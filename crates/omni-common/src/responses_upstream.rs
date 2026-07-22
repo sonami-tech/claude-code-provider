@@ -329,6 +329,17 @@ struct StreamToolCall {
     canonical_index: u32,
 }
 
+/// How no-match free-claim behaves when a terminal/full item carries a call_id
+/// that is not yet on any slot.
+#[derive(Debug, Clone, Copy)]
+enum FreeClaimPolicy {
+    /// completed/incomplete: claim only missing or empty-untagged at bare index.
+    StrictEmptyOrMissing,
+    /// stream item.done: may attach id to untagged (incl. non-empty) at bare index
+    /// so metadata can arrive after argument deltas.
+    AllowUntaggedNonEmpty,
+}
+
 /// Stateful parser that turns framed Responses SSE events into canonical
 /// stream events.
 ///
@@ -542,6 +553,8 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
             .get("output_index")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
+        // Stream announcement: bare output_index is authoritative for following
+        // deltas. Do not re-key by call_id here (that would desync later deltas).
         let canonical_index = self.ensure_tool_call(output_index);
         let call = self.tool_calls.entry(output_index).or_default();
         call.id = item
@@ -555,7 +568,7 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
             .map(str::to_string);
         self.saw_tool_call = true;
         if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str()) {
-            if let Some(err) = self.append_tool_arguments_from_full(output_index, arguments) {
+            if let Some(err) = self.merge_full_tool_arguments(output_index, arguments) {
                 return vec![Err(err)];
             }
         }
@@ -645,32 +658,14 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
             .get("output_index")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let canonical_index = self.ensure_tool_call(output_index);
-        {
-            let call = self.tool_calls.entry(output_index).or_default();
-            if call.id.is_none() {
-                call.id = item
-                    .get("call_id")
-                    .or_else(|| item.get("id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-            if call.name.is_none() {
-                call.name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-        }
-        self.saw_tool_call = true;
-        if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str()) {
-            if let Some(err) = self.append_tool_arguments_from_full(output_index, arguments) {
-                return vec![Err(err)];
-            }
-        }
-        let mut events = self.emit_tool_open_if_ready(output_index);
-        events.extend(self.emit_pending_tool_args(output_index, canonical_index));
-        events.into_iter().map(Ok).collect()
+        // Full-arg item.done shares call_id re-key + validate-before-mutate with
+        // the terminal path, but free-claim may attach to untagged non-empty at
+        // this stream index (metadata can arrive after deltas).
+        self.apply_function_call_full_item(
+            output_index,
+            item,
+            FreeClaimPolicy::AllowUntaggedNonEmpty,
+        )
     }
 
     fn handle_completed(
@@ -780,31 +775,56 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
         output_index: u32,
         item: &Value,
     ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let canonical_index = self.ensure_tool_call(output_index);
-        {
-            let call = self.tool_calls.entry(output_index).or_default();
-            if call.id.is_none() {
-                call.id = item
-                    .get("call_id")
-                    .or_else(|| item.get("id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-            if call.name.is_none() {
-                call.name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-        }
-        self.saw_tool_call = true;
+        // Class-K measured site (completed/incomplete): unique call_id re-key
+        // with strict free-claim (missing/empty-untagged only).
+        self.apply_function_call_full_item(
+            output_index,
+            item,
+            FreeClaimPolicy::StrictEmptyOrMissing,
+        )
+    }
+
+    /// Shared full-arg function_call apply for terminal completed/incomplete and
+    /// stream `output_item.done`. Sequence: resolve by call_id → ensure → content
+    /// merge (validate-before-mutate) → fill missing id/name → emit from the
+    /// **resolved** index. Flight `call_id_match` (if logged) must sample the
+    /// original `output_index` before resolve.
+    fn apply_function_call_full_item(
+        &mut self,
+        output_index: u32,
+        item: &Value,
+        free_claim: FreeClaimPolicy,
+    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
+        let terminal_call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(|v| v.as_str());
+        let terminal_name = item.get("name").and_then(|v| v.as_str());
+
+        let merge_index =
+            match self.resolve_tool_merge_index(output_index, terminal_call_id, free_claim) {
+                Ok(idx) => idx,
+                Err(err) => return vec![Err(err)],
+            };
+
+        let canonical_index = self.ensure_tool_call(merge_index);
         if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str()) {
-            if let Some(err) = self.append_tool_arguments_from_full(output_index, arguments) {
+            if let Some(err) = self.merge_full_tool_arguments(merge_index, arguments) {
                 return vec![Err(err)];
             }
         }
-        let mut events = self.emit_tool_open_if_ready(output_index);
-        events.extend(self.emit_pending_tool_args(output_index, canonical_index));
+        {
+            let call = self.tool_calls.entry(merge_index).or_default();
+            if call.id.is_none() {
+                call.id = terminal_call_id.map(str::to_string);
+            }
+            if call.name.is_none() {
+                call.name = terminal_name.map(str::to_string);
+            }
+        }
+        self.saw_tool_call = true;
+        let mut events = self.emit_tool_open_if_ready(merge_index);
+        events.extend(self.emit_pending_tool_args(merge_index, canonical_index));
         events.into_iter().map(Ok).collect()
     }
 
@@ -822,6 +842,64 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
             },
         );
         canonical_index
+    }
+
+    /// Choose the `tool_calls` map key for a full/terminal arg merge.
+    ///
+    /// When `terminal_call_id` is present:
+    /// - unique existing `id == call_id` → that key (ignore bare `output_index`)
+    /// - multi-match → fail-loud, zero mutations
+    /// - no match → free-claim at `output_index` per `free_claim` policy
+    ///
+    /// When absent: bare `output_index` (legacy path).
+    fn resolve_tool_merge_index(
+        &mut self,
+        output_index: u32,
+        terminal_call_id: Option<&str>,
+        free_claim: FreeClaimPolicy,
+    ) -> Result<u32, ProviderError> {
+        let Some(cid) = terminal_call_id else {
+            return Ok(output_index);
+        };
+
+        let matches: Vec<u32> = self
+            .tool_calls
+            .iter()
+            .filter(|(_, call)| call.id.as_deref() == Some(cid))
+            .map(|(&idx, _)| idx)
+            .collect();
+
+        match matches.as_slice() {
+            [only] => Ok(*only),
+            [] => {
+                // Pure decision only: do not attach id or ensure here. Claiming
+                // id before content merge would leave a poisoned call_id if
+                // merge_full_tool_arguments later fails (item.done conflict).
+                // apply_function_call_full_item attaches id after content accepts.
+                let free = match (free_claim, self.tool_calls.get(&output_index)) {
+                    (_, None) => true,
+                    // Stream item.done: metadata may land after deltas filled an
+                    // untagged buffer at this same index.
+                    (FreeClaimPolicy::AllowUntaggedNonEmpty, Some(call)) => call.id.is_none(),
+                    // Terminal class-K: never claim untagged non-empty (prefix-
+                    // compatible JSON is common across tools).
+                    (FreeClaimPolicy::StrictEmptyOrMissing, Some(call)) => {
+                        call.id.is_none() && call.arguments.is_empty()
+                    }
+                };
+                if !free {
+                    return Err(self.terminal_function_call_args_error());
+                }
+                Ok(output_index)
+            }
+            _ => Err(self.terminal_function_call_args_error()),
+        }
+    }
+
+    fn terminal_function_call_args_error(&self) -> ProviderError {
+        ProviderError::upstream(self.redact(
+            "Responses stream terminal function_call arguments did not extend prior argument deltas",
+        ))
     }
 
     fn emit_tool_open(&mut self, output_index: u32) -> Vec<CanonicalStreamEvent> {
@@ -858,9 +936,12 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
         }
     }
 
-    fn append_tool_arguments_from_full(
+    /// Content merge only (slot already chosen). Validate before any mutation:
+    /// equal → no-op; terminal is prefix-extension of buffer → append suffix;
+    /// else fail-loud with zero mutations.
+    fn merge_full_tool_arguments(
         &mut self,
-        output_index: u32,
+        merge_index: u32,
         arguments: &str,
     ) -> Option<ProviderError> {
         if arguments.is_empty() {
@@ -868,19 +949,17 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
         }
         let already = self
             .tool_calls
-            .get(&output_index)
+            .get(&merge_index)
             .map(|call| call.arguments.clone())
             .unwrap_or_default();
         if arguments == already {
             return None;
         }
         if arguments.len() > already.len() && arguments.starts_with(&already) {
-            self.append_tool_arguments(output_index, &arguments[already.len()..]);
+            self.append_tool_arguments(merge_index, &arguments[already.len()..]);
             return None;
         }
-        Some(ProviderError::upstream(self.redact(
-			"Responses stream terminal function_call arguments did not extend prior argument deltas",
-		)))
+        Some(self.terminal_function_call_args_error())
     }
 
     fn emit_pending_tool_args(
@@ -1585,5 +1664,669 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\
     fn incomplete_reason_normalizes_max_output_tokens_to_length() {
         let value = json!({"response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}});
         assert_eq!(response_incomplete_reason(&value), "length");
+    }
+
+    // --- Class-K: terminal function_call full-arg merge by unique call_id ---
+
+    /// Announce a function_call at `output_index` and stream its full args as one delta.
+    fn seed_tool_with_args(
+        parser: &mut ResponsesStreamParser<TokenRedactor>,
+        output_index: u32,
+        call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Vec<CanonicalStreamEvent> {
+        let mut events = Vec::new();
+        events.extend(ok_events(run_event(
+            parser,
+            "response.output_item.added",
+            json!({
+                "type":"response.output_item.added",
+                "output_index": output_index,
+                "item":{
+                    "type":"function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments":""
+                }
+            }),
+        )));
+        if !arguments.is_empty() {
+            events.extend(ok_events(run_event(
+                parser,
+                "response.function_call_arguments.delta",
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "output_index": output_index,
+                    "delta": arguments
+                }),
+            )));
+        }
+        events
+    }
+
+    /// Map tool call id → concatenated argument deltas from a stream of events.
+    fn tool_args_by_id(events: &[CanonicalStreamEvent]) -> HashMap<String, String> {
+        let mut id_by_index: HashMap<u32, String> = HashMap::new();
+        let mut args_by_index: HashMap<u32, String> = HashMap::new();
+        for event in events {
+            if let CanonicalStreamEvent::ToolCallDelta {
+                index,
+                id,
+                arguments_delta,
+                ..
+            } = event
+            {
+                if let Some(id) = id {
+                    id_by_index.insert(*index, id.clone());
+                }
+                args_by_index
+                    .entry(*index)
+                    .or_default()
+                    .push_str(arguments_delta);
+            }
+        }
+        id_by_index
+            .into_iter()
+            .map(|(idx, id)| (id, args_by_index.remove(&idx).unwrap_or_default()))
+            .collect()
+    }
+
+    fn first_upstream_err(
+        results: Vec<Result<CanonicalStreamEvent, ProviderError>>,
+    ) -> ProviderError {
+        results
+            .into_iter()
+            .find_map(|r| r.err())
+            .expect("expected an upstream error")
+    }
+
+    /// Prove buffers at the given stream indexes were not mutated: a full
+    /// `function_call_arguments.done` with the original text must equal-absorb
+    /// (no error, no new arg delta). Uses the bare-index done path so call_id
+    /// routing cannot mask a wrong-slot mutation.
+    fn assert_slots_unmutated(
+        parser: &mut ResponsesStreamParser<TokenRedactor>,
+        slots: &[(u32, &str)],
+    ) {
+        for &(output_index, original) in slots {
+            let results = run_event(
+                parser,
+                "response.function_call_arguments.done",
+                json!({
+                    "type":"response.function_call_arguments.done",
+                    "output_index": output_index,
+                    "arguments": original
+                }),
+            );
+            let events = ok_events(results);
+            let extra_args: String = events
+                .into_iter()
+                .filter_map(|e| match e {
+                    CanonicalStreamEvent::ToolCallDelta {
+                        arguments_delta, ..
+                    } if !arguments_delta.is_empty() => Some(arguments_delta),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                extra_args.is_empty(),
+                "slot {output_index} mutated after fail-loud; equal-absorb should emit nothing, got {extra_args:?}"
+            );
+        }
+    }
+
+    // WHY: measured class-K failure — stream deltas fill correct slots by
+    // output_index, but response.completed lists tools in a different order
+    // (array position becomes the merge key). Without call_id re-key, full args
+    // land on the wrong buffer and hard-error. Routing by unique call_id must
+    // identity-map args and succeed.
+    #[test]
+    fn terminal_completed_shuffled_indexes_merge_by_call_id() {
+        let mut parser = parser();
+        let mut events = Vec::new();
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            0,
+            "call_a",
+            "tool_a",
+            r#"{"a":1}"#,
+        ));
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            1,
+            "call_b",
+            "tool_b",
+            r#"{"b":2}"#,
+        ));
+        // Completed lists call_b then call_a (rotated relative to stream indexes).
+        events.extend(ok_events(run_event(
+            &mut parser,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{\"b\":2}"},
+                        {"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{\"a\":1}"}
+                    ]
+                }
+            }),
+        )));
+        let by_id = tool_args_by_id(&events);
+        assert_eq!(by_id.get("call_a").map(String::as_str), Some(r#"{"a":1}"#));
+        assert_eq!(by_id.get("call_b").map(String::as_str), Some(r#"{"b":2}"#));
+    }
+
+    // WHY: same-length but different JSON bodies must not be treated as a
+    // content conflict when completed routes them to the wrong bare index;
+    // unique call_id must re-home each body onto the slot that already holds
+    // that id (equal-absorb / success).
+    #[test]
+    fn terminal_same_len_different_content_routes_by_call_id() {
+        let mut parser = parser();
+        let mut events = Vec::new();
+        // Same length: {"x":1} and {"y":2} are both 7 bytes.
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            0,
+            "call_x",
+            "tool_x",
+            r#"{"x":1}"#,
+        ));
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            1,
+            "call_y",
+            "tool_y",
+            r#"{"y":2}"#,
+        ));
+        events.extend(ok_events(run_event(
+            &mut parser,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_y","name":"tool_y","arguments":"{\"y\":2}"},
+                        {"type":"function_call","call_id":"call_x","name":"tool_x","arguments":"{\"x\":1}"}
+                    ]
+                }
+            }),
+        )));
+        let by_id = tool_args_by_id(&events);
+        assert_eq!(by_id.get("call_x").map(String::as_str), Some(r#"{"x":1}"#));
+        assert_eq!(by_id.get("call_y").map(String::as_str), Some(r#"{"y":2}"#));
+    }
+
+    // WHY: after correct call_id routing, a true content conflict on the same
+    // call must still fail loud and leave buffers unchanged (no soft drop, no
+    // partial overwrite).
+    #[test]
+    fn terminal_same_call_id_content_conflict_fails_without_mutation() {
+        let mut parser = parser();
+        let _ = seed_tool_with_args(&mut parser, 0, "call_1", "lookup", r#"{"q":"sf"}"#);
+        let results = run_event(
+            &mut parser,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"nyc\"}"}
+                    ]
+                }
+            }),
+        );
+        let err = first_upstream_err(results);
+        assert!(
+            err.to_string().contains("terminal function_call arguments"),
+            "{err}"
+        );
+        assert_slots_unmutated(&mut parser, &[(0, r#"{"q":"sf"}"#)]);
+    }
+
+    // WHY: an unknown terminal call_id must not steal a slot already tagged with
+    // a different id (would corrupt multi-tool identity). Fail loud, no mutate.
+    #[test]
+    fn terminal_no_match_onto_other_tagged_slot_fails_without_mutation() {
+        let mut parser = parser();
+        let _ = seed_tool_with_args(&mut parser, 0, "call_a", "tool_a", r#"{"a":1}"#);
+        let _ = seed_tool_with_args(&mut parser, 1, "call_b", "tool_b", r#"{"b":2}"#);
+        let results = run_event(
+            &mut parser,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_orphan","name":"tool_z","arguments":"{\"z\":9}"}
+                    ]
+                }
+            }),
+        );
+        let err = first_upstream_err(results);
+        assert!(
+            err.to_string().contains("terminal function_call arguments"),
+            "{err}"
+        );
+        assert_slots_unmutated(&mut parser, &[(0, r#"{"a":1}"#), (1, r#"{"b":2}"#)]);
+    }
+
+    // WHY: untagged non-empty buffers exist when deltas precede metadata. Claiming
+    // them via equal/prefix heuristics is wrong-slot guessing (prefix-compatible
+    // JSON is common). No-match must fail loud and leave the buffer alone.
+    #[test]
+    fn terminal_no_match_onto_untagged_nonempty_fails_without_mutation() {
+        let mut parser = parser();
+        // Deltas first: creates untagged non-empty slot at index 0.
+        let _ = ok_events(run_event(
+            &mut parser,
+            "response.function_call_arguments.delta",
+            json!({
+                "type":"response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": r#"{"pre":1}"#
+            }),
+        ));
+        // Terminal presents a *different* call_id that matches nothing, targeting
+        // the same bare index (array position 0).
+        let results = run_event(
+            &mut parser,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_new","name":"lookup","arguments":"{\"pre\":1}"}
+                    ]
+                }
+            }),
+        );
+        let err = first_upstream_err(results);
+        assert!(
+            err.to_string().contains("terminal function_call arguments"),
+            "{err}"
+        );
+        assert_slots_unmutated(&mut parser, &[(0, r#"{"pre":1}"#)]);
+    }
+
+    // WHY: terminal-only tools (no prior stream slot) or empty untagged slots must
+    // still attach the call_id at the bare index and merge, or non-stream-like
+    // completed payloads would fail-loud incorrectly.
+    #[test]
+    fn terminal_no_match_missing_or_empty_untagged_attaches_and_merges() {
+        // Missing slot: completed alone.
+        {
+            let mut p = parser();
+            let events = ok_events(run_event(
+                &mut p,
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "response":{
+                        "status":"completed",
+                        "output":[
+                            {"type":"function_call","call_id":"call_solo","name":"lookup","arguments":"{\"q\":1}"}
+                        ]
+                    }
+                }),
+            ));
+            let by_id = tool_args_by_id(&events);
+            assert_eq!(
+                by_id.get("call_solo").map(String::as_str),
+                Some(r#"{"q":1}"#)
+            );
+        }
+
+        // Empty untagged: an empty delta ensures a map key with id=None and empty
+        // buffer; free-claim must attach the terminal call_id and merge args.
+        {
+            let mut p = parser();
+            let _ = ok_events(run_event(
+                &mut p,
+                "response.function_call_arguments.delta",
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "delta": ""
+                }),
+            ));
+            let events = ok_events(run_event(
+                &mut p,
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "response":{
+                        "status":"completed",
+                        "output":[
+                            {"type":"function_call","call_id":"call_free","name":"lookup","arguments":"{\"q\":2}"}
+                        ]
+                    }
+                }),
+            ));
+            let by_id = tool_args_by_id(&events);
+            assert_eq!(
+                by_id.get("call_free").map(String::as_str),
+                Some(r#"{"q":2}"#)
+            );
+        }
+    }
+
+    // WHY: three-tool rotation is the realistic multi-tool Codex shape; every
+    // completed entry must land on its own call_id buffer with no hard error.
+    #[test]
+    fn terminal_three_tool_completed_rotation_identity_maps() {
+        let mut parser = parser();
+        let mut events = Vec::new();
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            0,
+            "call_a",
+            "tool_a",
+            r#"{"a":1}"#,
+        ));
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            1,
+            "call_b",
+            "tool_b",
+            r#"{"b":2}"#,
+        ));
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            2,
+            "call_c",
+            "tool_c",
+            r#"{"c":3}"#,
+        ));
+        // Rotation: c, a, b at completed positions 0,1,2.
+        events.extend(ok_events(run_event(
+            &mut parser,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_c","name":"tool_c","arguments":"{\"c\":3}"},
+                        {"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{\"a\":1}"},
+                        {"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{\"b\":2}"}
+                    ]
+                }
+            }),
+        )));
+        let by_id = tool_args_by_id(&events);
+        assert_eq!(by_id.get("call_a").map(String::as_str), Some(r#"{"a":1}"#));
+        assert_eq!(by_id.get("call_b").map(String::as_str), Some(r#"{"b":2}"#));
+        assert_eq!(by_id.get("call_c").map(String::as_str), Some(r#"{"c":3}"#));
+    }
+
+    // WHY: duplicate call_id tags are a corrupted stream; first-match-wins would
+    // silently pick a buffer. Multi-match must fail loud with zero mutations.
+    #[test]
+    fn terminal_multi_match_same_call_id_fails_without_mutation() {
+        let mut parser = parser();
+        let _ = seed_tool_with_args(&mut parser, 0, "call_dup", "tool_a", r#"{"a":1}"#);
+        let _ = seed_tool_with_args(&mut parser, 1, "call_dup", "tool_b", r#"{"b":2}"#);
+        let results = run_event(
+            &mut parser,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_dup","name":"tool_a","arguments":"{\"a\":1}"}
+                    ]
+                }
+            }),
+        );
+        let err = first_upstream_err(results);
+        assert!(
+            err.to_string().contains("terminal function_call arguments"),
+            "{err}"
+        );
+        assert_slots_unmutated(&mut parser, &[(0, r#"{"a":1}"#), (1, r#"{"b":2}"#)]);
+    }
+
+    // WHY: equal full args on completed must no-op (already streamed), and a
+    // terminal that is a pure prefix-extension must append only the suffix —
+    // both pre-existing contracts must stay green under the shared merge helper.
+    #[test]
+    fn terminal_equal_absorb_and_prefix_extend_remain() {
+        // Equal absorb.
+        let mut p_eq = parser();
+        let mut events = seed_tool_with_args(&mut p_eq, 0, "call_1", "lookup", r#"{"q":"sf"}"#);
+        events.extend(ok_events(run_event(
+            &mut p_eq,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"sf\"}"}
+                    ]
+                }
+            }),
+        )));
+        let by_id = tool_args_by_id(&events);
+        assert_eq!(
+            by_id.get("call_1").map(String::as_str),
+            Some(r#"{"q":"sf"}"#),
+            "equal absorb must not double args"
+        );
+
+        // Prefix extend: stream partial, completed supplies the rest.
+        let mut p_ext = parser();
+        let mut events = seed_tool_with_args(&mut p_ext, 0, "call_2", "lookup", r#"{"q":"#);
+        events.extend(ok_events(run_event(
+            &mut p_ext,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_2","name":"lookup","arguments":"{\"q\":\"sf\"}"}
+                    ]
+                }
+            }),
+        )));
+        let by_id = tool_args_by_id(&events);
+        assert_eq!(
+            by_id.get("call_2").map(String::as_str),
+            Some(r#"{"q":"sf"}"#),
+            "prefix extend must append only the missing suffix"
+        );
+    }
+
+    // WHY: free-claim must not attach call_id before content validation. An
+    // item.done conflict on untagged non-empty must leave the slot untagged so
+    // later unique-match routing is not poisoned by a failed claim.
+    #[test]
+    fn item_done_content_conflict_does_not_poison_call_id() {
+        let mut parser = parser();
+        let _ = ok_events(run_event(
+            &mut parser,
+            "response.function_call_arguments.delta",
+            json!({
+                "type":"response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": r#"{"q":"sf"}"#
+            }),
+        ));
+        let results = run_event(
+            &mut parser,
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "output_index": 0,
+                "item":{
+                    "type":"function_call",
+                    "call_id":"call_poison",
+                    "name":"lookup",
+                    "arguments":"{\"q\":\"nyc\"}"
+                }
+            }),
+        );
+        let err = first_upstream_err(results);
+        assert!(
+            err.to_string().contains("terminal function_call arguments"),
+            "{err}"
+        );
+        // Strict terminal free-claim must still see untagged non-empty → fail.
+        // If call_id were poisoned on, unique match would equal-absorb wrongly.
+        let results = run_event(
+            &mut parser,
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","call_id":"call_poison","name":"lookup","arguments":"{\"q\":\"sf\"}"}
+                    ]
+                }
+            }),
+        );
+        let err = first_upstream_err(results);
+        assert!(
+            err.to_string().contains("terminal function_call arguments"),
+            "poisoned call_id would unique-match; expected strict free-claim fail: {err}"
+        );
+        assert_slots_unmutated(&mut parser, &[(0, r#"{"q":"sf"}"#)]);
+    }
+
+    // WHY: stream item.done may arrive after deltas filled an untagged buffer at
+    // the same output_index. Free-claim must allow attaching call_id to that
+    // non-empty untagged slot (metadata-late path), unlike strict terminal
+    // completed free-claim which refuses untagged non-empty.
+    #[test]
+    fn item_done_attaches_call_id_to_untagged_nonempty_same_index() {
+        let mut parser = parser();
+        let _ = ok_events(run_event(
+            &mut parser,
+            "response.function_call_arguments.delta",
+            json!({
+                "type":"response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": r#"{"q":"sf"}"#
+            }),
+        ));
+        let events = ok_events(run_event(
+            &mut parser,
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "output_index": 0,
+                "item":{
+                    "type":"function_call",
+                    "call_id":"call_late",
+                    "name":"lookup",
+                    "arguments":"{\"q\":\"sf\"}"
+                }
+            }),
+        ));
+        let by_id = tool_args_by_id(&events);
+        assert_eq!(
+            by_id.get("call_late").map(String::as_str),
+            Some(r#"{"q":"sf"}"#)
+        );
+    }
+
+    // WHY: item.done full-arg path must re-key by unique call_id and emit from
+    // the resolved slot (not bare wrong index), matching terminal class-K so a
+    // mis-indexed done cannot corrupt sibling tool buffers.
+    #[test]
+    fn item_done_routes_full_args_by_call_id() {
+        let mut parser = parser();
+        let mut events = Vec::new();
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            0,
+            "call_a",
+            "tool_a",
+            r#"{"a":1}"#,
+        ));
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            1,
+            "call_b",
+            "tool_b",
+            r#"{"b":2}"#,
+        ));
+        // Wrong bare index (0) but call_b's full args — must re-key to slot 1.
+        events.extend(ok_events(run_event(
+            &mut parser,
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "output_index": 0,
+                "item":{
+                    "type":"function_call",
+                    "call_id":"call_b",
+                    "name":"tool_b",
+                    "arguments":"{\"b\":2}"
+                }
+            }),
+        )));
+        let by_id = tool_args_by_id(&events);
+        assert_eq!(by_id.get("call_a").map(String::as_str), Some(r#"{"a":1}"#));
+        assert_eq!(by_id.get("call_b").map(String::as_str), Some(r#"{"b":2}"#));
+        assert_slots_unmutated(&mut parser, &[(0, r#"{"a":1}"#), (1, r#"{"b":2}"#)]);
+    }
+
+    // WHY: incomplete shares emit_terminal_function_call → the same call_id
+    // re-resolve helper. One incomplete multi-tool rotation proves the shared
+    // path is wired (measured prod site is completed; incomplete inherits).
+    #[test]
+    fn terminal_incomplete_shares_call_id_merge_helper() {
+        let mut parser = parser();
+        let mut events = Vec::new();
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            0,
+            "call_a",
+            "tool_a",
+            r#"{"a":1}"#,
+        ));
+        events.extend(seed_tool_with_args(
+            &mut parser,
+            1,
+            "call_b",
+            "tool_b",
+            r#"{"b":2}"#,
+        ));
+        events.extend(ok_events(run_event(
+            &mut parser,
+            "response.incomplete",
+            json!({
+                "type":"response.incomplete",
+                "response":{
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":"max_output_tokens"},
+                    "output":[
+                        {"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{\"b\":2}"},
+                        {"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{\"a\":1}"}
+                    ]
+                }
+            }),
+        )));
+        let by_id = tool_args_by_id(&events);
+        assert_eq!(by_id.get("call_a").map(String::as_str), Some(r#"{"a":1}"#));
+        assert_eq!(by_id.get("call_b").map(String::as_str), Some(r#"{"b":2}"#));
+        assert_eq!(
+            events.last(),
+            Some(&CanonicalStreamEvent::Finish {
+                finish_reason: Some("length".into())
+            })
+        );
     }
 }
