@@ -112,7 +112,7 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-Re-baselined against grok-shell **0.2.101** on **2026-07-16**.
+Re-baselined against grok-shell **0.2.112** on **2026-07-26**.
 
 ### Default path (cli-chat-proxy.grok.com)
 
@@ -124,7 +124,7 @@ Catalog (`/v1/models`):
 
 Wire notes from live MITM of `grok --single`:
 - Host: `cli-chat-proxy.grok.com`, path `POST /v1/responses`
-- UA / version: `grok-shell/0.2.101 (linux; x86_64)`, `x-grok-client-version: 0.2.101`
+- UA / version: `grok-shell/0.2.112 (linux; x86_64)`, `x-grok-client-version: 0.2.112`
 - Fingerprint headers: `x-xai-token-auth`, `x-authenticateresponse`,
   `x-grok-client-identifier`, `x-grok-client-mode: headless`,
   `x-grok-model-override`, `accept: text/event-stream`

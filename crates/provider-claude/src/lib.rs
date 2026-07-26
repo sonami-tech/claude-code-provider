@@ -653,7 +653,7 @@ mod tests {
         assert_eq!(provider_id(), "claude");
         let p = ClaudeProvider::new().expect("default profile constructs");
         assert_eq!(p.id(), "claude");
-        assert_eq!(p.profile().name, "cc-2.1.211-sdk-cli");
+        assert_eq!(p.profile().name, "cc-2.1.220-sdk-cli");
     }
 
     #[test]
@@ -1278,7 +1278,7 @@ mod tests {
         // cli alias -> resolves
         assert_eq!(
             prof.resolve_model("opus").unwrap().canonical,
-            "claude-opus-4-8"
+            "claude-opus-5"
         );
         // unknown -> NO LONGER defaults: passes through raw
         assert!(prof.resolve_model("weird").is_none());

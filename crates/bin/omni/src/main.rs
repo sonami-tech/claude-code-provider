@@ -3587,7 +3587,7 @@ mod tests {
         let (k, m) = resolve_provider_and_model("grok", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.5"));
 
-        // composer is no longer a Grok catalog alias (grok-shell 0.2.101).
+        // composer is no longer a Grok catalog alias (grok-shell 0.2.112).
         let err = resolve_provider_and_model("composer", &catalogs).unwrap_err();
         assert!(
             err.contains("unknown model"),
@@ -3646,7 +3646,7 @@ mod tests {
         let text = format_aliases_for_log(&providers).expect("aliases format");
         for expected in [
             "sonnet=claude-sonnet-5",
-            "opus=claude-opus-4-8",
+            "opus=claude-opus-5",
             "haiku=claude-haiku-4-5-20251001",
             "fable=claude-fable-5",
             "grok=grok-4.5",
@@ -3662,7 +3662,7 @@ mod tests {
             !text.contains("codex="),
             "startup alias log must not advertise the pruned codex alias: {text}"
         );
-        // composer dropped from grok-shell 0.2.101 advertised catalog.
+        // composer dropped from grok-shell 0.2.112 advertised catalog.
         assert!(
             !text.contains("composer="),
             "startup alias log must not advertise retired composer alias: {text}"
@@ -5582,7 +5582,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         );
         assert!(
             !ids.iter().any(|id| id == "grok-composer-2.5-fast"),
-            "composer is no longer in the grok-shell 0.2.101 catalog: {ids:?}"
+            "composer is no longer in the grok-shell 0.2.112 catalog: {ids:?}"
         );
         assert!(
             ids.iter().any(|id| id.starts_with("claude-")),

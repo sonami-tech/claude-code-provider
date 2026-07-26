@@ -1,7 +1,7 @@
 # Claude CLI Baseline Wire Fingerprint
 
-Active baseline: Claude Code 2.1.211, captured 2026-07-16. `latest` resolves to
-`cc-2.1.211-sdk-cli`.
+Active baseline: Claude Code 2.1.220, captured 2026-07-26. `latest` resolves to
+`cc-2.1.220-sdk-cli`.
 
 Raw mitmproxy `.flow` files are not committed because they contain live bearer
 tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
@@ -11,6 +11,7 @@ tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
+| `cc-2.1.220-sdk-cli` | `2.1.220` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-26 |
 | `cc-2.1.211-sdk-cli` | `2.1.211` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-16 |
 | `cc-2.1.207-sdk-cli` | `2.1.207` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-11 |
 | `cc-2.1.197-sdk-cli` | `2.1.197` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-01 |
@@ -52,6 +53,30 @@ Header names and dynamic values are pinned in
 - `anthropic-version: 2023-06-01`
 - `x-app: cli`
 - `x-client-request-id: <uuid>`
+
+## 2.1.220 Model Surface (active)
+
+| Input | Wire model | Beta list | max_tokens | temperature | output_config.effort |
+|---|---|---|---:|---:|---|
+| no `--model` | `claude-opus-5` | default (+fallback-credit) | 64000 | omitted | `high` |
+| `opus` | `claude-opus-5` | opus (+fallback-credit) | 64000 | omitted | `high` |
+| `fable` | `claude-fable-5` | fable | 64000 | omitted | `xhigh` |
+| `sonnet` | `claude-sonnet-5` | opus list (no fallback) | 64000 | omitted | `high` |
+| `haiku` | `claude-haiku-4-5-20251001` | haiku | 32000 | omitted | omitted |
+
+Default beta (2.1.220):
+
+```text
+claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11
+```
+
+Explicit Opus beta (2.1.220):
+
+```text
+claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11
+```
+
+Billing (no cch): `cc_version=2.1.220.01b; cc_entrypoint=sdk-cli;` for prompt `Say OK`.
 
 ## 2.1.175 Model Surface
 
