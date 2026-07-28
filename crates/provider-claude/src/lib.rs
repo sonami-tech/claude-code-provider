@@ -23,12 +23,16 @@
 //! billing suffix vectors, cch snapshots) intact.
 
 pub mod anthropic_passthrough;
+pub mod bootstrap;
 pub mod credentials;
 pub mod fingerprint;
 pub mod models;
 pub mod translate;
 pub mod upstream;
 
+pub use bootstrap::{
+    PROVIDER_ID, bootstrap, detected, detection_source, extras_allowed, from_provider,
+};
 pub use fingerprint::{
     CLAUDE_CODE_SYSTEM_PREAMBLE, FingerprintProfile, RequestContext, RequestKind, default_profile,
     resolve_profile, valid_profile_selectors,

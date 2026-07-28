@@ -15,9 +15,15 @@ Provider implementations remain separate crates:
 - `omni-common` owns shared OpenAI-compatible HTTP conversion, Responses
   conversion, SSE framing, auth, stats, conversation logging, session
   derivation, replacements, and error envelopes.
-- `omni-core` owns canonical types and the `LlmProvider` trait.
+- `omni-core` owns canonical types, the `LlmProvider` trait (canonical-only),
+  optional `AnthropicNativeSurface`, and `BootstrappedProvider`.
 - `crates/bin/omni` owns server startup, routing, auth wiring, stats wiring,
-  optional conversation-log wiring, and model catalog aggregation.
+  optional conversation-log wiring, and model catalog aggregation. It is a
+  **capability-based thin edge**: provider detect/init, extras allowlists, and
+  version/model catalogs are produced by provider-crate bootstrap factories.
+  The edge must not resolve fingerprint profiles or call Anthropic passthrough
+  helpers; Claude native Messages/count_tokens dispatch through
+  `entry.anthropic_native()`.
 
 ## Why One Binary
 
@@ -59,8 +65,10 @@ Codex supports OpenAI inbound non-streaming and streaming paths by posting to
 the Codex Responses API and translating native Responses SSE events into
 canonical stream events.
 
-`LlmProvider` remains canonical-only. Native Anthropic methods stay Claude-only
-on the Claude provider (not on the shared trait).
+`LlmProvider` remains canonical-only. Optional native Anthropic work uses a
+separate object-safe capability (`AnthropicNativeSurface`) exposed on the
+uniform provider entry (Claude only today). Grok/Codex do not implement it;
+their Anthropic inbound stays on the translated path.
 
 ## Build
 

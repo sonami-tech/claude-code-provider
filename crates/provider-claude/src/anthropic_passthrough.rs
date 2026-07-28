@@ -634,6 +634,92 @@ impl ClaudeProvider {
             .await
             .map_err(super::map_upstream_err)
     }
+
+    fn request_context_for_session(session_key: &str, outbound_model: &str) -> RequestContext {
+        let session = if let Ok(uuid) = uuid::Uuid::parse_str(session_key) {
+            uuid
+        } else {
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, session_key.as_bytes())
+        };
+        RequestContext::new_reply()
+            .with_session(session)
+            .with_model(outbound_model.to_string())
+    }
+}
+
+/// Object-safe native Anthropic surface for the thin edge (no FingerprintProfile
+/// or passthrough imports required at the call site).
+#[async_trait::async_trait]
+impl omni_core::AnthropicNativeSurface for ClaudeProvider {
+    fn prepare_messages(
+        &self,
+        raw_body: Value,
+        inject_identity: bool,
+    ) -> Result<omni_core::PreparedAnthropicNative, ProviderError> {
+        let prepared =
+            self.prepare_anthropic_messages(raw_body, &Replacements::empty(), inject_identity)?;
+        let body = prepared.body().clone();
+        Ok(omni_core::PreparedAnthropicNative::new(
+            prepared.requested_model,
+            prepared.model_canonical,
+            prepared.outbound_model,
+            prepared.stream,
+            prepared.dropped_fields,
+            body,
+        ))
+    }
+
+    fn prepare_count_tokens(
+        &self,
+        raw_body: Value,
+    ) -> Result<omni_core::PreparedAnthropicNative, ProviderError> {
+        let prepared = self.prepare_anthropic_count_tokens(raw_body, &Replacements::empty())?;
+        let body = prepared.body().clone();
+        Ok(omni_core::PreparedAnthropicNative::new(
+            prepared.requested_model,
+            prepared.model_canonical,
+            prepared.outbound_model,
+            prepared.stream,
+            prepared.dropped_fields,
+            body,
+        ))
+    }
+
+    async fn send_messages_json(
+        &self,
+        body: &Value,
+        session_key: &str,
+        outbound_model: &str,
+    ) -> Result<Value, ProviderError> {
+        let ctx = Self::request_context_for_session(session_key, outbound_model);
+        self.send_anthropic_messages_json(body, &ctx).await
+    }
+
+    async fn send_messages_stream(
+        &self,
+        body: &Value,
+        session_key: &str,
+        outbound_model: &str,
+    ) -> Result<omni_core::NativeAnthropicSseStream, ProviderError> {
+        let ctx = Self::request_context_for_session(session_key, outbound_model);
+        let stream = self.send_anthropic_messages_stream(body, &ctx).await?;
+        Ok(Box::pin(stream.map(|item| {
+            item.map(|frame| omni_core::NativeAnthropicSseFrame {
+                event: frame.event,
+                data: frame.data,
+            })
+        })))
+    }
+
+    async fn send_count_tokens(
+        &self,
+        body: &Value,
+        session_key: &str,
+        outbound_model: &str,
+    ) -> Result<Value, ProviderError> {
+        let ctx = Self::request_context_for_session(session_key, outbound_model);
+        self.send_anthropic_count_tokens(body, &ctx).await
+    }
 }
 
 #[allow(dead_code)]

@@ -2,7 +2,8 @@
 
 ## Architecture
 
-- Decision: one server binary (`omni`) with separate provider crates.
+- Decision: one server binary (`omni`) with separate provider crates and a
+  **capability-based thin edge**.
 - Rationale:
   - Claude fingerprint logic is isolated in `provider-claude`.
   - Grok wire logic is isolated in `provider-grok`.
@@ -10,8 +11,22 @@
   - Shared HTTP conversion, Responses conversion, auth, stats, replacements,
     session derivation, conversation logging, and error envelopes live in
     `omni-common`.
+  - `omni-core` owns canonical types, `LlmProvider` (canonical-only), optional
+    `AnthropicNativeSurface`, and `BootstrappedProvider`.
   - `omni` only routes, frames responses, exposes catalogs, records stats, and
-    wires optional conversation logging.
+    wires optional conversation logging. Detect/init, model catalog export, and
+    `provider_extras` allowlists live in provider crates behind bootstrap
+    factories registered by the edge.
+
+## Thin edge imports
+
+- Edge **may** depend on provider crates for: registration (`bootstrap`,
+  `detected`, `PROVIDER_ID`), and test-only constructors.
+- Edge **must not** import: `FingerprintProfile` resolution, `anthropic_passthrough`,
+  or concrete-only Claude fields on app state. Native Anthropic Messages /
+  count_tokens go through `AnthropicNativeSurface` on the uniform entry.
+- Fourth provider = bootstrap + `LlmProvider` (+ optional native surface) +
+  registration only; no new wire/fingerprint code in `main.rs`.
 
 ## Routing
 

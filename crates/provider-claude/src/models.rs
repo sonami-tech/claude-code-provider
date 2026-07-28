@@ -340,10 +340,7 @@ mod tests {
     #[test]
     fn resolve_canonical_names() {
         assert_eq!(
-            profile()
-                .resolve_model("claude-opus-5")
-                .unwrap()
-                .canonical,
+            profile().resolve_model("claude-opus-5").unwrap().canonical,
             "claude-opus-5"
         );
         assert_eq!(

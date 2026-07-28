@@ -83,20 +83,16 @@ use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use omni_common::{
-    ActiveRequestGuard, ApiKeyId, AppError, ChatCompletionRequest, ConversationLog, Replacements,
-    Stats, TokenUsage, anthropic_to_canonical, canonical_to_anthropic, env_nonempty,
-    from_canonical, parse_anthropic_object_no_dup_keys, peek_model_string,
-    sse_from_canonical_stream_anthropic, to_canonical,
+    ActiveRequestGuard, ApiKeyId, AppError, ChatCompletionRequest, ConversationLog, Stats,
+    TokenUsage, accumulate_anthropic_stream_usage, anthropic_to_canonical, canonical_to_anthropic,
+    from_canonical, is_anthropic_content_delta, parse_anthropic_object_no_dup_keys,
+    peek_model_string, sse_from_canonical_stream_anthropic, to_canonical,
+    token_usage_from_anthropic_response,
 };
 use omni_core::{
-    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, LlmProvider, ProviderError,
-    ProviderVersion, VersionSelector,
+    AnthropicNativeSurface, BootstrappedProvider, CanonicalResponse, CanonicalStream,
+    CanonicalStreamEvent, LlmProvider, NativeAnthropicSseStream, ProviderError, VersionSelector,
 };
-
-// Re-export the concrete providers so main can construct them by name.
-use provider_claude::ClaudeProvider;
-use provider_codex::CodexProvider;
-use provider_grok::GrokProvider;
 
 mod cloud_fidelity;
 mod log_color;
@@ -367,9 +363,86 @@ fn set_provider_oauth_refresh_env(provider: &str, env_key: &str, enable: bool, d
 #[derive(Clone)]
 struct ProviderEntry {
     provider: Arc<dyn LlmProvider>,
-    claude_native: Option<Arc<ClaudeProvider>>,
+    /// Optional native Anthropic Messages surface (Claude). Trait-object capability.
+    anthropic_native: Option<Arc<dyn AnthropicNativeSurface>>,
     models: Vec<serde_json::Value>,
     catalog: ModelCatalog,
+    /// Provider-owned extras allowlist (true = key permitted).
+    extras_allowed: fn(&str) -> bool,
+}
+
+/// One registered provider factory: detect + bootstrap live in the provider crate.
+struct ProviderFactory {
+    id: &'static str,
+    /// CLI binary name for `--match-system` version detection.
+    match_system_bin: &'static str,
+    detected: fn() -> bool,
+    detection_source: fn() -> Option<String>,
+    bootstrap: fn(&VersionSelector) -> anyhow::Result<BootstrappedProvider>,
+}
+
+fn provider_factories() -> &'static [ProviderFactory] {
+    &[
+        ProviderFactory {
+            id: provider_claude::PROVIDER_ID,
+            match_system_bin: "claude",
+            detected: provider_claude::detected,
+            detection_source: provider_claude::detection_source,
+            bootstrap: provider_claude::bootstrap,
+        },
+        ProviderFactory {
+            id: provider_grok::PROVIDER_ID,
+            match_system_bin: "grok",
+            detected: provider_grok::detected,
+            detection_source: provider_grok::detection_source,
+            bootstrap: provider_grok::bootstrap,
+        },
+        ProviderFactory {
+            id: provider_codex::PROVIDER_ID,
+            match_system_bin: "codex",
+            detected: provider_codex::detected,
+            detection_source: provider_codex::detection_source,
+            bootstrap: provider_codex::bootstrap,
+        },
+    ]
+}
+
+fn factory_for(id: &str) -> Option<&'static ProviderFactory> {
+    provider_factories().iter().find(|f| f.id == id)
+}
+
+fn entry_from_bootstrap(id: &str, boot: BootstrappedProvider) -> anyhow::Result<ProviderEntry> {
+    let models = stamp_owned_by(id, boot.models)?;
+    let mut catalog = ModelCatalog::default();
+    for (alias, canonical) in boot.aliases {
+        catalog.insert(&alias, &canonical);
+    }
+    Ok(ProviderEntry {
+        provider: boot.provider,
+        anthropic_native: boot.anthropic_native,
+        models,
+        catalog,
+        extras_allowed: boot.extras_allowed,
+    })
+}
+
+fn stamp_owned_by(
+    provider: &str,
+    models: Vec<serde_json::Value>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    models
+        .into_iter()
+        .map(|mut value| {
+            let obj = value
+                .as_object_mut()
+                .context("provider model catalog entry must serialize as an object")?;
+            obj.get("id")
+                .and_then(|v| v.as_str())
+                .context("provider model catalog entry missing string id")?;
+            obj.insert("owned_by".to_string(), serde_json::json!(provider));
+            Ok(value)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -437,67 +510,24 @@ async fn main() -> anyhow::Result<()> {
 
     let mut providers_map: HashMap<String, ProviderEntry> = HashMap::new();
     for name in &enabled {
-        let entry = match name.as_str() {
-            "claude" => {
-                let selector = version_selector_for(
-                    &cli.claude_version,
-                    cli.match_system,
-                    cli.match_system_exact,
-                    "claude",
-                );
-                let provider = init_claude_provider(&selector)
-                    .context("failed to initialize claude provider (fingerprint profile)")?;
-                let models = provider_model_values("claude", provider.profile().models_list())?;
-                let catalog = claude_model_catalog(provider.profile());
-                let provider = Arc::new(provider);
-                ProviderEntry {
-                    provider: provider.clone(),
-                    claude_native: Some(provider),
-                    models,
-                    catalog,
-                }
-            }
-            "grok" => {
-                let selector = version_selector_for(
-                    &cli.grok_version,
-                    cli.match_system,
-                    cli.match_system_exact,
-                    "grok",
-                );
-                let p = init_grok_provider(&selector).context("failed to init grok provider")?;
-                // Advertise the catalog the provider actually resolved (mode+version),
-                // not the static default.
-                let models = provider_model_values("grok", p.models_list())?;
-                let catalog = grok_model_catalog(&p);
-                ProviderEntry {
-                    provider: Arc::new(p),
-                    claude_native: None,
-                    models,
-                    catalog,
-                }
-            }
-            "codex" => {
-                let selector = version_selector_for(
-                    &cli.codex_version,
-                    cli.match_system,
-                    cli.match_system_exact,
-                    "codex",
-                );
-                let p = init_codex_provider(&selector).context("failed to init codex provider")?;
-                let models = provider_model_values("codex", p.models_list())?;
-                let catalog = codex_model_catalog(&p);
-                ProviderEntry {
-                    provider: Arc::new(p),
-                    claude_native: None,
-                    models,
-                    catalog,
-                }
-            }
-            other => {
-                // Should be impossible after normalize.
-                anyhow::bail!("unknown provider in list: {}", other);
-            }
+        let factory = factory_for(name).ok_or_else(|| {
+            anyhow::anyhow!("unknown provider in list: {name} (no registered factory)")
+        })?;
+        let explicit = match factory.id {
+            "claude" => &cli.claude_version,
+            "grok" => &cli.grok_version,
+            "codex" => &cli.codex_version,
+            _ => &None,
         };
+        let selector = version_selector_for(
+            explicit,
+            cli.match_system,
+            cli.match_system_exact,
+            factory.match_system_bin,
+        );
+        let boot = (factory.bootstrap)(&selector)
+            .with_context(|| format!("failed to initialize {} provider", factory.id))?;
+        let entry = entry_from_bootstrap(factory.id, boot)?;
         providers_map.insert(name.clone(), entry);
     }
 
@@ -573,309 +603,6 @@ fn log_startup_banner() {
     );
 }
 
-fn init_claude_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProvider> {
-    let profile = resolve_claude_profile(selector)?;
-    let selector_desc = describe_version_selector(selector, profile.claude_cli_version);
-    if let Some(base_url) = env_nonempty("OMNI_CLAUDE_BASE_URL") {
-        let authorization_bearer = env_nonempty("OMNI_CLAUDE_AUTH_TOKEN")
-            .is_some()
-            .then(|| "OMNI_CLAUDE_AUTH_TOKEN".to_string());
-        let api_key = env_nonempty("OMNI_CLAUDE_API_KEY")
-            .is_some()
-            .then(|| "OMNI_CLAUDE_API_KEY".to_string());
-        let custom_headers = std::env::var_os("OMNI_CLAUDE_CUSTOM_HEADERS")
-            .is_some()
-            .then(|| "OMNI_CLAUDE_CUSTOM_HEADERS".to_string());
-        let auth = describe_env_auth_winner(&[
-            ("OMNI_CLAUDE_AUTH_TOKEN", "bearer"),
-            ("OMNI_CLAUDE_API_KEY", "x-api-key"),
-            ("OMNI_CLAUDE_CUSTOM_HEADERS", "custom-headers"),
-        ]);
-        info!(
-            profile = profile.claude_cli_version,
-            selector = %selector_desc,
-            base_url = %base_url,
-            auth = %auth,
-            "initializing claude provider (custom gateway via OMNI_CLAUDE_BASE_URL)"
-        );
-        return ClaudeProvider::new_for_custom_gateway_env(
-            profile,
-            base_url,
-            authorization_bearer,
-            api_key,
-            custom_headers,
-        )
-        .map_err(anyhow::Error::from);
-    }
-
-    if let Some(base_url) = env_nonempty("ANTHROPIC_BASE_URL") {
-        let authorization_bearer = env_nonempty("ANTHROPIC_AUTH_TOKEN")
-            .is_some()
-            .then(|| "ANTHROPIC_AUTH_TOKEN".to_string());
-        let api_key = env_nonempty("ANTHROPIC_API_KEY")
-            .is_some()
-            .then(|| "ANTHROPIC_API_KEY".to_string());
-        let custom_headers = std::env::var_os("ANTHROPIC_CUSTOM_HEADERS")
-            .is_some()
-            .then(|| "ANTHROPIC_CUSTOM_HEADERS".to_string());
-        let auth = describe_env_auth_winner(&[
-            ("ANTHROPIC_AUTH_TOKEN", "bearer"),
-            ("ANTHROPIC_API_KEY", "x-api-key"),
-            ("ANTHROPIC_CUSTOM_HEADERS", "custom-headers"),
-        ]);
-        info!(
-            profile = profile.claude_cli_version,
-            selector = %selector_desc,
-            base_url = %base_url,
-            auth = %auth,
-            "initializing claude provider (custom gateway via ANTHROPIC_BASE_URL)"
-        );
-        return ClaudeProvider::new_for_custom_gateway_env(
-            profile,
-            base_url,
-            authorization_bearer,
-            api_key,
-            custom_headers,
-        )
-        .map_err(anyhow::Error::from);
-    }
-
-    let creds_path = provider_claude::credentials::Credentials::default_path();
-    let via = if std::env::var_os("CLAUDE_CREDENTIALS_PATH").is_some() {
-        " via CLAUDE_CREDENTIALS_PATH"
-    } else {
-        ""
-    };
-    let path_disp = display_path_for_log(&creds_path);
-    if !creds_path.is_file() {
-        anyhow::bail!(
-            "claude: credentials file missing at {path_disp}{via}; cannot start with claude enabled"
-        );
-    }
-    provider_claude::credentials::Credentials::load_fresh(&creds_path).with_context(|| {
-        format!("claude: credentials at {path_disp}{via} are unreadable or invalid")
-    })?;
-    info!(
-        profile = profile.claude_cli_version,
-        selector = %selector_desc,
-        auth = %format!("auth={path_disp}{via} (present)"),
-        "initializing claude provider"
-    );
-    ClaudeProvider::new_with_profile(profile).map_err(anyhow::Error::from)
-}
-
-fn init_grok_provider(selector: &VersionSelector) -> anyhow::Result<GrokProvider> {
-    let version = resolve_provider_version("grok", GrokProvider::version_catalog(), selector)?;
-    let selector_desc = describe_version_selector(selector, version.version);
-    let provider = GrokProvider::new(None)
-        .map_err(anyhow::Error::from)?
-        .with_version(version.version)
-        .map_err(anyhow::Error::from)?;
-    if let Some(base_url) = env_nonempty("OMNI_GROK_BASE_URL") {
-        let auth = describe_env_auth_winner(&[
-            ("OMNI_GROK_AUTH_TOKEN", "bearer-token"),
-            ("OMNI_GROK_API_KEY", "api-key"),
-            ("OMNI_GROK_CUSTOM_HEADERS", "custom-headers"),
-        ]);
-        info!(
-            version = version.version,
-            selector = %selector_desc,
-            base_url = %base_url,
-            auth = %auth,
-            "initializing grok provider (custom endpoint via OMNI_GROK_BASE_URL)"
-        );
-        return Ok(provider.with_custom_auth_env(
-            base_url,
-            Some("OMNI_GROK_AUTH_TOKEN".into()),
-            Some("OMNI_GROK_API_KEY".into()),
-            Some("OMNI_GROK_CUSTOM_HEADERS".into()),
-        ));
-    }
-
-    if let Some(base_url) = env_nonempty("GROK_MODELS_BASE_URL") {
-        let auth = if env_nonempty("XAI_API_KEY").is_some() {
-            "auth=env:XAI_API_KEY (set)"
-        } else {
-            "auth=none (XAI_API_KEY unset)"
-        };
-        info!(
-            version = version.version,
-            selector = %selector_desc,
-            base_url = %base_url,
-            auth,
-            "initializing grok provider (custom endpoint via GROK_MODELS_BASE_URL)"
-        );
-        return Ok(provider.with_base_url(base_url).with_custom_auth(
-            None,
-            Some("XAI_API_KEY".into()),
-            vec![],
-        ));
-    }
-
-    // Fail hard when the default CLI path has no usable credentials file.
-    validate_grok_cli_credentials_at_startup()?;
-    let auth = provider_grok::credentials::GrokCredentials::describe_cli_auth_source();
-    info!(
-        version = version.version,
-        selector = %selector_desc,
-        base_url = "https://cli-chat-proxy.grok.com",
-        auth = %auth,
-        "initializing grok provider (CLI path; credentials re-read per request)"
-    );
-    Ok(provider)
-}
-
-fn init_codex_provider(selector: &VersionSelector) -> anyhow::Result<CodexProvider> {
-    let version = resolve_provider_version("codex", CodexProvider::version_catalog(), selector)?;
-    let selector_desc = describe_version_selector(selector, version.version);
-    let provider = CodexProvider::new()
-        .map_err(anyhow::Error::from)?
-        .with_version(version.version)
-        .map_err(anyhow::Error::from)?;
-    // Transport (ChatGPT WS vs REST) is inferred per-request from CODEX_HOME
-    // config/auth, matching Claude/Grok (no operator mode flag).
-    // Hard-fail at launch when settings cannot be loaded (invalid CODEX_HOME, etc.).
-    let source = CodexProvider::startup_source_summary()
-        .map_err(|e| anyhow::anyhow!("codex: cannot load settings for enabled provider: {e}"))?;
-    info!(
-        version = version.version,
-        selector = %selector_desc,
-        source = %source,
-        "initializing codex provider"
-    );
-    Ok(provider)
-}
-
-/// Human-readable version selector for startup logs.
-fn describe_version_selector(selector: &VersionSelector, chose: &str) -> String {
-    match selector {
-        VersionSelector::Latest => format!("latest → chose={chose}"),
-        VersionSelector::Exact(v) => format!("exact={v} → chose={chose}"),
-        VersionSelector::MatchSystem(v) => {
-            format!("match-system detected={v} → chose={chose}")
-        }
-        VersionSelector::MatchSystemExact(v) => {
-            format!("match-system-exact detected={v} → chose={chose}")
-        }
-    }
-}
-
-/// Ensure Grok's default credential chain can load at least one file at launch.
-///
-/// Mirrors CLI-path precedence (XAI override → ~/.grok/auth.json → ~/.xai static).
-/// Custom endpoints skip this (they do not use the ambient file chain).
-fn validate_grok_cli_credentials_at_startup() -> anyhow::Result<()> {
-    use provider_grok::credentials::{GrokCredentials, GrokCredentialsError};
-
-    if let Some(p) = std::env::var_os("XAI_CREDENTIALS_PATH") {
-        let path = std::path::PathBuf::from(p);
-        if !path.is_file() {
-            anyhow::bail!(
-                "grok: XAI_CREDENTIALS_PATH={} is missing or not a file; cannot start with grok enabled",
-                path.display()
-            );
-        }
-        GrokCredentials::load_fresh(&path).with_context(|| {
-            format!(
-                "grok: credentials at {} (XAI_CREDENTIALS_PATH) are unreadable or invalid",
-                path.display()
-            )
-        })?;
-        return Ok(());
-    }
-
-    if let Some(cli_path) = GrokCredentials::grok_cli_path()
-        && cli_path.is_file()
-    {
-        match GrokCredentials::load_fresh(&cli_path) {
-            Ok(_) => return Ok(()),
-            Err(GrokCredentialsError::MissingToken) => {
-                // Fall through to static key, same as runtime CLI resolve.
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "grok: credentials at {} are unreadable or invalid: {e}",
-                    cli_path.display()
-                );
-            }
-        }
-    }
-
-    // default_path without XAI_CREDENTIALS_PATH is ~/.xai/.credentials.json.
-    let static_path = GrokCredentials::default_path();
-    if static_path.is_file() {
-        GrokCredentials::load_fresh(&static_path).with_context(|| {
-            format!(
-                "grok: credentials at {} are unreadable or invalid",
-                static_path.display()
-            )
-        })?;
-        return Ok(());
-    }
-
-    let auth = GrokCredentials::describe_cli_auth_source();
-    anyhow::bail!(
-        "grok: no credentials file found for CLI path ({auth}); cannot start with grok enabled"
-    );
-}
-
-/// First matching env wins. `kind` is a short role (bearer / api-key / …).
-/// Header envs count as set when the variable is present (even empty).
-fn describe_env_auth_winner(candidates: &[(&str, &str)]) -> String {
-    for (env_key, kind) in candidates {
-        let present = if env_key.contains("HEADERS") {
-            std::env::var_os(env_key).is_some()
-        } else {
-            env_nonempty(env_key).is_some()
-        };
-        if present {
-            return format!("auth=env:{env_key} ({kind}, set)");
-        }
-    }
-    "auth=none (no gateway auth env set)".into()
-}
-
-fn display_path_for_log(path: &std::path::Path) -> String {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
-}
-
-/// Resolve the Claude fingerprint profile for a [`VersionSelector`].
-///
-/// Claude does not use the conservative/extended catalog split (it already speaks
-/// the exact Anthropic protocol), so only the version selector applies. Grok also
-/// has a single path (CLI wire). An exact or match-system-exact pin that names no
-/// known profile is a hard startup error.
-fn resolve_claude_profile(
-    selector: &VersionSelector,
-) -> anyhow::Result<&'static provider_claude::FingerprintProfile> {
-    match selector {
-        VersionSelector::Latest => Ok(provider_claude::default_profile()),
-        VersionSelector::Exact(v) | VersionSelector::MatchSystemExact(v) => {
-            provider_claude::resolve_profile(v).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "claude: no fingerprint profile matches version {v:?} (exact-or-fail); known selectors: {}",
-                    provider_claude::valid_profile_selectors()
-                )
-            })
-        }
-        VersionSelector::MatchSystem(v) => {
-            // Closest match: try exact, else fall back to the default (newest).
-            Ok(provider_claude::resolve_profile(v).unwrap_or_else(|| {
-                let newest = provider_claude::default_profile();
-                warn!(
-                    installed = %v,
-                    chose = newest.claude_cli_version,
-                    "claude: no exact profile for installed version; using newest (default) profile"
-                );
-                newest
-            }))
-        }
-    }
-}
-
 /// Build a [`VersionSelector`] for one provider from the CLI flags.
 ///
 /// Precedence: an explicit per-provider `--{provider}-version` (exact-or-fail)
@@ -949,17 +676,6 @@ fn extract_version_token(text: &str) -> Option<String> {
             t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.')
         })
         .map(|tok| tok.trim_start_matches('v').to_string())
-}
-
-/// Resolve a selector against a provider's catalog, mapping the fail-loud cases to
-/// a clear startup error that names the provider.
-fn resolve_provider_version(
-    provider: &str,
-    versions: &'static [ProviderVersion],
-    selector: &VersionSelector,
-) -> anyhow::Result<&'static ProviderVersion> {
-    omni_core::resolve_version(versions, selector)
-        .map_err(|e| anyhow::anyhow!("{provider}: cannot resolve version selector: {e}"))
 }
 
 fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router {
@@ -1173,58 +889,6 @@ fn build_conversation_log(cli: &Cli) -> anyhow::Result<Option<Arc<ConversationLo
     Ok(None)
 }
 
-fn provider_model_values<T: serde::Serialize>(
-    provider: &str,
-    models: Vec<T>,
-) -> anyhow::Result<Vec<serde_json::Value>> {
-    models
-        .into_iter()
-        .map(|model| {
-            let mut value = serde_json::to_value(model)
-                .context("failed to serialize provider model catalog entry")?;
-            let obj = value
-                .as_object_mut()
-                .context("provider model catalog entry must serialize as an object")?;
-            obj.get("id")
-                .and_then(|v| v.as_str())
-                .context("provider model catalog entry missing string id")?;
-            obj.insert("owned_by".to_string(), serde_json::json!(provider));
-            Ok(value)
-        })
-        .collect()
-}
-
-fn claude_model_catalog(profile: &provider_claude::FingerprintProfile) -> ModelCatalog {
-    let mut catalog = ModelCatalog::default();
-    for model in profile.models {
-        catalog.insert(model.canonical, model.canonical);
-        catalog.insert(model.cli_name, model.canonical);
-        for alias in model.aliases {
-            catalog.insert(alias, model.canonical);
-        }
-    }
-    for model in profile.model_wire_overrides {
-        catalog.insert(model.model, model.model);
-    }
-    catalog
-}
-
-fn grok_model_catalog(provider: &GrokProvider) -> ModelCatalog {
-    let mut catalog = ModelCatalog::default();
-    for (alias, canonical) in provider.model_aliases() {
-        catalog.insert(alias, canonical);
-    }
-    catalog
-}
-
-fn codex_model_catalog(provider: &CodexProvider) -> ModelCatalog {
-    let mut catalog = ModelCatalog::default();
-    for (alias, canonical) in provider.model_aliases() {
-        catalog.insert(&alias, &canonical);
-    }
-    catalog
-}
-
 impl ModelCatalog {
     fn insert(&mut self, alias: &str, canonical: &str) {
         if let Some(existing) = self.aliases.get(alias) {
@@ -1415,47 +1079,33 @@ fn select_enabled_providers(raw: &[String]) -> anyhow::Result<(Vec<String>, &'st
 fn format_provider_detection_detail(enabled: &[String], source: &str) -> String {
     let mut parts = Vec::new();
     for name in enabled {
-        let reason = match name.as_str() {
-            "claude" => ClaudeProvider::detection_source().unwrap_or_else(|| {
+        let reason = factory_for(name)
+            .and_then(|f| (f.detection_source)())
+            .unwrap_or_else(|| {
                 if source == "configured" {
                     "configured".into()
                 } else {
                     "unknown".into()
                 }
-            }),
-            "grok" => GrokProvider::detection_source().unwrap_or_else(|| {
-                if source == "configured" {
-                    "configured".into()
-                } else {
-                    "unknown".into()
-                }
-            }),
-            "codex" => CodexProvider::detection_source().unwrap_or_else(|| {
-                if source == "configured" {
-                    "configured".into()
-                } else {
-                    "unknown".into()
-                }
-            }),
-            other => other.to_string(),
-        };
+            });
         parts.push(format!("{name}={reason}"));
     }
     parts.join("; ")
 }
 
 /// Normalize/validate a providers CLI/env list.
-/// Accepts "claude,grok,codex", trims, lowercases, dedups in order, rejects unknowns.
+/// Accepts registered factory ids, trims, lowercases, dedups in order, rejects unknowns.
 fn normalize_provider_list(raw: &[String]) -> anyhow::Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let known: Vec<&str> = provider_factories().iter().map(|f| f.id).collect();
     for r in raw {
         let p = r.trim().to_lowercase();
         if p.is_empty() {
             continue;
         }
-        if p != "claude" && p != "grok" && p != "codex" {
-            anyhow::bail!("unknown provider {:?}; supported: claude,grok,codex", r);
+        if factory_for(&p).is_none() {
+            anyhow::bail!("unknown provider {:?}; supported: {}", r, known.join(","));
         }
         if seen.insert(p.clone()) {
             out.push(p);
@@ -1474,17 +1124,11 @@ fn normalize_providers(raw: &[String]) -> anyhow::Result<Vec<String>> {
 }
 
 fn detect_available_providers() -> Vec<String> {
-    let mut out = Vec::new();
-    if ClaudeProvider::detected() {
-        out.push("claude".to_string());
-    }
-    if GrokProvider::detected() {
-        out.push("grok".to_string());
-    }
-    if CodexProvider::detected() {
-        out.push("codex".to_string());
-    }
-    out
+    provider_factories()
+        .iter()
+        .filter(|f| (f.detected)())
+        .map(|f| f.id.to_string())
+        .collect()
 }
 
 /// Pure routing function. Extracted for easy unit testing of the core logic.
@@ -1595,8 +1239,10 @@ fn provider_catalogs(providers: &HashMap<String, ProviderEntry>) -> HashMap<Stri
         .collect()
 }
 
-fn validate_provider_extras(
+/// Reject `provider_extras` keys the entry's allowlist does not permit.
+fn check_provider_extras(
     provider: &str,
+    entry: &ProviderEntry,
     extras: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let Some(obj) = extras.and_then(|value| value.as_object()) else {
@@ -1605,18 +1251,7 @@ fn validate_provider_extras(
     if obj.is_empty() {
         return Ok(());
     }
-
-    let unsupported = obj
-        .keys()
-        .find(|key| match provider {
-            "grok" => !provider_grok::grok_extra_allowed(key),
-            "codex" => !provider_codex::codex_extra_allowed(key),
-            "claude" => true,
-            _ => true,
-        })
-        .map(String::as_str);
-
-    if let Some(key) = unsupported {
+    if let Some(key) = obj.keys().find(|key| !(entry.extras_allowed)(key)) {
         return Err(format!("unsupported provider extra for {provider}: {key}"));
     }
     Ok(())
@@ -1773,7 +1408,7 @@ async fn chat_completions_handler(
     // Build canonical *with the stripped model* so the delegated provider sees the real model name.
     let mut canon = to_canonical(&body).map_err(|e| record_bad_request(&state, &stats_key, e))?;
     canon.model = stripped_model.clone();
-    validate_provider_extras(&prov_key, canon.provider_extras.as_ref())
+    check_provider_extras(&prov_key, entry, canon.provider_extras.as_ref())
         .map_err(|e| record_bad_request(&state, &stats_key, e))?;
 
     if let Some(stats) = &state.stats {
@@ -2204,13 +1839,6 @@ fn stats_model_key(provider: &str, model: &str) -> String {
     format!("{provider}:{model}")
 }
 
-fn derive_session_uuid(session_id: &str) -> uuid::Uuid {
-    if let Ok(uuid) = uuid::Uuid::parse_str(session_id) {
-        return uuid;
-    }
-    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, session_id.as_bytes())
-}
-
 fn session_header(headers: &HeaderMap) -> Option<&str> {
     headers.get("x-session-id").and_then(|v| v.to_str().ok())
 }
@@ -2330,70 +1958,71 @@ async fn anthropic_messages_inner(
         &peek_body,
     );
 
-    match prov_key.as_str() {
-        "claude" => {
-            anthropic_messages_claude_native(
-                state,
-                api_key,
-                raw_bytes,
-                requested_model,
-                stripped_model,
-                session_id,
-                short_request_id,
-            )
-            .await
-        }
-        "grok" | "codex" => {
-            anthropic_messages_translated(
-                state,
-                api_key,
-                &raw_bytes,
-                &prov_key,
-                requested_model,
-                stripped_model,
-                session_id,
-                short_request_id,
-            )
-            .await
-        }
-        other => Err(AppError::BadRequest(format!(
-            "Anthropic /v1/messages does not support provider '{other}'"
-        ))),
+    // Capability-based dual-mode: optional native surface → raw path; else translated.
+    let Some(entry) = state.providers.get(&prov_key) else {
+        return Err(AppError::ServerError("provider disappeared".into()));
+    };
+    if entry.anthropic_native.is_some() {
+        anthropic_messages_via_native(
+            state,
+            api_key,
+            raw_bytes,
+            &prov_key,
+            requested_model,
+            stripped_model,
+            session_id,
+            short_request_id,
+        )
+        .await
+    } else {
+        anthropic_messages_translated(
+            state,
+            api_key,
+            &raw_bytes,
+            &prov_key,
+            requested_model,
+            stripped_model,
+            session_id,
+            short_request_id,
+        )
+        .await
     }
 }
 
-/// Claude-native Anthropic path: original body bytes → prepare/fingerprint/cch.
+/// Native Anthropic path via optional `AnthropicNativeSurface` capability.
 /// Never runs `anthropic_to_canonical`.
-async fn anthropic_messages_claude_native(
+#[allow(clippy::too_many_arguments)]
+async fn anthropic_messages_via_native(
     state: Arc<AppState>,
     api_key: Option<Extension<ApiKeyId>>,
     raw_bytes: Vec<u8>,
+    prov_key: &str,
     requested_model: String,
     stripped_model: String,
     session_id: String,
     short_request_id: String,
 ) -> Result<Response, AppError> {
-    let Some(entry) = state.providers.get("claude") else {
-        return Err(AppError::BadRequest(
-            "Anthropic /v1/messages is supported only when the claude provider is enabled".into(),
-        ));
+    let Some(entry) = state.providers.get(prov_key) else {
+        return Err(AppError::BadRequest(format!(
+            "Anthropic /v1/messages: provider '{prov_key}' is not enabled"
+        )));
     };
-    let Some(claude) = entry.claude_native.as_ref() else {
-        return Err(AppError::ServerError(
-            "claude provider does not expose native Anthropic support".into(),
-        ));
+    let Some(native) = entry.anthropic_native.as_ref() else {
+        return Err(AppError::ServerError(format!(
+            "provider '{prov_key}' does not expose native Anthropic support"
+        )));
     };
 
-    // Parse once for prepare; strip `claude:` prefix only when present.
+    // Parse once for prepare; strip `{provider}:` prefix only when present.
     let mut raw_body: serde_json::Value = serde_json::from_slice(&raw_bytes)
         .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))?;
     if let Some(model) = raw_body.get("model").and_then(|v| v.as_str()) {
         if let Some((prefix, rest)) = model.split_once(':') {
-            if prefix.eq_ignore_ascii_case("claude") {
+            if prefix.eq_ignore_ascii_case(prov_key) {
                 if rest.trim().is_empty() {
-                    return Err(AppError::BadRequest(
-                        "empty model after claude provider prefix".into(),
-                    ));
+                    return Err(AppError::BadRequest(format!(
+                        "empty model after {prov_key} provider prefix"
+                    )));
                 }
                 raw_body["model"] = serde_json::Value::String(rest.trim().to_string());
             }
@@ -2408,9 +2037,8 @@ async fn anthropic_messages_claude_native(
         raw_body["model"] = serde_json::Value::String(stripped_model.clone());
     }
 
-    let replacements = Replacements::empty();
-    let prepared = claude
-        .prepare_anthropic_messages(raw_body, &replacements, true)
+    let prepared = native
+        .prepare_messages(raw_body, true)
         .map_err(map_anthropic_prepare_err)?;
     if !prepared.dropped_fields.is_empty() {
         warn!(
@@ -2419,13 +2047,10 @@ async fn anthropic_messages_claude_native(
         );
     }
 
-    let stats_key = stats_model_key("claude", &prepared.model_canonical);
+    let stats_key = stats_model_key(prov_key, &prepared.model_canonical);
     if let Some(stats) = &state.stats {
         stats.record_request(&stats_key, api_key.as_ref().map(|key| key.0.0.as_str()));
     }
-    let ctx = provider_claude::RequestContext::new_reply()
-        .with_session(derive_session_uuid(&session_id))
-        .with_model(prepared.outbound_model.clone());
 
     log_json(
         &state,
@@ -2438,8 +2063,8 @@ async fn anthropic_messages_claude_native(
 
     if prepared.stream {
         let open_started = Instant::now();
-        let stream = claude
-            .send_anthropic_messages_stream(prepared.body(), &ctx)
+        let stream = native
+            .send_messages_stream(prepared.body(), &session_id, &prepared.outbound_model)
             .await
             .map_err(|error| {
                 let err_msg = error.to_string();
@@ -2473,15 +2098,14 @@ async fn anthropic_messages_claude_native(
             stats_key,
             session_id,
             short_request_id,
-            replacements,
             Some(prepared.requested_model.clone()),
         ));
     }
 
     let _active = state.stats.as_deref().map(ActiveRequestGuard::new);
     let started = Instant::now();
-    let mut value = claude
-        .send_anthropic_messages_json(prepared.body(), &ctx)
+    let value = native
+        .send_messages_json(prepared.body(), &session_id, &prepared.outbound_model)
         .await
         .map_err(|error| {
             let err_msg = error.to_string();
@@ -2500,12 +2124,8 @@ async fn anthropic_messages_claude_native(
             }
             map_provider_err(error)
         })?;
-    provider_claude::anthropic_passthrough::apply_response_replacements_raw(
-        &mut value,
-        &replacements,
-    );
     let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let usage = provider_claude::anthropic_passthrough::token_usage_from_response(&value);
+    let usage = token_usage_from_anthropic_response(&value);
     if let Some(stats) = &state.stats {
         stats.record_response(&stats_key, usage, None, dur_ms);
         let stop_plain = value
@@ -2566,8 +2186,6 @@ async fn anthropic_messages_translated(
         anthropic_to_canonical(&body, prov_key).map_err(|e| AppError::BadRequest(e.to_string()))?;
     // Provider sees stripped model (no client prefix).
     canon.model = stripped_model.clone();
-    validate_provider_extras(prov_key, canon.provider_extras.as_ref())
-        .map_err(AppError::BadRequest)?;
 
     let stream = body
         .get("stream")
@@ -2578,6 +2196,8 @@ async fn anthropic_messages_translated(
         .providers
         .get(prov_key)
         .ok_or_else(|| AppError::ServerError("provider disappeared".into()))?;
+    check_provider_extras(prov_key, entry, canon.provider_extras.as_ref())
+        .map_err(AppError::BadRequest)?;
     let provider = &entry.provider;
 
     let stats_key = stats_model_key(prov_key, &stripped_model);
@@ -2723,33 +2343,25 @@ async fn anthropic_count_tokens_inner(
     span.record("session_id", session_id.as_str());
     span.record("provider", prov_key.as_str());
 
-    // Non-Claude: 400 token counting unsupported (plan §7).
-    if prov_key != "claude" {
+    // count_tokens is native-surface only (Claude today); others → 400.
+    let Some(entry) = state.providers.get(&prov_key) else {
+        return Err(AppError::ServerError("provider disappeared".into()));
+    };
+    let Some(native) = entry.anthropic_native.as_ref() else {
         return Err(AppError::BadRequest(format!(
             "token counting is not supported for provider '{prov_key}' on Anthropic /v1/messages/count_tokens"
         )));
-    }
-
-    let Some(entry) = state.providers.get("claude") else {
-        return Err(AppError::BadRequest(
-            "Anthropic count_tokens requires the claude provider".into(),
-        ));
-    };
-    let Some(claude) = entry.claude_native.as_ref() else {
-        return Err(AppError::ServerError(
-            "claude provider does not expose native Anthropic support".into(),
-        ));
     };
 
     let mut raw_body: serde_json::Value = serde_json::from_slice(&raw_bytes)
         .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))?;
     if let Some(model) = raw_body.get("model").and_then(|v| v.as_str()) {
         if let Some((prefix, rest)) = model.split_once(':') {
-            if prefix.eq_ignore_ascii_case("claude") {
+            if prefix.eq_ignore_ascii_case(&prov_key) {
                 if rest.trim().is_empty() {
-                    return Err(AppError::BadRequest(
-                        "empty model after claude provider prefix".into(),
-                    ));
+                    return Err(AppError::BadRequest(format!(
+                        "empty model after {prov_key} provider prefix"
+                    )));
                 }
                 raw_body["model"] = serde_json::Value::String(rest.trim().to_string());
             }
@@ -2763,17 +2375,13 @@ async fn anthropic_count_tokens_inner(
         raw_body["model"] = serde_json::Value::String(stripped_model);
     }
 
-    let replacements = Replacements::empty();
-    let prepared = claude
-        .prepare_anthropic_count_tokens(raw_body, &replacements)
+    let prepared = native
+        .prepare_count_tokens(raw_body)
         .map_err(map_anthropic_prepare_err)?;
-    let stats_key = stats_model_key("claude", &prepared.model_canonical);
+    let stats_key = stats_model_key(&prov_key, &prepared.model_canonical);
     if let Some(stats) = &state.stats {
         stats.record_request(&stats_key, api_key.as_ref().map(|key| key.0.0.as_str()));
     }
-    let ctx = provider_claude::RequestContext::new_reply()
-        .with_session(derive_session_uuid(&session_id))
-        .with_model(prepared.outbound_model.clone());
     log_json(
         &state,
         &session_id,
@@ -2784,8 +2392,8 @@ async fn anthropic_count_tokens_inner(
     );
 
     let started = Instant::now();
-    let value = claude
-        .send_anthropic_count_tokens(prepared.body(), &ctx)
+    let value = native
+        .send_count_tokens(prepared.body(), &session_id, &prepared.outbound_model)
         .await
         .map_err(|error| {
             let err_msg = error.to_string();
@@ -2865,13 +2473,12 @@ fn anthropic_session_id(
 
 #[allow(clippy::too_many_arguments)] // SSE response factory; args are independent stream/session fields
 fn anthropic_sse_response(
-    mut upstream: provider_claude::anthropic_passthrough::RawFrameStream,
+    mut upstream: NativeAnthropicSseStream,
     stats: Option<Arc<Stats>>,
     conversation_log: Option<Arc<ConversationLog>>,
     model: String,
     session_id: String,
     request_id: String,
-    replacements: Replacements,
     requested_model: Option<String>,
 ) -> Response {
     let response_request_id = request_id.clone();
@@ -2895,7 +2502,6 @@ fn anthropic_sse_response(
         let mut stop_reason_latch: Option<String> = None;
         // Exactly one request_complete even if multiple record_error fire.
         let mut complete_snapshot: Option<RequestCompleteParams> = None;
-        let mut repl_state = provider_claude::anthropic_passthrough::RawSseReplState::new(&replacements);
 
         yield Ok::<Event, Infallible>(Event::default().comment("ok"));
 
@@ -2913,7 +2519,7 @@ fn anthropic_sse_response(
                         "message_delta" => frame.data.get("usage").is_some(),
                         _ => false,
                     };
-                    provider_claude::anthropic_passthrough::accumulate_stream_usage(&frame, &mut usage);
+                    accumulate_anthropic_stream_usage(&frame.event, &frame.data, &mut usage);
                     if had_usage_fields {
                         usage_observed = true;
                     }
@@ -2931,7 +2537,7 @@ fn anthropic_sse_response(
                         }
                     }
                     if ttft_ms.is_none()
-                        && provider_claude::anthropic_passthrough::is_upstream_content_delta(&frame)
+                        && is_anthropic_content_delta(&frame.event, &frame.data)
                     {
                         ttft_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
                     }
@@ -2980,35 +2586,34 @@ fn anthropic_sse_response(
                     {
                         saw_message_stop = true;
                     }
-                    for (event, data) in repl_state.on_frame(&frame.event, frame.data, &replacements) {
-                        match anthropic_sse_event(&event, &data) {
-                            Ok(event) => yield Ok(event),
-                            Err(error) => {
-                                stream_failed = true;
-                                if let Some(stats) = stats.as_ref() {
-                                    stats.record_error(&model, &error);
-                                    if complete_snapshot.is_none() {
-                                        let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
-                                        let params = RequestCompleteParams::error(
-                                            model.clone(),
-                                            FinishSite {
-                                                entered_body: true,
-                                                incomplete: false,
-                                                no_finish_concept: false,
-                                                finish_latch: stop_reason_latch.clone(),
-                                            },
-                                            dur_ms,
-                                        )
-                                        .with_error(Some(error.clone()))
-                                        .with_requested_model(requested_model_field.clone());
-                                        let params = with_since_launch(params, Some(stats.as_ref()));
-                                        log_request_complete(&params);
-                                        complete_snapshot = Some(params);
-                                    }
+                    // Native surface owns response replacements; edge relays frames.
+                    match anthropic_sse_event(&frame.event, &frame.data) {
+                        Ok(event) => yield Ok(event),
+                        Err(error) => {
+                            stream_failed = true;
+                            if let Some(stats) = stats.as_ref() {
+                                stats.record_error(&model, &error);
+                                if complete_snapshot.is_none() {
+                                    let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                                    let params = RequestCompleteParams::error(
+                                        model.clone(),
+                                        FinishSite {
+                                            entered_body: true,
+                                            incomplete: false,
+                                            no_finish_concept: false,
+                                            finish_latch: stop_reason_latch.clone(),
+                                        },
+                                        dur_ms,
+                                    )
+                                    .with_error(Some(error.clone()))
+                                    .with_requested_model(requested_model_field.clone());
+                                    let params = with_since_launch(params, Some(stats.as_ref()));
+                                    log_request_complete(&params);
+                                    complete_snapshot = Some(params);
                                 }
-                                yield Ok(anthropic_error_event(&error));
-                                break;
                             }
+                            yield Ok(anthropic_error_event(&error));
+                            break;
                         }
                     }
                 }
@@ -3036,22 +2641,12 @@ fn anthropic_sse_response(
                             complete_snapshot = Some(params);
                         }
                     }
-                    for (event, data) in repl_state.flush_all(&replacements) {
-                        if let Ok(event) = anthropic_sse_event(&event, &data) {
-                            yield Ok(event);
-                        }
-                    }
                     yield Ok(anthropic_error_event(&message));
                     break;
                 }
             }
         }
 
-        for (event, data) in repl_state.flush_all(&replacements) {
-            if let Ok(event) = anthropic_sse_event(&event, &data) {
-                yield Ok(event);
-            }
-        }
         if !stream_failed && !saw_message_stop {
             stream_failed = true;
             let message = "anthropic stream ended before message_stop";
@@ -3087,6 +2682,7 @@ fn anthropic_sse_response(
                     ttft_ms,
                     dur_ms,
                 );
+
                 // Success twin only at AS5 (end-of-pump finalize), with record_*.
                 let (in_tok, out_tok) = if usage_observed {
                     (Some(usage.input_tokens), Some(usage.output_tokens))
@@ -3250,7 +2846,7 @@ async fn responses_handler(
     let mut canon = omni_common::responses_to_canonical(&body)
         .map_err(|e| record_bad_request(&state, &stats_key, e))?;
     canon.model = stripped_model.clone();
-    validate_provider_extras(&prov_key, canon.provider_extras.as_ref())
+    check_provider_extras(&prov_key, entry, canon.provider_extras.as_ref())
         .map_err(|e| record_bad_request(&state, &stats_key, e))?;
 
     if let Some(stats) = &state.stats {
@@ -3441,31 +3037,57 @@ mod tests {
         }
     }
 
+    fn catalog_from_boot(boot: omni_core::BootstrappedProvider) -> ModelCatalog {
+        let mut catalog = ModelCatalog::default();
+        for (alias, canonical) in boot.aliases {
+            catalog.insert(&alias, &canonical);
+        }
+        catalog
+    }
+
     fn catalogs_claude_grok() -> HashMap<String, ModelCatalog> {
+        let claude =
+            provider_claude::from_provider(provider_claude::ClaudeProvider::new().expect("claude"))
+                .expect("claude boot");
+        let grok =
+            provider_grok::from_provider(provider_grok::GrokProvider::new(None).expect("grok"))
+                .expect("grok boot");
         HashMap::from([
-            (
-                "claude".to_string(),
-                claude_model_catalog(provider_claude::default_profile()),
-            ),
-            (
-                "grok".to_string(),
-                grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
-            ),
+            ("claude".to_string(), catalog_from_boot(claude)),
+            ("grok".to_string(), catalog_from_boot(grok)),
         ])
     }
 
     fn catalogs_claude_grok_codex() -> HashMap<String, ModelCatalog> {
-        let codex = CodexProvider::new().expect("codex provider");
         let mut catalogs = catalogs_claude_grok();
-        catalogs.insert("codex".to_string(), codex_model_catalog(&codex));
+        let codex =
+            provider_codex::from_provider(provider_codex::CodexProvider::new().expect("codex"))
+                .expect("codex boot");
+        catalogs.insert("codex".to_string(), catalog_from_boot(codex));
         catalogs
     }
 
     fn catalogs_only_claude() -> HashMap<String, ModelCatalog> {
-        HashMap::from([(
-            "claude".to_string(),
-            claude_model_catalog(provider_claude::default_profile()),
-        )])
+        let claude =
+            provider_claude::from_provider(provider_claude::ClaudeProvider::new().expect("claude"))
+                .expect("claude boot");
+        HashMap::from([("claude".to_string(), catalog_from_boot(claude))])
+    }
+
+    /// Grok catalog + models for mock LlmProvider entries (StaticProvider tests).
+    fn grok_models_and_catalog() -> (Vec<serde_json::Value>, ModelCatalog) {
+        let boot =
+            provider_grok::from_provider(provider_grok::GrokProvider::new(None).expect("grok"))
+                .expect("grok boot");
+        let models = stamp_owned_by("grok", boot.models).expect("stamp");
+        let catalog = {
+            let mut catalog = ModelCatalog::default();
+            for (alias, canonical) in boot.aliases {
+                catalog.insert(&alias, &canonical);
+            }
+            catalog
+        };
+        (models, catalog)
     }
 
     #[test]
@@ -4092,7 +3714,9 @@ mod tests {
             eprintln!("skipping smoke_routing_and_delegate_claude: no claude creds");
             return;
         }
-        let claude = Arc::new(ClaudeProvider::new().expect("claude provider for omni router test"));
+        let claude = Arc::new(
+            provider_claude::ClaudeProvider::new().expect("claude provider for omni router test"),
+        );
 
         let catalogs = catalogs_only_claude();
         let (key, stripped) = resolve_provider_and_model("claude:sonnet", &catalogs).unwrap();
@@ -4162,8 +3786,8 @@ mod tests {
         fn assert_impls_dyn<P: LlmProvider + 'static>() {
             // If this compiles, GrokProvider (and Claude) can be the pointee for the thin router.
         }
-        assert_impls_dyn::<GrokProvider>();
-        assert_impls_dyn::<ClaudeProvider>();
+        assert_impls_dyn::<provider_grok::GrokProvider>();
+        assert_impls_dyn::<provider_claude::ClaudeProvider>();
     }
 
     // --- comprehensive http/integration tests added per task (using direct handler calls for router surfaces
@@ -4305,80 +3929,74 @@ mod tests {
     }
 
     fn claude_entry() -> ProviderEntry {
-        let provider = ClaudeProvider::new().expect("claude");
-        let models = provider_model_values("claude", provider.profile().models_list())
-            .expect("claude model catalog serializes");
-        let catalog = claude_model_catalog(provider.profile());
-        let provider = Arc::new(provider);
-        ProviderEntry {
-            provider: provider.clone(),
-            claude_native: Some(provider),
-            models,
-            catalog,
-        }
+        entry_from_bootstrap(
+            "claude",
+            provider_claude::from_provider(provider_claude::ClaudeProvider::new().expect("claude"))
+                .expect("claude bootstrap"),
+        )
+        .expect("claude entry")
     }
 
     fn claude_entry_with_base(base_url: &str) -> ProviderEntry {
-        let provider =
-            ClaudeProvider::new_for_test_with_base(provider_claude::default_profile(), base_url)
-                .expect("claude test provider");
-        let models = provider_model_values("claude", provider.profile().models_list())
-            .expect("claude model catalog serializes");
-        let catalog = claude_model_catalog(provider.profile());
-        let provider = Arc::new(provider);
-        ProviderEntry {
-            provider: provider.clone(),
-            claude_native: Some(provider),
-            models,
-            catalog,
-        }
+        let provider = provider_claude::ClaudeProvider::new_for_test_with_base(
+            provider_claude::default_profile(),
+            base_url,
+        )
+        .expect("claude test provider");
+        entry_from_bootstrap(
+            "claude",
+            provider_claude::from_provider(provider).expect("claude bootstrap"),
+        )
+        .expect("claude entry")
     }
 
     fn claude_custom_entry_with_base(base_url: &str) -> ProviderEntry {
-        let provider = ClaudeProvider::new_for_custom_gateway(
+        let provider = provider_claude::ClaudeProvider::new_for_custom_gateway(
             provider_claude::default_profile(),
             base_url,
             Some("test-token".into()),
             Vec::new(),
         )
         .expect("claude test provider");
-        let models = provider_model_values("claude", provider.profile().models_list())
-            .expect("claude model catalog serializes");
-        let catalog = claude_model_catalog(provider.profile());
-        let provider = Arc::new(provider);
-        ProviderEntry {
-            provider: provider.clone(),
-            claude_native: Some(provider),
-            models,
-            catalog,
-        }
+        entry_from_bootstrap(
+            "claude",
+            provider_claude::from_provider(provider).expect("claude bootstrap"),
+        )
+        .expect("claude entry")
     }
 
     fn grok_entry(base_url: &str) -> ProviderEntry {
         // Custom auth so hermetic tests mock OpenAI-compatible /chat/completions
         // without requiring the CLI Responses wire.
-        let provider = GrokProvider::new(None)
+        let provider = provider_grok::GrokProvider::new(None)
             .expect("grok provider")
             .with_base_url(base_url)
             .with_custom_auth(Some("k".into()), None, vec![]);
-        ProviderEntry {
-            provider: Arc::new(provider),
-            claude_native: None,
-            models: provider_model_values("grok", GrokProvider::default_models_list())
-                .expect("grok model catalog serializes"),
-            catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
-        }
+        entry_from_bootstrap(
+            "grok",
+            provider_grok::from_provider(provider).expect("grok bootstrap"),
+        )
+        .expect("grok entry")
     }
 
     fn codex_entry() -> ProviderEntry {
-        let provider = CodexProvider::new().expect("codex provider");
-        ProviderEntry {
-            provider: Arc::new(provider.clone()),
-            claude_native: None,
-            models: provider_model_values("codex", provider.models_list())
-                .expect("codex model catalog serializes"),
-            catalog: codex_model_catalog(&provider),
-        }
+        let provider = provider_codex::CodexProvider::new().expect("codex provider");
+        entry_from_bootstrap(
+            "codex",
+            provider_codex::from_provider(provider).expect("codex bootstrap"),
+        )
+        .expect("codex entry")
+    }
+
+    fn live_grok_entry() -> ProviderEntry {
+        entry_from_bootstrap(
+            "grok",
+            provider_grok::from_provider(
+                provider_grok::GrokProvider::new(None).expect("grok provider with creds"),
+            )
+            .expect("grok bootstrap"),
+        )
+        .expect("live grok entry")
     }
 
     struct TempCodexHome {
@@ -4533,16 +4151,6 @@ requires_openai_auth = false
     impl Drop for TempDetectedProviderHomes {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn live_grok_entry() -> ProviderEntry {
-        ProviderEntry {
-            provider: Arc::new(GrokProvider::new(None).expect("grok provider with creds")),
-            claude_native: None,
-            models: provider_model_values("grok", GrokProvider::default_models_list())
-                .expect("grok model catalog serializes"),
-            catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
         }
     }
 
@@ -4888,8 +4496,9 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_claude_provider(&VersionSelector::Latest)
+        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
             .expect("custom Claude provider from env");
+        let provider = boot.provider;
         drop(creds);
         let response = provider
             .send(omni_core::CanonicalRequest {
@@ -4948,21 +4557,13 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_claude_provider(&VersionSelector::Latest)
+        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
             .expect("custom Claude provider from env");
         drop(creds);
-        let models = provider_model_values("claude", provider.profile().models_list()).unwrap();
-        let catalog = claude_model_catalog(provider.profile());
-        let provider = Arc::new(provider);
         let mut providers = HashMap::new();
         providers.insert(
             "claude".into(),
-            ProviderEntry {
-                provider: provider.clone(),
-                claude_native: Some(provider),
-                models,
-                catalog,
-            },
+            entry_from_bootstrap("claude", boot).expect("claude entry"),
         );
 
         let resp = call_anthropic_messages_handler(
@@ -5021,8 +4622,9 @@ requires_openai_auth = false
                 .await;
         }
 
-        let provider = init_claude_provider(&VersionSelector::Latest)
+        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
             .expect("custom Claude provider from env");
+        let provider = boot.provider;
         drop(creds);
         let request = || omni_core::CanonicalRequest {
             model: "sonnet".into(),
@@ -5054,8 +4656,9 @@ requires_openai_auth = false
             ("ANTHROPIC_API_KEY", None),
             ("ANTHROPIC_CUSTOM_HEADERS", Some("X-Valid: yes")),
         ]);
-        let provider = init_claude_provider(&VersionSelector::Latest)
+        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
             .expect("custom Claude provider from env");
+        let provider = boot.provider;
         unsafe {
             std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "bad header");
         }
@@ -5112,10 +4715,11 @@ requires_openai_auth = false
             .mount(&omni_server)
             .await;
 
-        let provider =
-            init_claude_provider(&VersionSelector::Latest).expect("OMNI Claude provider from env");
+        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
+            .expect("OMNI Claude provider from env");
         drop(creds);
-        let response = provider
+        let response = boot
+            .provider
             .send(omni_core::CanonicalRequest {
                 model: "sonnet".into(),
                 messages: vec![omni_core::CanonicalMessage {
@@ -5161,9 +4765,10 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider =
-            init_grok_provider(&VersionSelector::Latest).expect("custom Grok provider from env");
-        let response = provider
+        let boot = provider_grok::bootstrap(&VersionSelector::Latest)
+            .expect("custom Grok provider from env");
+        let response = boot
+            .provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
                 messages: vec![omni_core::CanonicalMessage {
@@ -5222,9 +4827,10 @@ requires_openai_auth = false
             .mount(&omni_server)
             .await;
 
-        let provider =
-            init_grok_provider(&VersionSelector::Latest).expect("OMNI Grok provider from env");
-        let response = provider
+        let boot = provider_grok::bootstrap(&VersionSelector::Latest)
+            .expect("OMNI Grok provider from env");
+        let response = boot
+            .provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
                 messages: vec![omni_core::CanonicalMessage {
@@ -5276,8 +4882,9 @@ requires_openai_auth = false
                 .await;
         }
 
-        let provider =
-            init_grok_provider(&VersionSelector::Latest).expect("custom Grok provider from env");
+        let boot = provider_grok::bootstrap(&VersionSelector::Latest)
+            .expect("custom Grok provider from env");
+        let provider = boot.provider;
         let request = || omni_core::CanonicalRequest {
             model: "grok".into(),
             messages: vec![omni_core::CanonicalMessage {
@@ -5321,9 +4928,10 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider =
-            init_grok_provider(&VersionSelector::Latest).expect("custom Grok provider from env");
-        let response = provider
+        let boot = provider_grok::bootstrap(&VersionSelector::Latest)
+            .expect("custom Grok provider from env");
+        let response = boot
+            .provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
                 messages: vec![omni_core::CanonicalMessage {
@@ -5907,7 +5515,6 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "claude:claude-sonnet-4-6".into(),
             "sess".into(),
             "req".into(),
-            Replacements::empty(),
             None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
@@ -5935,7 +5542,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         let stats = Arc::new(Stats::open(&stats_path).unwrap());
         stats.record_request("claude:claude-sonnet-4-6", None);
         let upstream = futures_util::stream::iter(vec![
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "message_start".into(),
                 data: serde_json::json!({
                     "type": "message_start",
@@ -5946,7 +5553,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     }
                 }),
             }),
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "content_block_delta".into(),
                 data: serde_json::json!({
                     "type": "content_block_delta",
@@ -5954,7 +5561,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     "delta": {"type": "text_delta", "text": "partial"}
                 }),
             }),
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "message_delta".into(),
                 data: serde_json::json!({
                     "type": "message_delta",
@@ -5962,7 +5569,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     "usage": {"output_tokens": 7}
                 }),
             }),
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "error".into(),
                 data: serde_json::json!({
                     "type": "error",
@@ -5977,7 +5584,6 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "claude:claude-sonnet-4-6".into(),
             "sess".into(),
             "req".into(),
-            Replacements::empty(),
             None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
@@ -6007,7 +5613,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         let stats = Arc::new(Stats::open(&stats_path).unwrap());
         stats.record_request("claude:claude-sonnet-4-6", None);
         let upstream = futures_util::stream::iter(vec![
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "message_start".into(),
                 data: serde_json::json!({
                     "type": "message_start",
@@ -6018,7 +5624,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     }
                 }),
             }),
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "content_block_delta".into(),
                 data: serde_json::json!({
                     "type": "content_block_delta",
@@ -6026,7 +5632,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     "delta": {"type": "text_delta", "text": "partial"}
                 }),
             }),
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "message_delta".into(),
                 data: serde_json::json!({
                     "type": "message_delta",
@@ -6042,7 +5648,6 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "claude:claude-sonnet-4-6".into(),
             "sess".into(),
             "req".into(),
-            Replacements::empty(),
             None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
@@ -6108,9 +5713,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -6275,9 +5887,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(WarningProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         mk_app_with(providers, Arc::new(HashSet::new()))
@@ -6362,9 +5981,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -6459,9 +6085,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StreamingProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -6549,9 +6182,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(FailingStreamProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -6635,9 +6275,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(MissingFinishStreamProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -6716,9 +6363,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(NoFinishReasonProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -6784,9 +6438,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(SecretErrorProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -6845,7 +6506,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         let stats = Arc::new(Stats::open(&stats_path).unwrap());
         stats.record_request("claude:claude-sonnet-4-6", None);
         let upstream = futures_util::stream::iter(vec![
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "message_start".into(),
                 data: serde_json::json!({
                     "type": "message_start",
@@ -6856,7 +6517,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     }
                 }),
             }),
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "content_block_delta".into(),
                 data: serde_json::json!({
                     "type": "content_block_delta",
@@ -6864,7 +6525,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     "delta": {"type": "text_delta", "text": "hi"}
                 }),
             }),
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "message_delta".into(),
                 data: serde_json::json!({
                     "type": "message_delta",
@@ -6872,7 +6533,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     "usage": {"output_tokens": 2}
                 }),
             }),
-            Ok(provider_claude::upstream::RawFrame {
+            Ok(omni_core::NativeAnthropicSseFrame {
                 event: "message_stop".into(),
                 data: serde_json::json!({"type": "message_stop"}),
             }),
@@ -6884,7 +6545,6 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "claude:claude-sonnet-4-6".into(),
             "sess".into(),
             "req".into(),
-            Replacements::empty(),
             None,
         );
         let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -7141,9 +6801,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(ErrMidStreamProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         mk_app_with(providers, Arc::new(HashSet::new()))
@@ -7259,9 +6926,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let state = state_with_conversation_log(providers, &dir);
@@ -7341,9 +7015,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StreamingProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -7423,9 +7104,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(FailingStreamProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -7511,9 +7199,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(ErrorFinishStreamProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -7600,9 +7295,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(MissingFinishStreamProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -7916,9 +7618,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let state = state_with(map);
@@ -7984,9 +7693,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
-                claude_native: None,
-                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
-                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+                anthropic_native: None,
+                models: {
+                    let (m, _) = grok_models_and_catalog();
+                    m
+                },
+                catalog: {
+                    let (_, c) = grok_models_and_catalog();
+                    c
+                },
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -8164,10 +7880,10 @@ rule = [
         assert_eq!(r.apply_prompt("ping"), "pong");
         assert_eq!(r.apply_response("ping"), "pong");
         // grok path (test ctor, no net)
-        let pg = GrokProvider::new_for_test("k", "http://127.0.0.1:9");
+        let pg = provider_grok::GrokProvider::new_for_test("k", "http://127.0.0.1:9");
         assert_eq!(pg.id(), "grok");
         // claude path
-        let pc = ClaudeProvider::new().expect("claude");
+        let pc = provider_claude::ClaudeProvider::new().expect("claude");
         assert_eq!(pc.id(), "claude");
         let canon = omni_core::CanonicalResponse {
             model: "m".into(),
@@ -8732,12 +8448,13 @@ rule = [
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
-                claude_native: None,
+                anthropic_native: None,
                 models: vec![
                     serde_json::json!({"id":"o1-mini","owned_by":"grok"}),
                     serde_json::json!({"id":"gpt-4o","owned_by":"grok"}),
                 ],
                 catalog,
+                extras_allowed: provider_grok::extras_allowed,
             },
         );
         let state = state_with_strict(providers, AnthropicAuthScheme::ApiKey);
@@ -9030,6 +8747,134 @@ rule = [
             ),
             other => panic!("expected provider-extra BadRequest, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_chat_extras_policy_follows_entry_not_provider_id() {
+        // WHY: extras allowlist must live on the entry (provider-owned bootstrap
+        // policy). If the binary re-hardcoded match arms by provider name, a
+        // synthetic entry whose policy contradicts its id would still pass or
+        // fail for the wrong reason. This would fail if policy lived only in
+        // binary name-matching.
+        //
+        // Use a stub LlmProvider so the test isolates edge policy (Claude's own
+        // wire layer rejects all extras after edge allow).
+        use async_trait::async_trait;
+        struct StubOk;
+        #[async_trait]
+        impl LlmProvider for StubOk {
+            fn id(&self) -> &'static str {
+                "claude"
+            }
+            async fn send(
+                &self,
+                req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                Ok(CanonicalResponse {
+                    model: req.model,
+                    content: "ok".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: Default::default(),
+                    id: None,
+                    refusal: None,
+                    ..Default::default()
+                })
+            }
+        }
+        fn allow_only_seed(key: &str) -> bool {
+            key == "seed"
+        }
+        let mut entry = claude_entry();
+        // Keep Claude catalog/aliases for routing; replace provider + policy.
+        entry.provider = Arc::new(StubOk);
+        entry.anthropic_native = None;
+        entry.extras_allowed = allow_only_seed;
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), entry);
+        let state = state_with(map);
+
+        // seed is not on Claude's real allowlist (Claude allows nothing), but
+        // our injected policy permits it — must succeed.
+        let ok_req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"claude:sonnet","messages":[{"role":"user","content":"hi"}],
+                "seed":7}"#,
+        )
+        .unwrap();
+        call_chat_handler(state.clone(), ok_req)
+            .await
+            .expect("injected entry policy must allow seed through the edge");
+
+        // response_format is not in allow_only_seed — must 400 from entry policy.
+        let bad_req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"claude:sonnet","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        match call_chat_handler(state, bad_req).await {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("response_format"),
+                "entry policy must reject response_format: {msg}"
+            ),
+            other => panic!("expected BadRequest from entry extras policy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_anthropic_messages_dispatches_via_native_capability_not_provider_id() {
+        // WHY: /v1/messages must choose native vs translated from the entry's
+        // anthropic_native capability. A native-only field (`top_k`) must reach
+        // upstream prepare/send without anthropic_to_canonical (which drops it).
+        // Would fail if Claude were forced through the lossy canonical door.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(body_partial_json(serde_json::json!({ "top_k": 7 })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_native_cap",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type":"text","text":"native top_k ok"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert(
+            "claude".into(),
+            claude_custom_entry_with_base(&server.uri()),
+        );
+        let resp = call_anthropic_messages_handler(
+            state_with(map),
+            r#"{"model":"sonnet","max_tokens":8,"top_k":7,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["content"][0]["text"], "native top_k ok");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "native path must hit Anthropic upstream once"
+        );
+        let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            sent.get("top_k").and_then(|t| t.as_u64()),
+            Some(7),
+            "top_k must survive native prepare (not lost via anthropic_to_canonical)"
+        );
     }
 
     #[tokio::test]

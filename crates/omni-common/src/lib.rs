@@ -3,6 +3,7 @@
 //! Extracted/adapted from the original claude-code-provider common pieces.
 
 pub mod anthropic;
+pub mod anthropic_native_stats;
 pub mod auth;
 pub mod canonical_mapping;
 pub mod conversation_log;
@@ -23,6 +24,10 @@ pub use anthropic::{
     AnthropicMapError, AnthropicProtocolError, anthropic_to_canonical, canonical_to_anthropic,
     encode_tool_result_content, parse_anthropic_object_no_dup_keys, peek_model_string,
     sse_from_canonical_stream_anthropic,
+};
+pub use anthropic_native_stats::{
+    accumulate_anthropic_stream_usage, is_anthropic_content_delta,
+    token_usage_from_anthropic_response,
 };
 pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};

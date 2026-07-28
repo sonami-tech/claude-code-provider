@@ -40,7 +40,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
+pub mod bootstrap;
 pub mod credentials;
+
+pub use bootstrap::{
+    PROVIDER_ID, bootstrap, detected, detection_source, extras_allowed, from_provider,
+};
 
 use credentials::GrokCredentials;
 

@@ -13,7 +13,12 @@
 //! (`OMNI_OAUTH_REFRESH`, `OMNI_CODEX_OAUTH_REFRESH`, `--no-oauth-refresh-codex`,
 //! etc.). Static API keys are never refreshed.
 
+pub mod bootstrap;
 mod oauth_refresh;
+
+pub use bootstrap::{
+    PROVIDER_ID, bootstrap, detected, detection_source, extras_allowed, from_provider,
+};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
