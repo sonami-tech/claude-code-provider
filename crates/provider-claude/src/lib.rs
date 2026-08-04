@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(provider_id(), "claude");
         let p = ClaudeProvider::new().expect("default profile constructs");
         assert_eq!(p.id(), "claude");
-        assert_eq!(p.profile().name, "cc-2.1.220-sdk-cli");
+        assert_eq!(p.profile().name, "cc-2.1.221-sdk-cli");
     }
 
     #[test]

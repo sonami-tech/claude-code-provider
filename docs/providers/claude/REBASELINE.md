@@ -129,27 +129,27 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 - Recovered vectors are local to this repo and covered by Rust tests.
 - Default workspace tests pass without credentials or network.
 
-## Current 2.1.220 Status
+## Current 2.1.221 Status
 
-On 2026-07-26, Claude Code 2.1.220 was captured and model behavior was verified
+On 2026-08-04, Claude Code 2.1.221 was captured and model behavior was verified
 for default, `opus`, `sonnet`, and `haiku` flows. Headers still use SDK package
 `0.94.0`, runtime `v26.3.0`, Anthropic version `2023-06-01`, and
-`claude-cli/2.1.220 (external, sdk-cli)`.
+`claude-cli/2.1.221 (external, sdk-cli)`.
 
-2.1.220 is the current `latest` profile. Drift versus 2.1.211:
+2.1.221 is the current `latest` profile. Drift versus 2.1.220 is a pure version
+bump:
 
 1. CLI version string (UA + billing `cc_version`).
-2. Opus catalog id `claude-opus-4-8` → `claude-opus-5` (default and `--model opus`).
-3. Default and explicit-opus betas gain `fallback-credit-2026-06-01`.
 
-Sonnet/haiku betas, wire defaults (opus/sonnet 64k/no-temp/high; haiku
-32k/no-temp/no-effort), stainless package/runtime, and the no-cch billing shape
-are live-confirmed unchanged.
+Catalog, per-model betas (default/opus with `fallback-credit-2026-06-01`; sonnet
+matches mid-conversation without fallback; haiku unchanged), wire defaults
+(opus/sonnet 64k/no-temp/high; haiku 32k/no-temp/no-effort), stainless
+package/runtime, and the no-cch billing shape are live-confirmed unchanged.
 
-Like 2.1.186/197/207/211 it emits the billing header with no `cch=` field, ending
-at `cc_entrypoint=sdk-cli;`. The `cc_version` suffix algorithm is unchanged: the
-existing Sha256Utf16SampleV1 suffix reproduces the captured
-`cc_version=2.1.220.01b` exactly, and the live drift checker agrees against the
+Like 2.1.186/197/207/211/220 it emits the billing header with no `cch=` field,
+ending at `cc_entrypoint=sdk-cli;`. The `cc_version` suffix algorithm is
+unchanged: the existing Sha256Utf16SampleV1 suffix reproduces the captured
+`cc_version=2.1.221.116` exactly, and the live drift checker agrees against the
 installed CLI. Because there is no checksum to recompute, this no-cch profile
 ships no clean-room cch vectors.
 

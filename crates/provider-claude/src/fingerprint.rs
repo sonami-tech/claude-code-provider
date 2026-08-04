@@ -1060,7 +1060,7 @@ pub const WIRE_DEFAULTS_CC_2_1_207: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.220-sdk-cli";
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.221-sdk-cli";
 pub const LATEST_PROFILE_ALIAS: &str = "latest";
 
 pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfile {
@@ -1341,8 +1341,8 @@ pub const PROFILE_CLAUDE_2_1_211_SDK_CLI: FingerprintProfile = FingerprintProfil
 
 // Captured 2026-07-26 against installed Claude Code 2.1.220 via the shared
 // tools.capture framework (mitmproxy reverse proxy + real claude CLI, clean tmpfs
-// HOME), for default, explicit opus, sonnet, and haiku. This is now the default
-// `latest` profile. Drift vs 2.1.211:
+// HOME), for default, explicit opus, sonnet, and haiku. Selectable older profile
+// (no longer `latest`). Drift vs 2.1.211:
 //   1. claude_cli_version 2.1.211 -> 2.1.220 (UA + billing cc_version).
 //   2. Opus catalog id claude-opus-4-8 -> claude-opus-5 (default + --model opus).
 //   3. Default and explicit-opus betas gain fallback-credit-2026-06-01.
@@ -1350,7 +1350,7 @@ pub const PROFILE_CLAUDE_2_1_211_SDK_CLI: FingerprintProfile = FingerprintProfil
 // no-cch billing shape are live-confirmed unchanged. cc_version suffix algorithm
 // unchanged (captured cc_version=2.1.220.01b for prompt "Say OK").
 pub const PROFILE_CLAUDE_2_1_220_SDK_CLI: FingerprintProfile = FingerprintProfile {
-    name: DEFAULT_PROFILE_NAME,
+    name: "cc-2.1.220-sdk-cli",
     aliases: &["2.1.220"],
     claude_cli_version: "2.1.220",
     stainless_package_version: "0.94.0",
@@ -1366,7 +1366,33 @@ pub const PROFILE_CLAUDE_2_1_220_SDK_CLI: FingerprintProfile = FingerprintProfil
     billing: BILLING_SCHEME_V1_NO_CCH,
 };
 
+// Captured 2026-08-04 against installed Claude Code 2.1.221 via the shared
+// tools.capture framework (mitmproxy reverse proxy + real claude CLI, clean tmpfs
+// HOME), for default, explicit opus, sonnet, and haiku. This is now the default
+// `latest` profile. Drift vs 2.1.220 is a pure version bump:
+//   1. claude_cli_version 2.1.220 -> 2.1.221 (UA + billing cc_version).
+// Catalog, per-model betas, wire defaults, stainless package/runtime, and the
+// no-cch billing shape are live-confirmed unchanged. cc_version suffix algorithm
+// unchanged (captured cc_version=2.1.221.116 for prompt "Say OK").
+pub const PROFILE_CLAUDE_2_1_221_SDK_CLI: FingerprintProfile = FingerprintProfile {
+    name: DEFAULT_PROFILE_NAME,
+    aliases: &["2.1.221"],
+    claude_cli_version: "2.1.221",
+    stainless_package_version: "0.94.0",
+    stainless_runtime_version: "v26.3.0",
+    entrypoint: "sdk-cli",
+    beta_reply: BETA_CC_2_1_220_DEFAULT,
+    model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_220,
+    system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
+    models: CATALOG_CC_2_1_220,
+    preserve_explicit_model: true,
+    wire_defaults: WIRE_DEFAULTS_CC_2_1_207,
+    model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_220,
+    billing: BILLING_SCHEME_V1_NO_CCH,
+};
+
 pub static FINGERPRINT_PROFILES: &[FingerprintProfile] = &[
+    PROFILE_CLAUDE_2_1_221_SDK_CLI,
     PROFILE_CLAUDE_2_1_220_SDK_CLI,
     PROFILE_CLAUDE_2_1_211_SDK_CLI,
     PROFILE_CLAUDE_2_1_207_SDK_CLI,
@@ -2008,9 +2034,9 @@ mod tests {
         let creds = fixture_creds();
         let cases = [
             ("fable", BETA_CC_2_1_186_FABLE, false),
-            // 2.1.220: explicit opus-5 beta includes fallback-credit (no context-1m).
+            // 2.1.221 (same as 2.1.220): explicit opus-5 beta includes fallback-credit.
             ("opus", BETA_CC_2_1_220_OPUS, false),
-            // 2.1.220: sonnet-5 beta matches 2.1.207 OPUS list (mid-conversation, no fallback).
+            // 2.1.221: sonnet-5 beta matches 2.1.207 OPUS list (mid-conversation, no fallback).
             ("sonnet", BETA_CC_2_1_186_OPUS, false),
             ("haiku", BETA_CC_2_1_186_HAIKU, false),
         ];
@@ -2156,13 +2182,13 @@ mod tests {
     #[test]
     fn default_profile_matches_refreshed_claude_code_baseline() {
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.220-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.220");
+        assert_eq!(profile.name, "cc-2.1.221-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.221");
         assert_eq!(profile.stainless_package_version, "0.94.0");
         assert_eq!(profile.stainless_runtime_version, "v26.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.220 (external, sdk-cli)"
+            "claude-cli/2.1.221 (external, sdk-cli)"
         );
         assert_eq!(
             profile.resolve_model("fable").unwrap().canonical,
@@ -2180,7 +2206,7 @@ mod tests {
             profile.resolve_model("haiku").unwrap().canonical,
             "claude-haiku-4-5-20251001"
         );
-        // Captured 2.1.220 default/opus betas include fallback-credit.
+        // Captured 2.1.221 default/opus betas still include fallback-credit.
         assert!(profile.beta_reply.contains("fallback-credit-2026-06-01"));
         assert_eq!(
             profile.beta_reply_for_model("claude-opus-5"),
@@ -2196,7 +2222,13 @@ mod tests {
     fn profile_registry_resolves_known_selectors() {
         assert_eq!(
             resolve_profile("latest").unwrap().name,
-            "cc-2.1.220-sdk-cli"
+            "cc-2.1.221-sdk-cli"
+        );
+        assert_eq!(
+            resolve_profile("cc-2.1.220-sdk-cli")
+                .unwrap()
+                .claude_cli_version,
+            "2.1.220"
         );
         assert_eq!(
             resolve_profile("cc-2.1.211-sdk-cli")
@@ -2360,11 +2392,15 @@ mod tests {
         // and prompt "Say OK" on 2026-07-26 (live shared-capture mitmproxy run:
         // the real billing header read `cc_version=2.1.220.01b`).
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.220"), "01b");
-        // 2.1.220 (the default) emits NO cch field - the header ends at the
+        // Captured from Claude Code 2.1.221 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
+        // and prompt "Say OK" on 2026-08-04 (live shared-capture mitmproxy run:
+        // the real billing header read `cc_version=2.1.221.116`).
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.221"), "116");
+        // 2.1.221 (the default) emits NO cch field - the header ends at the
         // entrypoint. Verified byte-for-byte from the live capture.
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.220.01b; cc_entrypoint=sdk-cli;"
+            "x-anthropic-billing-header: cc_version=2.1.221.116; cc_entrypoint=sdk-cli;"
         );
         // The 2.1.175 profile still emits the cch placeholder form.
         assert_eq!(

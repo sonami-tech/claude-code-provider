@@ -65,14 +65,14 @@ const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 // This is plan-dependent: a platform sk- key / higher plan would likely expose
 // more, which a future version entry would capture.
 //
-// Version bumped to 0.145.0 on 2026-07-26. The installed CLI's request wire was
+// Version bumped to 0.146.0 on 2026-08-04. The installed CLI's request wire was
 // re-observed live via shared tools.capture (originator codex_exec,
 // x-codex-beta-features remote_compaction_v2, user-agent template, body key set
-// all unchanged from 0.144.5; only the version string moved). This host's Codex
+// all unchanged from 0.145.0; only the version string moved). This host's Codex
 // config points at a custom Responses base_url, so the native ChatGPT-backend
 // catalog was not re-probed this cycle; the model set below is carried from the
 // 0.142.0 verification.
-const CODEX_CATALOG_0_145_0: &[CatalogModel] = &[
+const CODEX_CATALOG_0_146_0: &[CatalogModel] = &[
     CatalogModel::new("gpt-5.5", &["gpt"]),
     CatalogModel::new("gpt-5.4-mini", &["mini", "gpt-mini"]),
 ];
@@ -81,9 +81,9 @@ const CODEX_CATALOG_0_145_0: &[CatalogModel] = &[
 /// codex CLI version this catalog was verified against. Conservative and extended
 /// point at the same list for the captured (free) plan.
 static CODEX_VERSIONS: &[ProviderVersion] = &[ProviderVersion {
-    version: "0.145.0",
-    conservative: CODEX_CATALOG_0_145_0,
-    extended: CODEX_CATALOG_0_145_0,
+    version: "0.146.0",
+    conservative: CODEX_CATALOG_0_146_0,
+    extended: CODEX_CATALOG_0_146_0,
     default_model: DEFAULT_CODEX_MODEL,
 }];
 
@@ -2287,7 +2287,7 @@ model = "gpt-native"
 
     #[test]
     fn codex_version_pin_is_exact_or_fails() {
-        let ok = CodexProvider::new().unwrap().with_version("0.145.0");
+        let ok = CodexProvider::new().unwrap().with_version("0.146.0");
         assert!(ok.is_ok());
         let bad = CodexProvider::new().unwrap().with_version("0.0.1");
         assert!(bad.is_err(), "unknown version must fail, not fall back");
@@ -2565,8 +2565,8 @@ query_params = { api-version = "2026-01-01" }
             access_token: "eyJ-fake-oauth".into(),
             account_id: "11111111-2222-3333-4444-555555555555".into(),
         };
-        let headers = conservative_codex_headers("0.145.0", &auth).unwrap();
-        assert_eq!(headers.get("version").unwrap(), "0.145.0");
+        let headers = conservative_codex_headers("0.146.0", &auth).unwrap();
+        assert_eq!(headers.get("version").unwrap(), "0.146.0");
         assert_eq!(
             headers.get("authorization").unwrap(),
             "Bearer eyJ-fake-oauth"
@@ -2579,12 +2579,12 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(headers.get("originator").unwrap(), "codex_exec");
         assert_eq!(
             headers.get("user-agent").unwrap(),
-            "codex_exec/0.145.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.145.0)"
+            "codex_exec/0.146.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.146.0)"
         );
 
         let request = conservative_ws_request(
             "ws://127.0.0.1/backend-api/codex/responses",
-            "0.145.0",
+            "0.146.0",
             &auth,
         )
         .unwrap();
@@ -2599,7 +2599,7 @@ query_params = { api-version = "2026-01-01" }
             CONSERVATIVE_BETA_FEATURES
         );
         assert_eq!(ws_headers.get("originator").unwrap(), "codex_exec");
-        assert_eq!(ws_headers.get("version").unwrap(), "0.145.0");
+        assert_eq!(ws_headers.get("version").unwrap(), "0.146.0");
         assert_eq!(
             ws_headers.get("x-client-request-id").unwrap(),
             CONSERVATIVE_CLIENT_REQUEST_ID
@@ -2721,14 +2721,14 @@ requires_openai_auth = false
         );
         assert_eq!(
             headers.get("user-agent").unwrap().to_str().unwrap(),
-            "codex_exec/0.145.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.145.0)"
+            "codex_exec/0.146.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.146.0)"
         );
         assert_eq!(headers.get("originator").unwrap(), "codex_exec");
         assert_eq!(
             headers.get("openai-beta").unwrap(),
             CONSERVATIVE_OPENAI_BETA
         );
-        assert_eq!(headers.get("version").unwrap(), "0.145.0");
+        assert_eq!(headers.get("version").unwrap(), "0.146.0");
         assert_eq!(
             headers.get("x-codex-beta-features").unwrap(),
             CONSERVATIVE_BETA_FEATURES
@@ -2834,7 +2834,7 @@ model = "gpt-5.5"
             .and(header("authorization", "Bearer eyJ-test-oauth"))
             .and(header("chatgpt-account-id", "acct-test"))
             .and(header("originator", "codex_exec"))
-            .and(header("version", "0.145.0"))
+            .and(header("version", "0.146.0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "models": [{"slug": "gpt-5.5", "prefer_websockets": true}]
             })))
