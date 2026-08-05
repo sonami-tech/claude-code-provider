@@ -34,9 +34,9 @@ fingerprint logic remains isolated in provider crates.
   chunks terminated by `data: [DONE]`.
 - `POST /v1/responses` - supported OpenAI Responses subset, non-stream JSON or
   Responses SSE events.
-- `POST /v1/messages` - native Anthropic Messages inbound for Claude models
-  only. This bypasses canonical OpenAI framing and forwards Anthropic JSON/SSE
-  through the Claude provider's fingerprint path.
+- `POST /v1/messages` - dual-mode Anthropic Messages inbound. Claude models use
+  the native fingerprint path; Grok/Codex models use the translated path (see
+  `docs/anthropic-compat.md`).
 - `POST /v1/messages/count_tokens` - native Anthropic token counting for Claude
   models only.
 - `GET /v1/models`, `GET /models` - provider-owned canonical model catalogs.
@@ -169,11 +169,11 @@ Inbound compatibility:
 |---|---:|---:|---:|
 | OpenAI `/v1/chat/completions` | Yes | Yes | Yes |
 | OpenAI `/v1/responses` | Yes | Yes | Yes |
-| Anthropic `/v1/messages` | Yes | No | No |
+| Anthropic `/v1/messages` | Yes (native) | Yes (translated) | Yes (translated) |
 | Anthropic `/v1/messages/count_tokens` | Yes | No | No |
 
-Anthropic inbound is intentionally provider-native. It routes only to Claude;
-use OpenAI-compatible inbound surfaces for Grok and Codex.
+Anthropic inbound is dual-mode: Claude is native; Grok/Codex are translated.
+`count_tokens` remains Claude-only. Full notes: `docs/anthropic-compat.md`.
 
 Provider maintenance docs live under `docs/providers/`. Live provider tests are
 explicitly opt-in:
@@ -184,3 +184,44 @@ OMNI_LIVE_TESTS=1 cargo test --workspace
 
 Do not enable `OMNI_LIVE_TESTS` in normal CI or shell profiles; live tests may
 spend provider quota and depend on account state.
+
+### Live HTTP suite (running process, issue #15)
+
+Opt-in Python suite that targets a **running** omni instance. It does **not**
+spawn omni, does **not** run under `cargo test`, and is **not** part of CI.
+Default base URL is `http://127.0.0.1:18321` (override with `--base-url` or
+`OMNI_BASE_URL`).
+
+Start omni yourself first (example):
+
+```bash
+cargo run -p omni -- --no-auth --port 18321
+```
+
+Then run the suite from the repo root:
+
+```bash
+python3 -m tools.live_http_suite
+python3 -m tools.live_http_suite --base-url http://127.0.0.1:19001
+python3 -m tools.live_http_suite --dual-mode-off   # skip dual-mode Anthropic edge
+```
+
+Hermetic unit tests for oracles and retry policy (no network):
+
+```bash
+python3 -m unittest tools.live_http_suite.tests.test_hermetic -v
+```
+
+Model pins (override via env): `OMNI_TEST_CLAUDE_MODEL` (default
+`claude-haiku-4-5-20251001`), `OMNI_TEST_DUAL_MODE_MODEL` (default `grok-4.5`),
+`OMNI_TEST_RESPONSES_MODEL` (default Claude haiku pin). The suite fails loud if
+a required pin is missing from `GET /v1/models`. Dual-mode skip is only via
+`OMNI_TEST_DUAL_MODE_OFF=1` or `--dual-mode-off`, checked before resolving the
+dual-mode pin (never inferred from 4xx).
+
+Other knobs: `OMNI_TEST_HTTP_TIMEOUT_S` (per-attempt wall-clock seconds, default
+60; retries reset the deadline), `--only NAME…`, `--list`. The suite sends no
+gateway credentials; start omni with `--no-auth` (or an empty key set). Zero-pass
+and all-skip runs exit non-zero. Prefer multi-provider omni so unknown-model
+tests are rejected at the gateway (single-provider mode can pass unknown ids
+through to upstream).

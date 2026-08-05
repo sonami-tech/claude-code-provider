@@ -142,3 +142,7 @@ pseudo-streaming.
 - Live provider tests require `OMNI_LIVE_TESTS=1` plus usable credentials.
 - Subprocess HTTP tests use shared Rust helpers in `omni-common::test_support`
   instead of shelling out to `curl`.
+- Residual live HTTP checks against a **running** omni process live in
+  `tools/live_http_suite` (issue #15). Opt-in only
+  (`python3 -m tools.live_http_suite`); not spawned by cargo, not run in CI.
+  Separate from `OMNI_LIVE_TESTS`.
