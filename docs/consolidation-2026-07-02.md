@@ -4,6 +4,8 @@
 
 **Scope:** This report is *analysis only* for the consolidation findings. No consolidation code was changed. It identifies where logic is duplicated across the three provider crates, where small hygiene cleanups exist, and ranks the work by value against risk. It deliberately does **not** recommend restructuring the crate layering — that is sound (see [What not to touch](#7-what-not-to-touch)).
 
+**Postscript (issue #12, 2026-08):** Multi-version selection was removed after this report. Each provider ships one live pin. Symbols named below as current API — `resolve_version`, `CatalogMode`, `ProviderVersion` multi-table helpers, `with_version` / `with_mode` wrappers, and multi-entry `FINGERPRINT_PROFILES` / `resolve_profile` — no longer exist in the tree. Keep this document as historical analysis of the pre-#12 codebase. Rebaseline overwrites the single pin; use an older Omni release for older wire.
+
 **Also tracked here:** a separate, approved **observability feature track** — restoring correlation-ID logging and adding colorized log output — is folded into the plan in [§9](#9-observability-track-correlation-ids--colorized-logs-separate-feature-work). That work *adds* functionality (it is not consolidation) and has its own detailed handoff; §9 records it and its one coordination point with the consolidation batch.
 
 ---

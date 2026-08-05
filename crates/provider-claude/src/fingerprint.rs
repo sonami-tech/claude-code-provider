@@ -36,7 +36,6 @@ use crate::models::{
 #[derive(Debug, Clone, Copy)]
 pub struct FingerprintProfile {
     pub name: &'static str,
-    pub aliases: &'static [&'static str],
     pub claude_cli_version: &'static str,
     pub stainless_package_version: &'static str,
     pub stainless_runtime_version: &'static str,
@@ -410,7 +409,6 @@ pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.221-sdk-cli";
 // Captured cc_version=2.1.221.116 for prompt "Say OK".
 pub const PROFILE_CLAUDE_2_1_221_SDK_CLI: FingerprintProfile = FingerprintProfile {
     name: DEFAULT_PROFILE_NAME,
-    aliases: &["2.1.221"],
     claude_cli_version: "2.1.221",
     stainless_package_version: "0.94.0",
     stainless_runtime_version: "v26.3.0",
@@ -837,7 +835,6 @@ mod tests {
     fn cch_rewrite_profile() -> FingerprintProfile {
         FingerprintProfile {
             name: "test-cch-rewrite",
-            aliases: &[],
             claude_cli_version: "2.1.175",
             stainless_package_version: "0.94.0",
             stainless_runtime_version: "v24.3.0",
@@ -1346,7 +1343,6 @@ mod tests {
     fn static_cch_mode_preserves_sentinel() {
         let profile = FingerprintProfile {
             name: "test-static",
-            aliases: &[],
             claude_cli_version: "2.1.142",
             stainless_package_version: "0.94.0",
             stainless_runtime_version: "v24.3.0",
