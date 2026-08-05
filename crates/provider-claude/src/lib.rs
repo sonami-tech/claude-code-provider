@@ -35,7 +35,6 @@ pub use bootstrap::{
 };
 pub use fingerprint::{
     CLAUDE_CODE_SYSTEM_PREAMBLE, FingerprintProfile, RequestContext, RequestKind, default_profile,
-    resolve_profile, valid_profile_selectors,
 };
 pub use upstream::{UpstreamClient, UpstreamError};
 
@@ -230,7 +229,7 @@ pub struct ClaudeProvider {
 }
 
 impl ClaudeProvider {
-    /// Construct using the default (latest) fingerprint profile.
+    /// Construct using the active fingerprint pin.
     /// Reads no credentials at construction time (per-request fresh read).
     pub fn new() -> Result<Self, ProviderError> {
         Self::new_with_profile(default_profile())
@@ -339,7 +338,7 @@ impl ClaudeProvider {
         Ok(Self { profile, client })
     }
 
-    /// For tests / alternate profiles (e.g. pinned older for rebaseline).
+    /// For tests that supply an explicit fingerprint pin.
     #[cfg(test)]
     pub fn new_for_test(profile: &'static FingerprintProfile) -> Self {
         // Use a dummy client; real tests avoid the network path or use integration.
@@ -1218,10 +1217,12 @@ mod tests {
     }
 
     #[test]
-    fn new_for_test_allows_other_profiles() {
-        let p154 =
-            ClaudeProvider::new_for_test(crate::fingerprint::resolve_profile("2.1.154").unwrap());
-        assert_eq!(p154.profile().name, "cc-2.1.154-sdk-cli");
+    fn new_for_test_uses_active_pin() {
+        // WHY: single-pin world (issue #12) — test helpers must still construct
+        // a provider on the shipped fingerprint, not a deleted historical profile.
+        let p = ClaudeProvider::new_for_test(crate::fingerprint::default_profile());
+        assert_eq!(p.profile().name, "cc-2.1.221-sdk-cli");
+        assert_eq!(p.profile().claude_cli_version, "2.1.221");
     }
 
     #[test]

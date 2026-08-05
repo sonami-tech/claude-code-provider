@@ -2,6 +2,15 @@
 
 Omni has one server binary, but provider maintenance stays provider-specific.
 
+## Breaking change (issue #12)
+
+Each provider ships **one live pin**. Multi-version selection is gone:
+`--claude-version`, `--grok-version`, `--codex-version`,
+`--match-system`, `--match-system-exact`, and env counterparts
+`OMNI_CLAUDE_VERSION`, `OMNI_GROK_VERSION`, `OMNI_CODEX_VERSION`,
+`OMNI_MATCH_SYSTEM`, `OMNI_MATCH_SYSTEM_EXACT` are removed. Rebaseline
+**overwrites** the pin. Use an older Omni release for older wire.
+
 - Claude: `docs/providers/claude/README.md`
 - Grok: `docs/providers/grok/README.md`
 - Codex: `docs/providers/codex/README.md`

@@ -32,7 +32,7 @@ use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
     CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, CatalogModel, LlmProvider,
-    ProviderError, ProviderVersion,
+    ProviderError,
 };
 use reqwest::Client;
 use reqwest::header;
@@ -57,7 +57,7 @@ static GROK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
 
 /// User-Agent template for CLI-parity requests. `{version}` is filled from the
-/// pinned catalog version (`self.version.version`, e.g. "0.2.118") so the UA and
+/// pinned catalog version (`self.version`, e.g. "0.2.118") so the UA and
 /// `x-grok-client-version` cannot drift from the catalog the request claims.
 /// Verified live against grok-shell 0.2.118 (2026-08-04; first captured 0.2.60 on
 /// 2026-06-23, UA template unchanged across bumps).
@@ -81,19 +81,11 @@ const CLI_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
 // we still intentionally omit on Omni's user-driven Responses body. Session
 // headers (conv/req/session/agent/turn-idx) and x-compaction-at remain
 // intentionally omitted on single-shot Omni requests.
-const GROK_CATALOG_0_2_118: &[CatalogModel] = &[CatalogModel::new("grok-4.5", &["grok"])];
+/// Pinned grok-shell CLI version (UA + header fingerprint). Single live pin.
+pub const GROK_VERSION: &str = "0.2.118";
 
-/// Grok version catalog, newest-first. The version string is the installed
-/// grok-shell CLI version this catalog was verified against.
-///
-/// Both `ProviderVersion` catalog fields point at the same list: omni-core's
-/// shared type still carries two slots (used by Codex); Grok has a single path.
-static GROK_VERSIONS: &[ProviderVersion] = &[ProviderVersion {
-    version: "0.2.118",
-    conservative: GROK_CATALOG_0_2_118,
-    extended: GROK_CATALOG_0_2_118,
-    default_model: "grok-4.5",
-}];
+/// Model catalog for the active pin.
+const GROK_CATALOG: &[CatalogModel] = &[CatalogModel::new("grok-4.5", &["grok"])];
 
 /// OpenAI-compatible model entry exposed by the server's `/v1/models` route.
 #[derive(Debug, Clone, Serialize)]
@@ -117,8 +109,8 @@ pub struct GrokProvider {
     client: Client,
     base_url: String,
     auth: GrokAuthConfig,
-    /// Pinned version from the provider's own catalog. Default newest.
-    version: &'static ProviderVersion,
+    /// Pinned grok-shell CLI version string (for UA/headers).
+    version: &'static str,
     /// Whether the CLI path emits a parity-loss `warn!` when an override
     /// (custom base_url / `XAI_CREDENTIALS_PATH`) is active. True in production
     /// constructors; test constructors set it false so mock bases do not spam.
@@ -173,7 +165,7 @@ impl GrokProvider {
                 fallback_api_key: api_key,
                 fallback_user_id: None,
             },
-            version: &GROK_VERSIONS[0],
+            version: GROK_VERSION,
             warn_overrides: true,
         })
     }
@@ -231,28 +223,14 @@ impl GrokProvider {
         self
     }
 
-    /// Pin a specific version from the provider's catalog. Chainable. Default
-    /// newest. Returns `Err` listing available versions if `version` is unknown
-    /// (exact-or-fail; no closest match).
-    pub fn with_version(mut self, version: &str) -> Result<Self, ProviderError> {
-        let found = GROK_VERSIONS
-            .iter()
-            .find(|v| v.version == version)
-            .ok_or_else(|| {
-                let available: Vec<&str> = GROK_VERSIONS.iter().map(|v| v.version).collect();
-                ProviderError::Other(anyhow::Error::msg(format!(
-                    "unknown grok version {version:?}; available: [{}]",
-                    available.join(", ")
-                )))
-            })?;
-        self.version = found;
-        Ok(self)
+    /// The model catalog for the active pin.
+    fn active_catalog(&self) -> &'static [CatalogModel] {
+        GROK_CATALOG
     }
 
-    /// The model catalog for the pinned version.
-    fn active_catalog(&self) -> &'static [CatalogModel] {
-        // Both ProviderVersion slots hold the same Grok catalog.
-        self.version.conservative
+    /// Shipped grok-shell pin version string.
+    pub fn pinned_version() -> &'static str {
+        GROK_VERSION
     }
 
     /// Configure this provider as a custom OpenAI-compatible endpoint.
@@ -322,7 +300,7 @@ impl GrokProvider {
                 fallback_api_key: Some(api_key.into()),
                 fallback_user_id: user_id,
             },
-            version: &GROK_VERSIONS[0],
+            version: GROK_VERSION,
             warn_overrides: false,
         }
     }
@@ -342,20 +320,15 @@ impl GrokProvider {
         catalog_model_aliases(self.active_catalog())
     }
 
-    /// Default (newest version) `/v1/models` list, for startup sites that run
-    /// before a provider instance exists.
+    /// Active-pin `/v1/models` list, for startup sites that run before a
+    /// provider instance exists.
     pub fn default_models_list() -> Vec<GrokModelInfo> {
-        catalog_models_list(GROK_VERSIONS[0].conservative)
+        catalog_models_list(GROK_CATALOG)
     }
 
-    /// Default (newest version) alias map, for startup sites.
+    /// Active-pin alias map, for startup sites.
     pub fn default_model_aliases() -> Vec<(&'static str, &'static str)> {
-        catalog_model_aliases(GROK_VERSIONS[0].conservative)
-    }
-
-    /// The provider's version catalog (newest-first).
-    pub fn version_catalog() -> &'static [ProviderVersion] {
-        GROK_VERSIONS
+        catalog_model_aliases(GROK_CATALOG)
     }
 
     /// Resolve the effective bearer key the same way for every request: load the operator's
@@ -500,7 +473,7 @@ impl GrokProvider {
     ///
     /// Header NAMES + VALUES are the fingerprint surface; order does not matter
     /// (reqwest sets them). The 0.2.118 version string and the UA are both derived
-    /// from `self.version.version`, so they cannot drift from the catalog the
+    /// from `self.version`, so they cannot drift from the catalog the
     /// request claims.
     ///
     /// INTENTIONALLY OMITTED CLI headers and why:
@@ -517,7 +490,7 @@ impl GrokProvider {
         creds: &GrokCredentials,
         model: &str,
     ) -> Result<header::HeaderMap, ProviderError> {
-        let version = self.version.version;
+        let version = self.version;
         let user_agent = CLI_USER_AGENT_TEMPLATE.replace("{version}", version);
 
         let mut headers = header::HeaderMap::new();
@@ -1797,10 +1770,6 @@ impl LlmProvider for GrokProvider {
         "grok"
     }
 
-    fn versions(&self) -> &'static [ProviderVersion] {
-        GROK_VERSIONS
-    }
-
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
         tracing::trace!(
             provider = "grok",
@@ -1895,7 +1864,7 @@ mod tests {
             provider_extras: Some(json!({"service_tier": "priority"})),
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["max_completion_tokens"], 128);
@@ -1937,7 +1906,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(body["model"], "composer");
     }
 
@@ -2234,7 +2203,7 @@ mod tests {
             provider_extras: None,
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "get_weather");
@@ -2274,7 +2243,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         let messages = body["messages"].as_array().unwrap();
 
         // The assistant message keeps its Text sibling as `content` AND carries
@@ -2329,7 +2298,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let asst_idx = messages.iter().position(|m| m["role"] == "assistant");
         let tool_idx = messages.iter().position(|m| m["role"] == "tool");
@@ -2357,7 +2326,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let assistant = messages
             .iter()
@@ -2473,7 +2442,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl, GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &repl, GROK_CATALOG).unwrap();
         let msg0 = &body["messages"][0];
         assert_eq!(msg0["content"], "tell REDACTED");
     }
@@ -2503,7 +2472,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "look");
@@ -2537,7 +2506,7 @@ mod tests {
             metadata: Default::default(),
             provider_extras: Some(serde_json::json!({"service_tier": "standard"})),
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert!(body.get("tools").is_some());
         assert_eq!(body["tool_choice"], "auto");
@@ -2764,7 +2733,7 @@ mod tests {
         let mut r = base.clone();
         r.temperature = Some(0.2);
         r.max_tokens = Some(64);
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG).unwrap();
         let t = b["temperature"].as_f64().unwrap();
         assert!((t - 0.2).abs() < 1e-6, "temp float json: {}", t);
         assert_eq!(b["max_completion_tokens"], 64);
@@ -2772,7 +2741,7 @@ mod tests {
         // top_p only
         let mut r = base.clone();
         r.top_p = Some(0.95);
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG).unwrap();
         let tp = b["top_p"].as_f64().unwrap();
         assert!((tp - 0.95).abs() < 1e-6, "top_p float json approx: {}", tp);
 
@@ -2782,7 +2751,7 @@ mod tests {
             effort: Some("low".into()),
             budget_tokens: Some(50),
         });
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(b["reasoning_effort"], "low");
 
         // all together
@@ -2795,7 +2764,7 @@ mod tests {
             budget_tokens: None,
         });
         r.provider_extras = Some(json!({"service_tier": "priority"}));
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(b["temperature"], 1.0);
         assert_eq!(b["max_completion_tokens"], 10);
         assert_eq!(b["reasoning_effort"], "high");
@@ -2820,7 +2789,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["response_format"]["type"], "json_object");
         assert_eq!(body["seed"], 42);
@@ -2842,7 +2811,7 @@ mod tests {
             provider_extras: Some(json!({"user": "u123"})),
             ..Default::default()
         };
-        let err = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118)
+        let err = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG)
             .expect_err("gateway user must reject as provider extra");
         assert!(
             err.to_string().contains("user"),
@@ -2869,7 +2838,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let err = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118)
+        let err = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG)
             .expect_err("unsupported Responses extras must reject");
         let msg = err.to_string();
         assert!(
@@ -2892,7 +2861,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert!(body.get("input").is_none(), "no responses 'input' shape");
         assert!(body.get("messages").is_some());
         assert_eq!(body["stream"], false);
@@ -2920,7 +2889,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         // extras "tools" wins (last write)
         let tools = &body["tools"];
         assert!(tools.is_array());
@@ -2944,7 +2913,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Required),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(body["tool_choice"], "required");
     }
 
@@ -2970,7 +2939,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl, GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &repl, GROK_CATALOG).unwrap();
         assert_eq!(body["messages"][0]["content"], "tell REDACTED");
         // desc gets prompt apply (name currently does not per mapper)
         assert_eq!(
@@ -3485,7 +3454,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(body["tools"][0]["function"]["name"], "adder");
         assert_eq!(body["tool_choice"]["function"]["name"], "adder");
 
@@ -3526,8 +3495,7 @@ mod tests {
         // maps content/tool_call deltas to canonical events (see the dedicated
         // SSE parser test). Pin the builder flags here so the non-stream tool path
         // above and the stream path stay distinct.
-        let stream_body =
-            to_xai_chat_stream_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let stream_body = to_xai_chat_stream_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
         assert_eq!(body["stream"], false);
@@ -3709,13 +3677,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        let stream_body =
-            to_xai_chat_stream_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let stream_body = to_xai_chat_stream_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
 
         // The non-stream builder is unchanged: still stream: false, no stream_options.
-        let plain_body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_118).unwrap();
+        let plain_body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
         assert_eq!(plain_body["stream"], false);
         assert!(plain_body.get("stream_options").is_none());
     }
@@ -4323,13 +4290,14 @@ mod tests {
     }
 
     #[test]
-    fn version_pin_is_exact_or_fails() {
-        // Exact known version pins.
-        let p = GrokProvider::new(None).unwrap().with_version("0.2.118");
-        assert!(p.is_ok());
-        // Unknown version is a hard error (exact-or-fail), not a silent newest.
-        let err = GrokProvider::new(None).unwrap().with_version("0.0.1");
-        assert!(err.is_err(), "unknown version must fail, not fall back");
+    fn active_pin_is_single_catalog_version() {
+        // WHY: issue #12 ships one pin only. Catalog and UA version must stay
+        // locked to the verified grok-shell release so wire headers cannot drift.
+        assert_eq!(GrokProvider::pinned_version(), "0.2.118");
+        let p = GrokProvider::new(None).unwrap();
+        let ids: Vec<_> = p.models_list().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["grok-4.5".to_string()]);
+        assert_eq!(p.version, "0.2.118");
     }
 
     fn base_req() -> CanonicalRequest {
@@ -4385,7 +4353,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CATALOG_0_2_118, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CATALOG, false).unwrap();
 
         // No Codex-only / CLI-preference keys.
         assert!(
@@ -4443,7 +4411,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CATALOG_0_2_118, true).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CATALOG, true).unwrap();
 
         assert_eq!(body["stream"], true);
         let tools = body["tools"].as_array().expect("tools is an array");
@@ -4482,7 +4450,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Auto),
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CATALOG_0_2_118, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CATALOG, false).unwrap();
         assert!(
             body.get("tool_choice").is_none(),
             "tool_choice must be omitted when there are no tools (endpoint rejects it)"
@@ -4521,7 +4489,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CATALOG_0_2_118, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CATALOG, false).unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[0]["call_id"], "call_1");

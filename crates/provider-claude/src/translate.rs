@@ -677,9 +677,7 @@ fn strip_existing_claude_identity(blocks: Vec<SystemBlock>) -> Vec<SystemBlock> 
 }
 
 fn is_claude_code_system_preamble(text: &str) -> bool {
-    crate::fingerprint::FINGERPRINT_PROFILES
-        .iter()
-        .any(|profile| profile.system_preamble == text)
+    text == crate::fingerprint::CLAUDE_CODE_SYSTEM_PREAMBLE
 }
 
 fn first_user_text_for_billing(req: &MessagesRequest) -> Option<&str> {

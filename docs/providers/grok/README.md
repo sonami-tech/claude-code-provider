@@ -20,7 +20,11 @@ preambles. The maintained contract is:
 - fresh credential resolution per request (prefers `~/.grok/auth.json` OIDC),
 - grok-shell fingerprint headers for the pinned CLI version,
 - correct non-stream and stream decoding via the shared Responses parser,
-- model catalog kept current (latest pin: grok-shell 0.2.118; `grok-4.5` only).
+- model catalog kept current (single pin: grok-shell 0.2.118; `grok-4.5` only).
+
+`--grok-version` / `OMNI_GROK_VERSION` and match-system flags are removed
+(issue #12). Rebaseline overwrites this pin; older wire needs an older Omni
+release.
 
 Default path credentials: `$XAI_CREDENTIALS_PATH`, then `~/.grok/auth.json`, then
 `~/.xai/.credentials.json`. Custom endpoint mode is different by design.

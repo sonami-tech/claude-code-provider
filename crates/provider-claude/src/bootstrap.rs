@@ -1,19 +1,18 @@
-//! Claude provider bootstrap: detect, version/profile resolve, init, catalog, extras.
+//! Claude provider bootstrap: detect, init, catalog, extras.
 //!
 //! Owned by provider-claude so the omni edge only registers a factory and never
-//! resolves `FingerprintProfile` or hand-writes init bodies.
+//! hand-writes init bodies. One active fingerprint pin only (issue #12).
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use omni_common::env_nonempty;
-use omni_core::{BootstrappedProvider, VersionSelector};
-use tracing::{info, warn};
+use omni_core::BootstrappedProvider;
+use tracing::info;
 
 use crate::ClaudeProvider;
 use crate::credentials::Credentials;
-use crate::fingerprint::{
-    FingerprintProfile, default_profile, resolve_profile, valid_profile_selectors,
-};
+use crate::fingerprint::{FingerprintProfile, default_profile};
 
 /// Provider id for routing / stats / registration.
 pub const PROVIDER_ID: &str = "claude";
@@ -33,9 +32,9 @@ pub fn extras_allowed(_key: &str) -> bool {
     false
 }
 
-/// Bootstrap Claude from a version selector and env (custom gateway or CLI creds).
-pub fn bootstrap(selector: &VersionSelector) -> anyhow::Result<BootstrappedProvider> {
-    let provider = init_provider(selector)?;
+/// Bootstrap Claude from env (custom gateway or CLI creds) on the active pin.
+pub fn bootstrap() -> anyhow::Result<BootstrappedProvider> {
+    let provider = init_provider()?;
     let models = model_catalog_values(provider.profile())?;
     let aliases = model_aliases(provider.profile());
     let provider = Arc::new(provider);
@@ -88,9 +87,8 @@ fn model_aliases(profile: &FingerprintProfile) -> Vec<(String, String)> {
     out
 }
 
-fn init_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProvider> {
-    let profile = resolve_claude_profile(selector)?;
-    let selector_desc = describe_version_selector(selector, profile.claude_cli_version);
+fn init_provider() -> anyhow::Result<ClaudeProvider> {
+    let profile = default_profile();
     if let Some(base_url) = env_nonempty("OMNI_CLAUDE_BASE_URL") {
         let authorization_bearer = env_nonempty("OMNI_CLAUDE_AUTH_TOKEN")
             .is_some()
@@ -108,7 +106,6 @@ fn init_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProvider> {
         ]);
         info!(
             profile = profile.claude_cli_version,
-            selector = %selector_desc,
             base_url = %base_url,
             auth = %auth,
             "initializing claude provider (custom gateway via OMNI_CLAUDE_BASE_URL)"
@@ -140,7 +137,6 @@ fn init_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProvider> {
         ]);
         info!(
             profile = profile.claude_cli_version,
-            selector = %selector_desc,
             base_url = %base_url,
             auth = %auth,
             "initializing claude provider (custom gateway via ANTHROPIC_BASE_URL)"
@@ -172,49 +168,10 @@ fn init_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProvider> {
     })?;
     info!(
         profile = profile.claude_cli_version,
-        selector = %selector_desc,
         auth = %format!("auth={path_disp}{via} (present)"),
         "initializing claude provider"
     );
     ClaudeProvider::new_with_profile(profile).map_err(anyhow::Error::from)
-}
-
-fn resolve_claude_profile(
-    selector: &VersionSelector,
-) -> anyhow::Result<&'static FingerprintProfile> {
-    match selector {
-        VersionSelector::Latest => Ok(default_profile()),
-        VersionSelector::Exact(v) | VersionSelector::MatchSystemExact(v) => {
-            resolve_profile(v).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "claude: no fingerprint profile matches version {v:?} (exact-or-fail); known selectors: {}",
-                    valid_profile_selectors()
-                )
-            })
-        }
-        VersionSelector::MatchSystem(v) => Ok(resolve_profile(v).unwrap_or_else(|| {
-            let newest = default_profile();
-            warn!(
-                installed = %v,
-                chose = newest.claude_cli_version,
-                "claude: no exact profile for installed version; using newest (default) profile"
-            );
-            newest
-        })),
-    }
-}
-
-fn describe_version_selector(selector: &VersionSelector, chose: &str) -> String {
-    match selector {
-        VersionSelector::Latest => format!("latest → chose={chose}"),
-        VersionSelector::Exact(v) => format!("exact={v} → chose={chose}"),
-        VersionSelector::MatchSystem(v) => {
-            format!("match-system detected={v} → chose={chose}")
-        }
-        VersionSelector::MatchSystemExact(v) => {
-            format!("match-system-exact detected={v} → chose={chose}")
-        }
-    }
 }
 
 fn describe_env_auth_winner(candidates: &[(&str, &str)]) -> String {
@@ -237,5 +194,3 @@ fn display_path_for_log(path: &std::path::Path) -> String {
         .display()
         .to_string()
 }
-
-use anyhow::Context;

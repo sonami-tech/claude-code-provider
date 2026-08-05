@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::native_anthropic::AnthropicNativeSurface;
 use crate::traits::LlmProvider;
 
-/// Product of a provider factory after version selection and startup validation.
+/// Product of a provider factory after startup validation.
 pub struct BootstrappedProvider {
     /// Canonical path (`LlmProvider`).
     pub provider: Arc<dyn LlmProvider>,

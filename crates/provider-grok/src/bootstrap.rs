@@ -1,12 +1,13 @@
-//! Grok provider bootstrap: detect, version resolve, init, catalog, extras.
+//! Grok provider bootstrap: detect, init, catalog, extras.
 //!
 //! Owned by provider-grok so the omni edge only registers a factory.
+//! One active pin only (issue #12).
 
 use std::sync::Arc;
 
 use anyhow::Context;
 use omni_common::env_nonempty;
-use omni_core::{BootstrappedProvider, VersionSelector};
+use omni_core::BootstrappedProvider;
 use tracing::info;
 
 use crate::credentials::{GrokCredentials, GrokCredentialsError};
@@ -27,9 +28,9 @@ pub fn extras_allowed(key: &str) -> bool {
     grok_extra_allowed(key)
 }
 
-/// Bootstrap Grok from a version selector and env (custom endpoint or CLI path).
-pub fn bootstrap(selector: &VersionSelector) -> anyhow::Result<BootstrappedProvider> {
-    let provider = init_provider(selector)?;
+/// Bootstrap Grok from env (custom endpoint or CLI path) on the active pin.
+pub fn bootstrap() -> anyhow::Result<BootstrappedProvider> {
+    let provider = init_provider()?;
     from_provider(provider)
 }
 
@@ -57,13 +58,9 @@ pub fn from_provider(provider: GrokProvider) -> anyhow::Result<BootstrappedProvi
     })
 }
 
-fn init_provider(selector: &VersionSelector) -> anyhow::Result<GrokProvider> {
-    let version = resolve_provider_version(selector)?;
-    let selector_desc = describe_version_selector(selector, version.version);
-    let provider = GrokProvider::new(None)
-        .map_err(anyhow::Error::from)?
-        .with_version(version.version)
-        .map_err(anyhow::Error::from)?;
+fn init_provider() -> anyhow::Result<GrokProvider> {
+    let version = GrokProvider::pinned_version();
+    let provider = GrokProvider::new(None).map_err(anyhow::Error::from)?;
     if let Some(base_url) = env_nonempty("OMNI_GROK_BASE_URL") {
         let auth = describe_env_auth_winner(&[
             ("OMNI_GROK_AUTH_TOKEN", "bearer-token"),
@@ -71,8 +68,7 @@ fn init_provider(selector: &VersionSelector) -> anyhow::Result<GrokProvider> {
             ("OMNI_GROK_CUSTOM_HEADERS", "custom-headers"),
         ]);
         info!(
-            version = version.version,
-            selector = %selector_desc,
+            version,
             base_url = %base_url,
             auth = %auth,
             "initializing grok provider (custom endpoint via OMNI_GROK_BASE_URL)"
@@ -92,8 +88,7 @@ fn init_provider(selector: &VersionSelector) -> anyhow::Result<GrokProvider> {
             "auth=none (XAI_API_KEY unset)"
         };
         info!(
-            version = version.version,
-            selector = %selector_desc,
+            version,
             base_url = %base_url,
             auth,
             "initializing grok provider (custom endpoint via GROK_MODELS_BASE_URL)"
@@ -108,20 +103,12 @@ fn init_provider(selector: &VersionSelector) -> anyhow::Result<GrokProvider> {
     validate_cli_credentials_at_startup()?;
     let auth = GrokCredentials::describe_cli_auth_source();
     info!(
-        version = version.version,
-        selector = %selector_desc,
+        version,
         base_url = "https://cli-chat-proxy.grok.com",
         auth = %auth,
         "initializing grok provider (CLI path; credentials re-read per request)"
     );
     Ok(provider)
-}
-
-fn resolve_provider_version(
-    selector: &VersionSelector,
-) -> anyhow::Result<&'static omni_core::ProviderVersion> {
-    omni_core::resolve_version(GrokProvider::version_catalog(), selector)
-        .map_err(|e| anyhow::anyhow!("grok: cannot resolve version selector: {e}"))
 }
 
 fn validate_cli_credentials_at_startup() -> anyhow::Result<()> {
@@ -174,19 +161,6 @@ fn validate_cli_credentials_at_startup() -> anyhow::Result<()> {
     anyhow::bail!(
         "grok: no credentials file found for CLI path ({auth}); cannot start with grok enabled"
     )
-}
-
-fn describe_version_selector(selector: &VersionSelector, chose: &str) -> String {
-    match selector {
-        VersionSelector::Latest => format!("latest → chose={chose}"),
-        VersionSelector::Exact(v) => format!("exact={v} → chose={chose}"),
-        VersionSelector::MatchSystem(v) => {
-            format!("match-system detected={v} → chose={chose}")
-        }
-        VersionSelector::MatchSystemExact(v) => {
-            format!("match-system-exact detected={v} → chose={chose}")
-        }
-    }
 }
 
 fn describe_env_auth_winner(candidates: &[(&str, &str)]) -> String {

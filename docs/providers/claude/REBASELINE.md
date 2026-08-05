@@ -1,7 +1,16 @@
 # Claude Rebaseline Procedure
 
-Use this when a new Claude Code release appears or a current profile is rejected
+Use this when a new Claude Code release appears or a current pin is rejected
 upstream.
+
+## Breaking change (issue #12)
+
+Omni ships **one live pin** per provider. Multi-version CLI flags
+(`--claude-version`, `--grok-version`, `--codex-version`,
+`--match-system`, `--match-system-exact`) and env counterparts
+(`OMNI_*_VERSION`, `OMNI_MATCH_SYSTEM*`) are removed. Rebaseline **overwrites**
+the single pin; it does not append a profile ladder. For older wire fingerprints,
+use an older Omni release from git history.
 
 ## Safety
 
@@ -85,15 +94,17 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
    - Confirm all pinned catalog models are accepted.
    - Confirm the billing suffix and cch behavior.
    - If any checksum or body mutation cannot be reproduced exactly, do not
-     promote the profile to `latest`.
+     promote the new pin.
 
-4. Update code:
+4. Update code (overwrite the single active pin; do not append a profile ladder):
 
-   - Add or update the `FingerprintProfile` in
-     `crates/provider-claude/src/fingerprint.rs`.
-   - Add or update model catalog entries in `crates/provider-claude/src/models.rs`.
-   - Update the default/latest profile only after the new profile is proven.
-   - Update tests and local vectors.
+   - Overwrite the active `FingerprintProfile` in
+     `crates/provider-claude/src/fingerprint.rs` with the new capture.
+   - Overwrite the single model catalog in `crates/provider-claude/src/models.rs`.
+   - Rename shared constants if the pin version changes (do not keep historical
+     `*_VERSION` symbol names that disagree with the live pin).
+   - Update active-pin goldens and local vectors. History lives in git tags and
+     older Omni releases, not in-tree multi-profile selection.
 
 5. Regenerate clean-room cch vectors:
 
@@ -136,7 +147,7 @@ for default, `opus`, `sonnet`, and `haiku` flows. Headers still use SDK package
 `0.94.0`, runtime `v26.3.0`, Anthropic version `2023-06-01`, and
 `claude-cli/2.1.221 (external, sdk-cli)`.
 
-2.1.221 is the current `latest` profile. Drift versus 2.1.220 is a pure version
+2.1.221 is the current active pin. Drift versus 2.1.220 is a pure version
 bump:
 
 1. CLI version string (UA + billing `cc_version`).

@@ -91,7 +91,7 @@ use omni_common::{
 };
 use omni_core::{
     AnthropicNativeSurface, BootstrappedProvider, CanonicalResponse, CanonicalStream,
-    CanonicalStreamEvent, LlmProvider, NativeAnthropicSseStream, ProviderError, VersionSelector,
+    CanonicalStreamEvent, LlmProvider, NativeAnthropicSseStream, ProviderError,
 };
 
 mod cloud_fidelity;
@@ -236,30 +236,6 @@ struct Cli {
     )]
     log_backups: usize,
 
-    /// Pin Claude to an exact fingerprint version (e.g. 2.1.186). Exact match or
-    /// the server fails to start; no closest match. Default: newest in catalog.
-    #[arg(long, env = "OMNI_CLAUDE_VERSION")]
-    claude_version: Option<String>,
-
-    /// Pin Grok to an exact catalog version (e.g. 0.2.60). Exact-or-fail.
-    #[arg(long, env = "OMNI_GROK_VERSION")]
-    grok_version: Option<String>,
-
-    /// Pin Codex to an exact catalog version (e.g. 0.142.0). Exact-or-fail.
-    #[arg(long, env = "OMNI_CODEX_VERSION")]
-    codex_version: Option<String>,
-
-    /// Match every provider to the client version installed on this system,
-    /// choosing the CLOSEST catalog version when there is no exact match. A
-    /// per-provider --{provider}-version overrides this for that provider.
-    #[arg(long, env = "OMNI_MATCH_SYSTEM", conflicts_with = "match_system_exact")]
-    match_system: bool,
-
-    /// Like --match-system, but require an EXACT catalog version for each detected
-    /// installed client; fail loudly at startup if the catalog lacks it.
-    #[arg(long, env = "OMNI_MATCH_SYSTEM_EXACT")]
-    match_system_exact: bool,
-
     /// Opt-in cloud-fidelity checks: single Anthropic auth header shape and
     /// strict OpenAI chat token-cap fields for known model families.
     #[arg(long, env = "OMNI_STRICT_CLOUD_FIDELITY", default_value_t = false)]
@@ -374,32 +350,27 @@ struct ProviderEntry {
 /// One registered provider factory: detect + bootstrap live in the provider crate.
 struct ProviderFactory {
     id: &'static str,
-    /// CLI binary name for `--match-system` version detection.
-    match_system_bin: &'static str,
     detected: fn() -> bool,
     detection_source: fn() -> Option<String>,
-    bootstrap: fn(&VersionSelector) -> anyhow::Result<BootstrappedProvider>,
+    bootstrap: fn() -> anyhow::Result<BootstrappedProvider>,
 }
 
 fn provider_factories() -> &'static [ProviderFactory] {
     &[
         ProviderFactory {
             id: provider_claude::PROVIDER_ID,
-            match_system_bin: "claude",
             detected: provider_claude::detected,
             detection_source: provider_claude::detection_source,
             bootstrap: provider_claude::bootstrap,
         },
         ProviderFactory {
             id: provider_grok::PROVIDER_ID,
-            match_system_bin: "grok",
             detected: provider_grok::detected,
             detection_source: provider_grok::detection_source,
             bootstrap: provider_grok::bootstrap,
         },
         ProviderFactory {
             id: provider_codex::PROVIDER_ID,
-            match_system_bin: "codex",
             detected: provider_codex::detected,
             detection_source: provider_codex::detection_source,
             bootstrap: provider_codex::bootstrap,
@@ -513,19 +484,7 @@ async fn main() -> anyhow::Result<()> {
         let factory = factory_for(name).ok_or_else(|| {
             anyhow::anyhow!("unknown provider in list: {name} (no registered factory)")
         })?;
-        let explicit = match factory.id {
-            "claude" => &cli.claude_version,
-            "grok" => &cli.grok_version,
-            "codex" => &cli.codex_version,
-            _ => &None,
-        };
-        let selector = version_selector_for(
-            explicit,
-            cli.match_system,
-            cli.match_system_exact,
-            factory.match_system_bin,
-        );
-        let boot = (factory.bootstrap)(&selector)
+        let boot = (factory.bootstrap)()
             .with_context(|| format!("failed to initialize {} provider", factory.id))?;
         let entry = entry_from_bootstrap(factory.id, boot)?;
         providers_map.insert(name.clone(), entry);
@@ -601,81 +560,6 @@ fn log_startup_banner() {
         OMNI_ASCII_BANNER.trim_matches('\n'),
         env!("CARGO_PKG_VERSION")
     );
-}
-
-/// Build a [`VersionSelector`] for one provider from the CLI flags.
-///
-/// Precedence: an explicit per-provider `--{provider}-version` (exact-or-fail)
-/// wins. Otherwise the system-match flags apply, detecting the installed client
-/// version for `bin`. With no flags, `Latest`.
-fn version_selector_for(
-    explicit: &Option<String>,
-    match_system: bool,
-    match_system_exact: bool,
-    bin: &str,
-) -> VersionSelector {
-    if let Some(v) = explicit
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        return VersionSelector::Exact(v.to_string());
-    }
-    if match_system_exact {
-        match detect_installed_cli_version(bin) {
-            Ok(v) => return VersionSelector::MatchSystemExact(v),
-            Err(reason) => {
-                warn!(
-                    bin,
-                    reason,
-                    "{bin}: --match-system-exact set but no installed version detected; using newest catalog version"
-                );
-            }
-        }
-    } else if match_system {
-        match detect_installed_cli_version(bin) {
-            Ok(v) => return VersionSelector::MatchSystem(v),
-            Err(reason) => {
-                warn!(
-                    bin,
-                    reason,
-                    "{bin}: --match-system set but no installed version detected; using newest catalog version"
-                );
-            }
-        }
-    }
-    VersionSelector::Latest
-}
-
-/// Detect the version string of an installed provider CLI by running
-/// `<bin> --version` and extracting the first dotted-number token.
-///
-/// On failure returns a short operator-facing reason (`not on PATH`, etc.).
-fn detect_installed_cli_version(bin: &str) -> Result<String, &'static str> {
-    let out = match std::process::Command::new(bin).arg("--version").output() {
-        Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err("not on PATH");
-        }
-        Err(_) => return Err("failed to spawn --version"),
-    };
-    if !out.status.success() {
-        return Err("nonzero --version exit");
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    extract_version_token(&text).ok_or("unparseable --version output")
-}
-
-/// Extract the first whitespace-delimited token that looks like a dotted version
-/// (starts with a digit and contains a dot), e.g. "2.1.186" from
-/// "2.1.186 (Claude Code)" or "0.2.60" from "grok 0.2.60 (abc) [stable]".
-fn extract_version_token(text: &str) -> Option<String> {
-    text.split_whitespace()
-        .find(|tok| {
-            let t = tok.trim_start_matches('v');
-            t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.')
-        })
-        .map(|tok| tok.trim_start_matches('v').to_string())
 }
 
 fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router {
@@ -4496,8 +4380,7 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
-            .expect("custom Claude provider from env");
+        let boot = provider_claude::bootstrap().expect("custom Claude provider from env");
         let provider = boot.provider;
         drop(creds);
         let response = provider
@@ -4557,8 +4440,7 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
-            .expect("custom Claude provider from env");
+        let boot = provider_claude::bootstrap().expect("custom Claude provider from env");
         drop(creds);
         let mut providers = HashMap::new();
         providers.insert(
@@ -4622,8 +4504,7 @@ requires_openai_auth = false
                 .await;
         }
 
-        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
-            .expect("custom Claude provider from env");
+        let boot = provider_claude::bootstrap().expect("custom Claude provider from env");
         let provider = boot.provider;
         drop(creds);
         let request = || omni_core::CanonicalRequest {
@@ -4656,8 +4537,7 @@ requires_openai_auth = false
             ("ANTHROPIC_API_KEY", None),
             ("ANTHROPIC_CUSTOM_HEADERS", Some("X-Valid: yes")),
         ]);
-        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
-            .expect("custom Claude provider from env");
+        let boot = provider_claude::bootstrap().expect("custom Claude provider from env");
         let provider = boot.provider;
         unsafe {
             std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "bad header");
@@ -4715,8 +4595,7 @@ requires_openai_auth = false
             .mount(&omni_server)
             .await;
 
-        let boot = provider_claude::bootstrap(&VersionSelector::Latest)
-            .expect("OMNI Claude provider from env");
+        let boot = provider_claude::bootstrap().expect("OMNI Claude provider from env");
         drop(creds);
         let response = boot
             .provider
@@ -4765,8 +4644,7 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let boot = provider_grok::bootstrap(&VersionSelector::Latest)
-            .expect("custom Grok provider from env");
+        let boot = provider_grok::bootstrap().expect("custom Grok provider from env");
         let response = boot
             .provider
             .send(omni_core::CanonicalRequest {
@@ -4827,8 +4705,7 @@ requires_openai_auth = false
             .mount(&omni_server)
             .await;
 
-        let boot = provider_grok::bootstrap(&VersionSelector::Latest)
-            .expect("OMNI Grok provider from env");
+        let boot = provider_grok::bootstrap().expect("OMNI Grok provider from env");
         let response = boot
             .provider
             .send(omni_core::CanonicalRequest {
@@ -4882,8 +4759,7 @@ requires_openai_auth = false
                 .await;
         }
 
-        let boot = provider_grok::bootstrap(&VersionSelector::Latest)
-            .expect("custom Grok provider from env");
+        let boot = provider_grok::bootstrap().expect("custom Grok provider from env");
         let provider = boot.provider;
         let request = || omni_core::CanonicalRequest {
             model: "grok".into(),
@@ -4928,8 +4804,7 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let boot = provider_grok::bootstrap(&VersionSelector::Latest)
-            .expect("custom Grok provider from env");
+        let boot = provider_grok::bootstrap().expect("custom Grok provider from env");
         let response = boot
             .provider
             .send(omni_core::CanonicalRequest {

@@ -29,7 +29,7 @@ use omni_common::{env_nonempty, headers_from_env};
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
-    CanonicalToolChoice, CatalogModel, LlmProvider, ProviderError, ProviderVersion,
+    CanonicalToolChoice, CatalogModel, LlmProvider, ProviderError,
 };
 use reqwest::header::HeaderMap;
 use reqwest::{Client, Url, header};
@@ -72,20 +72,14 @@ const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 // config points at a custom Responses base_url, so the native ChatGPT-backend
 // catalog was not re-probed this cycle; the model set below is carried from the
 // 0.142.0 verification.
-const CODEX_CATALOG_0_146_0: &[CatalogModel] = &[
+/// Pinned Codex CLI version (UA + header fingerprint). Single live pin.
+pub const CODEX_VERSION: &str = "0.146.0";
+
+/// Model catalog for the active pin.
+const CODEX_CATALOG: &[CatalogModel] = &[
     CatalogModel::new("gpt-5.5", &["gpt"]),
     CatalogModel::new("gpt-5.4-mini", &["mini", "gpt-mini"]),
 ];
-
-/// Codex version catalog, newest-first. The version string is the installed
-/// codex CLI version this catalog was verified against. Conservative and extended
-/// point at the same list for the captured (free) plan.
-static CODEX_VERSIONS: &[ProviderVersion] = &[ProviderVersion {
-    version: "0.146.0",
-    conservative: CODEX_CATALOG_0_146_0,
-    extended: CODEX_CATALOG_0_146_0,
-    default_model: DEFAULT_CODEX_MODEL,
-}];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CodexModelInfo {
@@ -98,8 +92,8 @@ pub struct CodexModelInfo {
 #[derive(Debug, Clone)]
 pub struct CodexProvider {
     client: Client,
-    /// Pinned version from the provider's own catalog. Default newest.
-    version: &'static ProviderVersion,
+    /// Pinned Codex CLI version string (for UA/headers).
+    version: &'static str,
 }
 
 impl CodexProvider {
@@ -111,35 +105,21 @@ impl CodexProvider {
             .map_err(|e| ProviderError::Other(anyhow::anyhow!("http client: {e}")))?;
         Ok(Self {
             client,
-            version: &CODEX_VERSIONS[0],
+            version: CODEX_VERSION,
         })
     }
 
-    /// Pin a specific version from the provider's catalog. Chainable. Default
-    /// newest. Returns `Err` listing available versions if `version` is unknown
-    /// (exact-or-fail; no closest match).
-    pub fn with_version(mut self, version: &str) -> Result<Self, ProviderError> {
-        let found = CODEX_VERSIONS
-            .iter()
-            .find(|v| v.version == version)
-            .ok_or_else(|| {
-                let available: Vec<&str> = CODEX_VERSIONS.iter().map(|v| v.version).collect();
-                ProviderError::Other(anyhow::anyhow!(
-                    "unknown codex version {version:?}; available: [{}]",
-                    available.join(", ")
-                ))
-            })?;
-        self.version = found;
-        Ok(self)
-    }
-
-    /// The active catalog for the pinned version.
+    /// The model catalog for the active pin.
     ///
-    /// Both `ProviderVersion` catalog slots hold the same Codex list today (like
-    /// Grok). Path selection (ChatGPT WebSocket vs REST) is inferred from
+    /// Path selection (ChatGPT WebSocket vs REST) is inferred from
     /// `CODEX_HOME` config/auth, not from a catalog mode flag.
     fn active_catalog(&self) -> &'static [CatalogModel] {
-        self.version.conservative
+        CODEX_CATALOG
+    }
+
+    /// Shipped Codex CLI pin version string.
+    pub fn pinned_version() -> &'static str {
+        CODEX_VERSION
     }
 
     /// The model id used for an actual request. This stays config-driven (the
@@ -266,11 +246,6 @@ impl CodexProvider {
         out
     }
 
-    /// The provider's version catalog (newest-first).
-    pub fn version_catalog() -> &'static [ProviderVersion] {
-        CODEX_VERSIONS
-    }
-
     async fn send_conservative_ws(
         &self,
         req: CanonicalRequest,
@@ -287,8 +262,8 @@ impl CodexProvider {
         config: CodexRequestConfig,
     ) -> Result<CanonicalStream, ProviderError> {
         let auth = config.chatgpt_auth().await?;
-        let models_url = config.conservative_models_url(self.version.version)?;
-        let headers = conservative_codex_headers(self.version.version, &auth)?;
+        let models_url = config.conservative_models_url(self.version)?;
+        let headers = conservative_codex_headers(self.version, &auth)?;
         let redactor = CodexErrorRedactor::for_secrets([auth.access_token.clone()]);
 
         let preflight = self
@@ -319,7 +294,7 @@ impl CodexProvider {
         }
 
         let ws_url = config.conservative_responses_ws_url()?;
-        let ws_request = conservative_ws_request(&ws_url, self.version.version, &auth)?;
+        let ws_request = conservative_ws_request(&ws_url, self.version, &auth)?;
         let body = codex_response_create_body(&req)?;
 
         let stream = async_stream::stream! {
@@ -429,10 +404,6 @@ impl CodexProvider {
 impl LlmProvider for CodexProvider {
     fn id(&self) -> &'static str {
         "codex"
-    }
-
-    fn versions(&self) -> &'static [ProviderVersion] {
-        CODEX_VERSIONS
     }
 
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
@@ -2267,11 +2238,9 @@ model = "gpt-native"
     }
 
     #[test]
-    fn version_catalog_advertises_verified_models_alongside_configured() {
-        // WHY: /v1/models must surface the verified catalog (gpt-5.5, gpt-5.4-mini)
-        // AND the actually-configured model. A regression that dropped the catalog
-        // would hide gpt-5.4-mini; one that dropped the configured model would hide
-        // whatever the operator pinned. Both must appear.
+    fn active_catalog_advertises_verified_models_alongside_configured() {
+        // WHY: /v1/models must surface the verified single-pin catalog (gpt-5.5,
+        // gpt-5.4-mini) AND the actually-configured model. Both must appear.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new("", None);
         // Clear any OMNI override from a prior test in the shared process.
@@ -2286,11 +2255,18 @@ model = "gpt-native"
     }
 
     #[test]
-    fn codex_version_pin_is_exact_or_fails() {
-        let ok = CodexProvider::new().unwrap().with_version("0.146.0");
-        assert!(ok.is_ok());
-        let bad = CodexProvider::new().unwrap().with_version("0.0.1");
-        assert!(bad.is_err(), "unknown version must fail, not fall back");
+    fn active_pin_is_single_catalog_version() {
+        // WHY: issue #12 ships one pin only. Catalog and UA version must stay
+        // locked to the verified Codex CLI release so wire headers cannot drift.
+        // Hold ENV_LOCK so models_list() (reads CODEX_HOME) does not race other
+        // tests that mutate env.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new("", None);
+        assert_eq!(CodexProvider::pinned_version(), "0.146.0");
+        let provider = CodexProvider::new().unwrap();
+        assert_eq!(provider.version, "0.146.0");
+        let ids: Vec<_> = provider.active_catalog().iter().map(|m| m.id).collect();
+        assert_eq!(ids, ["gpt-5.5", "gpt-5.4-mini"]);
     }
 
     #[test]

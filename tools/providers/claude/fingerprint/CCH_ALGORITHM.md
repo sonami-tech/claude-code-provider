@@ -1,7 +1,9 @@
 # Claude Code cch fingerprint
 
-Canonical target: Claude Code `2.1.175`, profile `cc-2.1.175-sdk-cli`.
-Older supported profiles remain pinned in `crates/provider-claude/src/fingerprint.rs`.
+Active Omni pin: Claude Code `2.1.221` (no `cch` field on the wire). This
+document records the historical `cch` rewrite algorithm used by earlier Claude
+Code releases and by clean-room vectors under `vectors/`. Rebaseline overwrites
+the single active pin; it does not reintroduce a multi-profile ladder.
 
 This document is the repo-canonical record for the `cch` field in Claude
 Code's billing marker. If this conflicts with an agent memory note, update the

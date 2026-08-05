@@ -2,6 +2,10 @@
 
 Codex-specific behavior lives in `crates/provider-codex`.
 
+Single pin: Codex CLI **0.146.0**. `--codex-version` / `OMNI_CODEX_VERSION` and
+match-system flags are removed (issue #12). Rebaseline overwrites this pin;
+older wire needs an older Omni release.
+
 ## Source Of Truth
 
 - Provider implementation and Responses mapping:

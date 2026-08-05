@@ -1,33 +1,23 @@
 # Claude CLI Baseline Wire Fingerprint
 
-Active baseline: Claude Code 2.1.221, captured 2026-08-04. `latest` resolves to
-`cc-2.1.221-sdk-cli`.
+Active baseline: Claude Code 2.1.221, captured 2026-08-04 (single pin; issue #12).
 
 Raw mitmproxy `.flow` files are not committed because they contain live bearer
 tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
 `tools/providers/claude/fingerprint/extract_flow.py`.
 
-## Profiles
+## Active pin
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
 | `cc-2.1.221-sdk-cli` | `2.1.221` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-08-04 |
-| `cc-2.1.220-sdk-cli` | `2.1.220` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-26 |
-| `cc-2.1.211-sdk-cli` | `2.1.211` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-16 |
-| `cc-2.1.207-sdk-cli` | `2.1.207` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-11 |
-| `cc-2.1.197-sdk-cli` | `2.1.197` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-01 |
-| `cc-2.1.186-sdk-cli` | `2.1.186` | `0.94.0` | `v24.3.0` | `sdk-cli` | live shared-capture mitmproxy, default/Opus/Sonnet/Haiku, 2026-06-22 |
-| `cc-2.1.175-sdk-cli` | `2.1.175` | `0.94.0` | `v24.3.0` | `sdk-cli` | fake-server and live capture, Fable/Opus/Sonnet/Haiku/default, 2026-06-12 |
-| `cc-2.1.165-sdk-cli` | `2.1.165` | `0.94.0` | `v24.3.0` | `sdk-cli` | mitmproxy capture, 2026-06-05 |
-| `cc-2.1.162-sdk-cli` | `2.1.162` | `0.94.0` | `v24.3.0` | `sdk-cli` | mitmproxy capture, 2026-06-04 |
-| `cc-2.1.161-sdk-cli` | `2.1.161` | `0.94.0` | `v24.3.0` | `sdk-cli` | mitmproxy capture, 2026-06-03 |
-| `cc-2.1.158-sdk-cli` | `2.1.158` | `0.94.0` | `v24.3.0` | `sdk-cli` | mitmproxy capture, 2026-05-30 |
-| `cc-2.1.154-sdk-cli` | `2.1.154` | `0.94.0` | `v24.3.0` | `sdk-cli` | fake-server probe, 2026-05-28 |
-| `cc-2.1.150-sdk-cli` | `2.1.150` | `0.94.0` | `v24.3.0` | `sdk-cli` | reverse-proxy probe, 2026-05-25 |
-| `cc-2.1.142-sdk-cli` | `2.1.142` | `0.94.0` | `v24.3.0` | `sdk-cli` | local debug probe, 2026-05-15 |
 
-Do not make `latest` an automatic max-version calculation. Move it only after a
-profile is re-baselined, covered by vectors, and live-smoked.
+Only one pin is compiled. Rebaseline overwrites this row; do not append a
+historical ladder. Older Omni releases retain older wire.
+
+
+Overwrite the single pin only after capture, vectors, and live smoke prove the
+new wire. Do not append historical profiles.
 
 ## Endpoint And Headers
 

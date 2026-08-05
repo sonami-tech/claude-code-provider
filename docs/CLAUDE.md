@@ -5,8 +5,9 @@
 
 ## Layout
 
-- `crates/provider-claude/src/fingerprint.rs` - profiles, cch billing header,
-  per-model betas, system preamble, model catalog, and wire defaults.
+- `crates/provider-claude/src/fingerprint.rs` - active fingerprint pin, cch
+  billing header, per-model betas, system preamble, model catalog, and wire
+  defaults.
 - `crates/provider-claude/src/credentials.rs` - fresh reads from
   `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`.
 - `crates/provider-claude/src/translate.rs` - canonical request/response
@@ -19,8 +20,8 @@
 - `crates/bin/omni` - server routing, auth, stats, `/v1/models`, `/stats`, and
   Claude-only Anthropic inbound route registration.
 
-Nothing Claude-specific, including cch, betas, preamble, profiles, billing
-suffixes, or Claude Code header values, belongs in `omni`.
+Nothing Claude-specific, including cch, betas, preamble, fingerprint pin,
+billing suffixes, or Claude Code header values, belongs in `omni`.
 
 ## Run
 
@@ -36,14 +37,17 @@ as `claude:sonnet` only when you need to force a provider.
 
 ## Fingerprint Invariant
 
-For each supported Claude Code version, the Claude path must reproduce that
-version's wire fingerprint byte-for-byte: version string, `anthropic-beta`
-flags, stainless versions, `x-anthropic-billing-header` cch checksum, billing
-suffix, system preamble, model catalog, and wire defaults. An inexact fingerprint
-is a failure, not a partial success.
+Omni ships one Claude Code pin. That pin must reproduce the captured wire
+fingerprint byte-for-byte: version string, `anthropic-beta` flags, stainless
+versions, `x-anthropic-billing-header` cch checksum when the pin uses cch,
+billing suffix, system preamble, model catalog, and wire defaults. An inexact
+fingerprint is a failure, not a partial success.
+
+Rebaseline overwrites this single pin (issue #12). Multi-version flags are
+removed; use an older Omni release for older wire.
 
 The offline unit tests pin the captured bytes. Live tests are credential-gated
-and prove Anthropic accepts the current profile when the account has capacity.
+and prove Anthropic accepts the current pin when the account has capacity.
 
 Omni's `/v1/messages` and `/v1/messages/count_tokens` routes are native
 Anthropic inbound routes for Claude only. They do not use canonical OpenAI
