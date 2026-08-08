@@ -547,11 +547,16 @@ fn derive_thinking_from_canonical(reasoning: Option<&CanonicalReasoning>) -> Opt
         Some(CanonicalReasoning {
             effort: Some(e),
             budget_tokens,
-        }) if !e.is_empty() => {
-            let budget = budget_tokens.or_else(|| Some(budget_for_effort(e)));
+        }) if !e.is_empty() && e != "none" => {
+            let budget = budget_tokens.unwrap_or_else(|| budget_for_effort(e));
+            // Anthropic rejects budget 0. Unknown efforts that map to 0 disable
+            // thinking rather than building an invalid body.
+            if budget == 0 {
+                return None;
+            }
             Some(Thinking {
                 kind: "enabled".into(),
-                budget_tokens: budget,
+                budget_tokens: Some(budget),
             })
         }
         _ => None,
@@ -560,7 +565,8 @@ fn derive_thinking_from_canonical(reasoning: Option<&CanonicalReasoning>) -> Opt
 
 fn budget_for_effort(effort: &str) -> u32 {
     match effort {
-        "low" => 1024,
+        // OpenAI "minimal" is below "low"; Claude has no lower rung, so map to low.
+        "minimal" | "low" => 1024,
         "medium" => 8192,
         "high" => 16384,
         "max" => 32768,

@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalRequest,
-    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolCall,
-    CanonicalToolChoice,
+    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
+    CanonicalRequest, CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalTool,
+    CanonicalToolCall, CanonicalToolChoice,
 };
 
 use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
@@ -228,26 +228,145 @@ pub struct ChatUsage {
 ///   Responses/Codex/Claude paths do not accept this key.
 const GATEWAY_ONLY_EXTRAS: &[&str] = &["user", "stream_options"];
 
+/// Canonical effort values accepted on the chat boundary.
+///
+/// Union of common OpenAI chat values (`minimal|low|medium|high`), Claude
+/// extras (`none|max`), and Grok (`low|medium|high`). Explicit `"none"` is
+/// preserved on `CanonicalReasoning` for provider-side disable/omit.
+const VALID_REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "max"];
+
 /// Top-level request fields that Omni consumes as gateway metadata rather than
 /// forwarding as provider extras.
 pub fn gateway_only_extra_keys() -> &'static [&'static str] {
     GATEWAY_ONLY_EXTRAS
 }
 
-fn provider_extras_from_flattened(extras: &Value) -> Option<Value> {
-    let filtered = extras.as_object().and_then(|extras| {
-        let filtered = extras
-            .iter()
-            .filter(|(key, _)| !gateway_only_extra_keys().contains(&key.as_str()))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<Map<_, _>>();
-        if filtered.is_empty() {
-            None
-        } else {
-            Some(filtered)
+fn validate_chat_reasoning_effort(effort: &str) -> Result<(), String> {
+    if VALID_REASONING_EFFORTS.contains(&effort) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid reasoning_effort: '{effort}'. Valid values: none, minimal, low, medium, high, max"
+        ))
+    }
+}
+
+/// Parse a chat effort string into a value for `CanonicalReasoning.effort`.
+/// Explicit `"none"` is preserved so providers that support disable (Codex)
+/// can emit it; Claude/Grok adapters treat `"none"` as omit.
+fn parse_chat_effort_value(effort: &str) -> Result<String, String> {
+    validate_chat_reasoning_effort(effort)?;
+    Ok(effort.to_string())
+}
+
+/// Read an optional string effort from a JSON value. JSON `null` is absent.
+fn effort_string_from_value(value: &Value, field: &str) -> Result<Option<String>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        _ => Err(format!("{field} must be a string")),
+    }
+}
+
+/// Lift chat reasoning fields out of flattened extras into
+/// [`CanonicalReasoning`], and return the remaining provider extras.
+///
+/// OpenAI chat clients send top-level `reasoning_effort`. Nested
+/// `reasoning.effort` (Responses-style) is also accepted. Lifted keys are
+/// stripped from provider extras so edge allowlists never see them as
+/// unsupported passthrough fields. Top-level `reasoning_effort` wins when both
+/// are present. JSON `null` is treated as absent. Explicit `"none"` is kept as
+/// `CanonicalReasoning.effort` so providers can disable (Codex) or omit
+/// (Claude/Grok). Nested sibling keys under `reasoning` (e.g. `summary`) remain
+/// in extras for allowlist handling (fail loud if unsupported).
+fn chat_reasoning_and_extras(
+    extras: &Value,
+) -> Result<(Option<CanonicalReasoning>, Option<Value>), String> {
+    let Some(obj) = extras.as_object() else {
+        return Ok((None, None));
+    };
+
+    // Top-level OpenAI chat shape first so a *present string* wins without
+    // nested validation blocking it. JSON null is true absence (does not
+    // suppress a nested reasoning.effort). Explicit `"none"` is preserved.
+    let mut effort: Option<String> = None;
+    if let Some(effort_val) = obj.get("reasoning_effort") {
+        if let Some(raw) = effort_string_from_value(effort_val, "reasoning_effort")? {
+            effort = Some(parse_chat_effort_value(&raw)?);
         }
-    })?;
-    Some(Value::Object(filtered))
+        // null: leave effort as None (absent); key is still stripped below.
+    }
+
+    // What (if anything) to leave under provider_extras["reasoning"].
+    let mut reasoning_extra: Option<Value> = None;
+
+    if let Some(reasoning_val) = obj.get("reasoning") {
+        match reasoning_val {
+            Value::Null => {
+                // Strip explicit null; do not leave it as an extra.
+                reasoning_extra = None;
+            }
+            Value::Object(nested) if nested.is_empty() => {
+                // Empty object is absent, not an unsupported extra.
+                reasoning_extra = None;
+            }
+            Value::Object(nested) => {
+                if nested.contains_key("effort") {
+                    // Lift effort only when top-level did not already set a value
+                    // (including explicit "none", which wins over nested).
+                    if effort.is_none() {
+                        let effort_val = &nested["effort"];
+                        if let Some(raw) = effort_string_from_value(effort_val, "reasoning.effort")?
+                        {
+                            effort = Some(parse_chat_effort_value(&raw)?);
+                        }
+                        // nested effort null: absent; strip with siblings below.
+                    }
+                    // Preserve non-effort siblings for allowlist (fail loud).
+                    let siblings: Map<_, _> = nested
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != "effort")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    if !siblings.is_empty() {
+                        reasoning_extra = Some(Value::Object(siblings));
+                    }
+                } else {
+                    // No effort key: leave whole object as extra (fail loud).
+                    reasoning_extra = Some(reasoning_val.clone());
+                }
+            }
+            other => {
+                // Non-object: leave as extra so allowlist fails loud by name.
+                reasoning_extra = Some(other.clone());
+            }
+        }
+    }
+
+    let reasoning = effort.map(|e| CanonicalReasoning {
+        effort: Some(e),
+        budget_tokens: None,
+    });
+
+    let mut filtered = Map::new();
+    for (key, value) in obj {
+        let k = key.as_str();
+        if gateway_only_extra_keys().contains(&k) || k == "reasoning_effort" || k == "reasoning" {
+            continue;
+        }
+        filtered.insert(key.clone(), value.clone());
+    }
+    if let Some(rem) = reasoning_extra {
+        filtered.insert("reasoning".into(), rem);
+    }
+
+    let provider_extras = if filtered.is_empty() {
+        None
+    } else {
+        Some(Value::Object(filtered))
+    };
+
+    Ok((reasoning, provider_extras))
 }
 
 /// Convert an OpenAI request into a `CanonicalRequest`. The `model` field is the
@@ -308,6 +427,8 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
         None => None,
     };
 
+    let (reasoning, provider_extras) = chat_reasoning_and_extras(&req.extras)?;
+
     Ok(CanonicalRequest {
         model: req.model.clone(),
         messages,
@@ -317,9 +438,9 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
         max_tokens: req.max_completion_tokens.or(req.max_tokens),
         temperature: req.temperature,
         top_p: req.top_p,
-        reasoning: None,
+        reasoning,
         metadata: Default::default(),
-        provider_extras: provider_extras_from_flattened(&req.extras),
+        provider_extras,
     })
 }
 
@@ -810,6 +931,213 @@ mod tests {
         assert!(
             extras.get("stream_options").is_none(),
             "stream_options must not become a provider extra: {extras}"
+        );
+    }
+
+    #[test]
+    fn to_canonical_maps_reasoning_effort_and_strips_from_extras() {
+        // WHY: OpenAI chat clients send top-level reasoning_effort. Mapping it
+        // into provider_extras causes edge allowlists to 400 (issue #16). It
+        // must become CanonicalReasoning.effort and leave provider_extras.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":"high","response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).expect("chat request should convert");
+        assert_eq!(
+            canon.reasoning.expect("reasoning mapped").effort.as_deref(),
+            Some("high")
+        );
+        let extras = canon
+            .provider_extras
+            .expect("unrelated extras should remain");
+        assert_eq!(extras["response_format"]["type"], "json_object");
+        assert!(
+            extras.get("reasoning_effort").is_none(),
+            "reasoning_effort must not become a provider extra: {extras}"
+        );
+    }
+
+    #[test]
+    fn to_canonical_maps_nested_reasoning_effort_shape() {
+        // WHY: some clients send Responses-style reasoning:{effort} on chat.
+        // Accept and lift so it is not rejected as an unsupported extra.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning":{"effort":"medium"}}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).expect("nested reasoning converts");
+        assert_eq!(
+            canon.reasoning.expect("reasoning mapped").effort.as_deref(),
+            Some("medium")
+        );
+        assert!(
+            canon.provider_extras.is_none(),
+            "nested reasoning must be stripped from extras, got {:?}",
+            canon.provider_extras
+        );
+    }
+
+    #[test]
+    fn to_canonical_top_level_reasoning_effort_wins_over_nested() {
+        // WHY: when both shapes appear, the OpenAI chat top-level field is the
+        // primary contract and must win.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":"high","reasoning":{"effort":"low"}}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).unwrap();
+        assert_eq!(
+            canon.reasoning.expect("reasoning mapped").effort.as_deref(),
+            Some("high")
+        );
+        assert!(canon.provider_extras.is_none());
+    }
+
+    #[test]
+    fn to_canonical_rejects_invalid_reasoning_effort() {
+        // WHY: invalid efforts must fail loud at the chat boundary with a clear
+        // error, never silently drop or pass as an extra.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":"extreme"}"#,
+        )
+        .unwrap();
+        let err = to_canonical(&req).expect_err("invalid effort must reject");
+        assert!(
+            err.contains("reasoning_effort") && err.contains("extreme"),
+            "error must name the bad effort: {err}"
+        );
+    }
+
+    #[test]
+    fn to_canonical_rejects_non_string_reasoning_effort() {
+        // WHY: a non-string effort is malformed input; reject by name.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":3}"#,
+        )
+        .unwrap();
+        let err = to_canonical(&req).expect_err("non-string effort must reject");
+        assert!(
+            err.contains("reasoning_effort") && err.contains("string"),
+            "error must name the type requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn to_canonical_none_effort_is_explicit_disable() {
+        // WHY: preserve effort:"none" so Codex can emit reasoning.effort:none.
+        // Claude/Grok adapters omit "none"; collapsing to reasoning:None would
+        // make chat disable indistinguishable from "field absent".
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":"none"}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).unwrap();
+        assert_eq!(
+            canon.reasoning.expect("none preserved").effort.as_deref(),
+            Some("none")
+        );
+        assert!(
+            canon.provider_extras.is_none(),
+            "none must not leave reasoning_effort as an extra"
+        );
+    }
+
+    #[test]
+    fn to_canonical_null_reasoning_effort_is_absent() {
+        // WHY: clients often send explicit null for unset fields. Null must not
+        // 400 as a type error or become an unsupported extra.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":null,"reasoning":null}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).unwrap();
+        assert!(canon.reasoning.is_none());
+        assert!(
+            canon.provider_extras.is_none(),
+            "null reasoning fields must be stripped: {:?}",
+            canon.provider_extras
+        );
+    }
+
+    #[test]
+    fn to_canonical_null_top_level_does_not_block_nested_effort() {
+        // WHY: null means absent, not disable. A nested effort must still lift
+        // when top-level is JSON null (common SDK "unset" shape).
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":null,"reasoning":{"effort":"high"}}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).unwrap();
+        assert_eq!(
+            canon
+                .reasoning
+                .expect("nested effort lifted")
+                .effort
+                .as_deref(),
+            Some("high")
+        );
+        assert!(canon.provider_extras.is_none());
+    }
+
+    #[test]
+    fn to_canonical_empty_reasoning_object_is_absent() {
+        // WHY: `{}` is not a useful extra; treating it as unsupported is noise.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning":{}}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).unwrap();
+        assert!(canon.reasoning.is_none());
+        assert!(canon.provider_extras.is_none());
+    }
+
+    #[test]
+    fn to_canonical_preserves_nested_reasoning_siblings_in_extras() {
+        // WHY: lifting effort must not silently drop sibling keys (summary).
+        // Leave them in extras so the allowlist can fail loud if unsupported.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning":{"effort":"high","summary":"auto"}}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).unwrap();
+        assert_eq!(
+            canon.reasoning.expect("effort lifted").effort.as_deref(),
+            Some("high")
+        );
+        let extras = canon.provider_extras.expect("siblings remain as extras");
+        assert!(
+            extras
+                .get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .is_none()
+        );
+        assert_eq!(extras["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn to_canonical_accepts_minimal_effort() {
+        // WHY: OpenAI reasoning models document "minimal"; rejecting it at the
+        // chat boundary forces clients into opaque upstream failures.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":"minimal"}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).unwrap();
+        assert_eq!(
+            canon.reasoning.expect("minimal mapped").effort.as_deref(),
+            Some("minimal")
         );
     }
 

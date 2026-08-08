@@ -1603,7 +1603,8 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
         body["top_p"] = json!(top_p);
     }
     if let Some(CanonicalReasoning { effort, .. }) = &req.reasoning
-        && let Some(effort) = effort
+        && let Some(effort) = effort.as_deref()
+        && let Some(effort) = codex_reasoning_effort(effort)
     {
         body["reasoning"] = json!({ "effort": effort });
     }
@@ -1645,6 +1646,22 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
         }
     }
     Ok(body)
+}
+
+/// Map canonical effort onto OpenAI Responses vocabulary.
+/// `"max"` (Claude-centric) clamps to `"high"`. Empty/`none` still emit as
+/// `"none"` so Codex can disable reasoning (unlike Grok, which has no omit-to-
+/// disable contract for the default-high models).
+fn codex_reasoning_effort(effort: &str) -> Option<&'static str> {
+    match effort {
+        "" => None,
+        "none" => Some("none"),
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "max" => Some("high"),
+        _ => None,
+    }
 }
 
 fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {

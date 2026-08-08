@@ -1107,11 +1107,12 @@ fn to_xai_chat_request(
         body["top_p"] = json!(p);
     }
 
-    // Map canonical reasoning -> xAI chat.completions form (top level for this surface)
+    // Map canonical reasoning -> xAI chat.completions form (top level for this surface).
+    // xAI documents low|medium|high; clamp canonical extras from the chat vocabulary.
     if let Some(CanonicalReasoning {
         effort: Some(eff), ..
     }) = &req.reasoning
-        && !eff.is_empty()
+        && let Some(eff) = grok_reasoning_effort(eff)
     {
         body["reasoning_effort"] = json!(eff);
     }
@@ -1290,13 +1291,26 @@ fn to_grok_responses_request(
         effort: Some(effort),
         ..
     }) = &req.reasoning
-        && !effort.is_empty()
+        && let Some(effort) = grok_reasoning_effort(effort)
     {
         // Responses-standard reasoning; NOT the CLI's {summary:"concise"} preference.
         body["reasoning"] = json!({ "effort": effort });
     }
 
     Ok(body)
+}
+
+/// Map canonical effort onto xAI's documented set (`low|medium|high`).
+/// `"none"` omits the field. `"minimal"`/`"max"` clamp to the nearest rung.
+fn grok_reasoning_effort(effort: &str) -> Option<&'static str> {
+    match effort {
+        "" | "none" => None,
+        "minimal" | "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "max" => Some("high"),
+        // Unknown: omit rather than 400 upstream. Chat already rejects unknowns.
+        _ => None,
+    }
 }
 
 /// Map one canonical message onto OpenAI-Responses `input` items, mirroring the

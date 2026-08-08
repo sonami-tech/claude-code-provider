@@ -8602,6 +8602,88 @@ rule = [
     }
 
     #[tokio::test]
+    async fn test_chat_reasoning_effort_not_rejected_as_extra_for_all_providers() {
+        // WHY (issue #16): chat top-level reasoning_effort must map to canonical
+        // reasoning and never 400 as an unsupported provider extra for Grok,
+        // Claude, or Codex. Stubs isolate the edge allowlist path.
+        use async_trait::async_trait;
+        struct StubOk {
+            id: &'static str,
+        }
+        #[async_trait]
+        impl LlmProvider for StubOk {
+            fn id(&self) -> &'static str {
+                self.id
+            }
+            async fn send(
+                &self,
+                req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                // Prove the edge path delivered first-class reasoning, not an extra.
+                assert_eq!(
+                    req.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
+                    Some("high"),
+                    "chat reasoning_effort must reach provider as CanonicalReasoning"
+                );
+                if let Some(extras) = &req.provider_extras {
+                    assert!(
+                        extras.get("reasoning_effort").is_none(),
+                        "reasoning_effort must not be in provider_extras: {extras}"
+                    );
+                }
+                Ok(CanonicalResponse {
+                    model: req.model,
+                    content: "ok".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: Default::default(),
+                    id: None,
+                    refusal: None,
+                    ..Default::default()
+                })
+            }
+        }
+
+        fn stub_entry(base: ProviderEntry, id: &'static str) -> ProviderEntry {
+            ProviderEntry {
+                provider: Arc::new(StubOk { id }),
+                anthropic_native: None,
+                models: base.models,
+                catalog: base.catalog,
+                extras_allowed: base.extras_allowed,
+            }
+        }
+
+        let cases: [(&str, ProviderEntry, &str); 3] = [
+            (
+                "grok",
+                stub_entry(grok_entry("http://127.0.0.1:1"), "grok"),
+                "grok:grok-4.3",
+            ),
+            (
+                "claude",
+                stub_entry(claude_entry(), "claude"),
+                "claude:sonnet",
+            ),
+            ("codex", stub_entry(codex_entry(), "codex"), "codex:gpt-5.5"),
+        ];
+
+        for (name, entry, model) in cases {
+            let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+            map.insert(name.into(), entry);
+            let state = state_with(map);
+            let req: ChatCompletionRequest = serde_json::from_str(&format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],
+                    "reasoning_effort":"high"}}"#
+            ))
+            .unwrap();
+            call_chat_handler(state, req).await.unwrap_or_else(|e| {
+                panic!("{name}: reasoning_effort must not 400 as extra: {e:?}")
+            });
+        }
+    }
+
+    #[tokio::test]
     async fn test_chat_provider_extras_reject_for_unsupported_provider() {
         // WHY: OpenAI-compatible top-level provider extras must not disappear
         // when the selected provider cannot forward them. The handler should
@@ -8622,6 +8704,62 @@ rule = [
             ),
             other => panic!("expected provider-extra BadRequest, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_chat_reasoning_effort_still_rejects_unrelated_unsupported_extras() {
+        // WHY: lifting reasoning_effort must not weaken extras policy. Real
+        // unsupported extras (e.g. response_format on Claude) still fail loud.
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), claude_entry());
+        let state = state_with(map);
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"claude:sonnet","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":"high","response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        let res = call_chat_handler(state, req).await;
+        match res {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("response_format") && msg.contains("claude"),
+                "unrelated unsupported extras must still 400: {msg}"
+            ),
+            other => panic!("expected response_format BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_chat_reasoning_effort_reaches_grok_upstream_body() {
+        // WHY: the edge stub proves allowlist acceptance; this hermetic mock
+        // proves the real Grok adapter emits chat reasoning_effort from the
+        // lifted canonical field (not as a passthrough extra).
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "reasoning_effort": "high"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "grok-4.3",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".into(), grok_entry(&server.uri()));
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"grok:grok-4.3","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":"high"}"#,
+        )
+        .unwrap();
+        call_chat_handler(state_with(map), req)
+            .await
+            .expect("lifted reasoning_effort must reach Grok body");
     }
 
     #[tokio::test]
