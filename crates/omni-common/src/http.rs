@@ -228,12 +228,9 @@ pub struct ChatUsage {
 ///   Responses/Codex/Claude paths do not accept this key.
 const GATEWAY_ONLY_EXTRAS: &[&str] = &["user", "stream_options"];
 
-/// Canonical effort values accepted on the chat boundary.
-///
-/// Union of common OpenAI chat values (`minimal|low|medium|high`), Claude
-/// extras (`none|max`), and Grok (`low|medium|high`). Explicit `"none"` is
-/// preserved on `CanonicalReasoning` for provider-side disable/omit.
-const VALID_REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "max"];
+/// Max length for a free-string `reasoning_effort` at the edge (issue #20).
+/// Soft UI vocab is discovery-only; the edge does not close the name set.
+pub const MAX_REASONING_EFFORT_LEN: usize = 32;
 
 /// Top-level request fields that Omni consumes as gateway metadata rather than
 /// forwarding as provider extras.
@@ -241,21 +238,38 @@ pub fn gateway_only_extra_keys() -> &'static [&'static str] {
     GATEWAY_ONLY_EXTRAS
 }
 
-fn validate_chat_reasoning_effort(effort: &str) -> Result<(), String> {
-    if VALID_REASONING_EFFORTS.contains(&effort) {
-        Ok(())
-    } else {
-        Err(format!(
-            "Invalid reasoning_effort: '{effort}'. Valid values: none, minimal, low, medium, high, max"
-        ))
+/// Lexical hygiene for free-string reasoning effort at chat and Responses edges.
+///
+/// Accepts any non-empty, bounded, safe-charset name (`A-Z a-z 0-9 _ -`),
+/// including `xhigh` and other unknown values. No global allowlist: adapters
+/// map or fail loud. Catalog advertised lists are discovery-only and never
+/// gate this path (issue #20).
+pub fn validate_reasoning_effort_lexical(effort: &str) -> Result<(), String> {
+    if effort.is_empty() {
+        return Err("Invalid reasoning_effort: empty string".into());
     }
+    if effort.len() > MAX_REASONING_EFFORT_LEN {
+        return Err(format!(
+            "Invalid reasoning_effort: length {} exceeds max {MAX_REASONING_EFFORT_LEN}",
+            effort.len()
+        ));
+    }
+    if !effort
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "Invalid reasoning_effort: '{effort}' has unsafe characters (allowed: A-Z a-z 0-9 _ -)"
+        ));
+    }
+    Ok(())
 }
 
 /// Parse a chat effort string into a value for `CanonicalReasoning.effort`.
 /// Explicit `"none"` is preserved so providers that support disable (Codex)
 /// can emit it; Claude/Grok adapters treat `"none"` as omit.
 fn parse_chat_effort_value(effort: &str) -> Result<String, String> {
-    validate_chat_reasoning_effort(effort)?;
+    validate_reasoning_effort_lexical(effort)?;
     Ok(effort.to_string())
 }
 
@@ -998,18 +1012,62 @@ mod tests {
     }
 
     #[test]
-    fn to_canonical_rejects_invalid_reasoning_effort() {
-        // WHY: invalid efforts must fail loud at the chat boundary with a clear
-        // error, never silently drop or pass as an extra.
-        let req: ChatCompletionRequest = serde_json::from_str(
+    fn to_canonical_accepts_xhigh_and_unknown_effort_names() {
+        // WHY (issue #20): chat must not hard-allowlist effort names. Real
+        // upstream levels (Anthropic/OpenAI `xhigh`) and other well-formed
+        // free strings lift into CanonicalReasoning; adapters map or fail loud.
+        for effort in ["xhigh", "ultra", "extreme"] {
+            let req: ChatCompletionRequest = serde_json::from_str(&format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],
+                    "reasoning_effort":"{effort}"}}"#
+            ))
+            .unwrap();
+            let canon = to_canonical(&req).unwrap_or_else(|e| {
+                panic!("well-formed effort {effort:?} must accept at chat edge: {e}")
+            });
+            assert_eq!(
+                canon.reasoning.expect("reasoning mapped").effort.as_deref(),
+                Some(effort)
+            );
+        }
+    }
+
+    #[test]
+    fn to_canonical_rejects_lexically_invalid_reasoning_effort() {
+        // WHY (issue #20): edge keeps lexical hygiene only (empty, over-long,
+        // unsafe charset). No closed valid-values list.
+        let empty: ChatCompletionRequest = serde_json::from_str(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
-                "reasoning_effort":"extreme"}"#,
+                "reasoning_effort":""}"#,
         )
         .unwrap();
-        let err = to_canonical(&req).expect_err("invalid effort must reject");
+        let err = to_canonical(&empty).expect_err("empty effort must reject");
         assert!(
-            err.contains("reasoning_effort") && err.contains("extreme"),
-            "error must name the bad effort: {err}"
+            err.contains("reasoning_effort") && err.contains("empty"),
+            "error must name empty: {err}"
+        );
+
+        let bad_chars: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "reasoning_effort":"hi there"}"#,
+        )
+        .unwrap();
+        let err = to_canonical(&bad_chars).expect_err("unsafe charset must reject");
+        assert!(
+            err.contains("reasoning_effort") && err.contains("unsafe"),
+            "error must name charset: {err}"
+        );
+
+        let too_long = "a".repeat(MAX_REASONING_EFFORT_LEN + 1);
+        let long: ChatCompletionRequest = serde_json::from_str(&format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],
+                "reasoning_effort":"{too_long}"}}"#
+        ))
+        .unwrap();
+        let err = to_canonical(&long).expect_err("over-long effort must reject");
+        assert!(
+            err.contains("reasoning_effort") && err.contains("max"),
+            "error must name length bound: {err}"
         );
     }
 

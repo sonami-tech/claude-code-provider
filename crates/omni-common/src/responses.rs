@@ -27,7 +27,7 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
-use crate::http::gateway_only_extra_keys;
+use crate::http::{gateway_only_extra_keys, validate_reasoning_effort_lexical};
 
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
@@ -370,10 +370,20 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         None => None,
     };
 
-    let reasoning = req.reasoning.as_ref().map(|r| CanonicalReasoning {
-        effort: r.effort.clone(),
-        budget_tokens: None,
-    });
+    let reasoning = match req.reasoning.as_ref() {
+        None => None,
+        Some(r) => {
+            // Free-string effort with lexical hygiene only (issue #20 parity
+            // with chat). No closed allowlist at the edge.
+            if let Some(effort) = r.effort.as_deref() {
+                validate_reasoning_effort_lexical(effort)?;
+            }
+            Some(CanonicalReasoning {
+                effort: r.effort.clone(),
+                budget_tokens: None,
+            })
+        }
+    };
 
     let provider_extras = req.extras.as_object().and_then(|extras| {
         let filtered = extras
@@ -1594,6 +1604,34 @@ mod tests {
         assert_eq!(
             canon.reasoning.expect("reasoning mapped").effort.as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn to_canonical_accepts_free_string_effort_including_xhigh() {
+        // WHY (issue #20): Responses and chat must agree on free-string effort
+        // acceptance. No closed valid-values reject at the edge.
+        for effort in ["xhigh", "ultra", "minimal"] {
+            let req = parse(&format!(
+                r#"{{"model":"m","input":"q","reasoning":{{"effort":"{effort}"}}}}"#
+            ));
+            let canon = responses_to_canonical(&req)
+                .unwrap_or_else(|e| panic!("Responses free effort {effort:?} must accept: {e}"));
+            assert_eq!(
+                canon.reasoning.expect("reasoning mapped").effort.as_deref(),
+                Some(effort)
+            );
+        }
+    }
+
+    #[test]
+    fn to_canonical_rejects_lexically_invalid_effort() {
+        // WHY (issue #20): lexical hygiene only, shared with chat.
+        let req = parse(r#"{"model":"m","input":"q","reasoning":{"effort":""}}"#);
+        let err = responses_to_canonical(&req).expect_err("empty effort must reject");
+        assert!(
+            err.contains("reasoning_effort") && err.contains("empty"),
+            "error must name empty: {err}"
         );
     }
 

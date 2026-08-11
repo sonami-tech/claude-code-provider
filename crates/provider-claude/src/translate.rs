@@ -405,6 +405,11 @@ pub fn build_messages_request_from_canonical(
     let top_k = None;
     let stop_sequences = None;
 
+    // output_config.effort from client is applied in prepare_anthropic_request
+    // (needs profile wire/beta support). Leave None here so pin defaults still
+    // fill only when client effort is absent.
+    let output_config = None;
+
     // metadata / user passthrough limited for canonical v1
     let metadata = None;
 
@@ -441,7 +446,7 @@ pub fn build_messages_request_from_canonical(
         stream: Some(false),
         metadata,
         thinking,
-        output_config: None,
+        output_config,
         // Auto-cache marker is injected later by finalize_claude_wire_request
         // (step 6), gated on the first-party + enabled check. None here keeps
         // the direct-builder output identical to the fingerprint baseline.
@@ -815,6 +820,33 @@ pub fn prepare_anthropic_request(
     // must NOT re-apply them or the billing suffix would be computed over
     // double-replaced text. Pass an empty Replacements to the tail.
     let mut anth = build_messages_request_from_canonical(canon, resolved, repl)?;
+
+    // Issue #20: client effort -> output_config.effort before wire defaults so
+    // pin cannot overwrite. Only on models that support the effort surface
+    // (pin output_effort or effort beta). Else keep thinking-budget path; if
+    // that also cannot express the value, fail loud (no silent omit).
+    apply_client_effort_to_output_config(&mut anth, canon, profile)?;
+
+    // Prefer output_config.effort when set from client. Legacy thinking budgets
+    // only when the client supplied an explicit budget_tokens (or the model has
+    // no effort surface, so build left thinking as the expression path).
+    // Effort-derived thinking + output_config together can 400 on modern
+    // Anthropic models that want adaptive effort, not manual enabled thinking.
+    if anth.output_config.is_some()
+        && canon
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.budget_tokens)
+            .is_none()
+        && anth.thinking.is_some()
+    {
+        anth.thinking = None;
+        // build forced temperature=1.0 / top_p=None while thinking was active;
+        // restore client sampling so pin defaults can fill unset fields.
+        anth.temperature = canon.temperature;
+        anth.top_p = canon.top_p;
+    }
+
     finalize_claude_wire_request(
         &mut anth,
         &canon.model,
@@ -824,7 +856,64 @@ pub fn prepare_anthropic_request(
         inject_identity,
         supports_auto_cache,
     );
+    // Explicit client "none"/empty means omit effort, not "use pin default".
+    if let Some(effort) = canon.reasoning.as_ref().and_then(|r| r.effort.as_deref())
+        && (effort.is_empty() || effort == "none")
+    {
+        anth.output_config = None;
+    }
     Ok(anth)
+}
+
+/// Whether this model’s fingerprint pin exposes `output_config.effort`.
+fn model_supports_output_effort(profile: &FingerprintProfile, model: &str) -> bool {
+    let defaults = profile.wire_defaults_for_model(model);
+    defaults.output_effort.is_some()
+        || profile
+            .beta_reply_for_model(model)
+            .split(',')
+            .any(|b| b == "effort-2025-11-24")
+}
+
+/// Map OpenAI-centric effort aliases onto Anthropic `output_config.effort`.
+/// Free strings (incl. `xhigh`) pass through. Documented aliases: `minimal`→
+/// `low`. `max` is kept as Anthropic vocabulary (not clamped to high).
+fn claude_output_effort_value(effort: &str) -> &str {
+    match effort {
+        "minimal" => "low",
+        other => other,
+    }
+}
+
+/// Apply explicit client reasoning effort onto `output_config` when the model
+/// can express it. Runs before pin wire defaults (issue #20 precedence).
+fn apply_client_effort_to_output_config(
+    anth: &mut MessagesRequest,
+    canon: &CanonicalRequest,
+    profile: &FingerprintProfile,
+) -> Result<(), String> {
+    let Some(effort) = canon.reasoning.as_ref().and_then(|r| r.effort.as_deref()) else {
+        return Ok(());
+    };
+    if effort.is_empty() || effort == "none" {
+        return Ok(());
+    }
+    // Use the builder’s resolved model id (canonical when known).
+    let model = anth.model.as_str();
+    if model_supports_output_effort(profile, model) {
+        anth.output_config = Some(OutputConfig {
+            effort: claude_output_effort_value(effort).to_string(),
+        });
+        return Ok(());
+    }
+    // No output_config surface (e.g. Haiku pin). Thinking budget may still
+    // express known ladder values; unmappable efforts must not silently vanish.
+    if budget_for_effort(effort) == 0 {
+        return Err(format!(
+            "unsupported reasoning_effort: provider=claude path=messages model={model} requested={effort} supported=[low, medium, high, max] (thinking budget only; output_config.effort unavailable on this model)"
+        ));
+    }
+    Ok(())
 }
 
 /// The single provider-level "forge tail" shared by both Claude-bound doors
@@ -892,6 +981,9 @@ pub fn finalize_claude_wire_request(
     // Step 3 already wrote a non-zero max_tokens when thinking is active, so
     // this leaves that alone. NOTE: this is NOT a no-op wrapper - it also
     // re-defaults an explicit max_tokens:0, intentionally.
+    // Client non-none effort is already on output_config from Door-1 build and
+    // is not overwritten here (issue #20). Explicit "none" is cleared after
+    // this tail in prepare_anthropic_request.
     apply_profile_wire_defaults(req, profile);
 
     // 5. Identity: the billing suffix is computed over the final body and
@@ -921,6 +1013,9 @@ pub fn finalize_claude_wire_request(
 /// "client did not supply": max_tokens sentinel 0, temperature None,
 /// output_config None. Mirrors the reference implementation's
 /// `apply_profile_wire_defaults` (see the working claude-code-provider).
+///
+/// Client non-none effort must already be on `output_config` before this runs
+/// so pin defaults cannot overwrite it (issue #20).
 pub fn apply_profile_wire_defaults(req: &mut MessagesRequest, profile: &FingerprintProfile) {
     let defaults = profile.wire_defaults_for_model(&req.model);
     if req.max_tokens == 0 {
@@ -1514,18 +1609,195 @@ mod tests {
     }
 
     #[test]
-    fn door1_thinking_budget_bump_locks_effort_derived_max_tokens() {
-        // WHY (forge-tail unification): the thinking-budget bump was moved out of
-        // build_messages_request_from_canonical into the shared forge tail, and it
-        // MUST run BEFORE apply_profile_wire_defaults so it still sees the sentinel
-        // 0 and reproduces today's Door-1 result. The ceiling stays the CATALOG max
-        // (64000), NOT the wire-default 32000 - using 32000 would (a) silently
-        // change the high-effort result 17408->32000 and (b) emit an INVALID
-        // request at max effort (32000 <= 32768 budget). These exact values lock
-        // both: high -> budget+1024=17408; max -> 32768+1024=33792 (> budget).
+    fn client_effort_sets_output_config_and_overrides_pin_default() {
+        // WHY (issue #20): explicit client effort drives output_config.effort and
+        // must not be overwritten by fingerprint pin defaults (e.g. Fable xhigh).
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
-        for (effort, expected_max) in [("high", 17408u32), ("max", 33792u32)] {
+        let canon = CanonicalRequest {
+            model: "fable".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("low".into()),
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
+        assert_eq!(
+            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            Some("low"),
+            "client effort must win over Fable pin default xhigh"
+        );
+    }
+
+    #[test]
+    fn client_xhigh_effort_reaches_output_config() {
+        // WHY (issue #20): chat-accepted xhigh must land on Anthropic
+        // output_config.effort, not be blocked or replaced by pin defaults.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        let canon = CanonicalRequest {
+            model: "sonnet".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("xhigh".into()),
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
+        assert_eq!(
+            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn absent_effort_keeps_fable_pin_default_xhigh() {
+        // WHY (issue #20): pin default applies only when client effort is absent.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        let canon = CanonicalRequest {
+            model: "fable".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
+        assert_eq!(
+            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            Some("xhigh"),
+            "Fable capture-backed pin default when effort absent"
+        );
+    }
+
+    #[test]
+    fn explicit_none_effort_suppresses_pin_output_config() {
+        // WHY (issue #20): client "none" is explicit omit, not absence. Pin must
+        // not re-inject output_config.effort.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        let canon = CanonicalRequest {
+            model: "fable".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("none".into()),
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
+        assert!(
+            anth.output_config.is_none(),
+            "explicit none must not get pin effort: {:?}",
+            anth.output_config
+        );
+    }
+
+    #[test]
+    fn haiku_client_effort_does_not_inject_output_config() {
+        // WHY (issue #20 review): Haiku pin has no output_effort and no effort
+        // beta. Client high/medium must not force output_config (upstream 400 /
+        // fingerprint break); thinking budget still expresses known efforts.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        let canon = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("high".into()),
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
+        assert!(
+            anth.output_config.is_none(),
+            "haiku must not get output_config.effort: {:?}",
+            anth.output_config
+        );
+        assert!(
+            anth.thinking.is_some(),
+            "haiku high effort still uses thinking budget"
+        );
+    }
+
+    #[test]
+    fn haiku_unmappable_effort_fails_loud() {
+        // WHY: xhigh has no thinking budget and haiku has no output_config
+        // surface; must fail loud, not silent omit.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        let canon = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("xhigh".into()),
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let err = prepare_anthropic_request(&canon, profile, &repl, false, false)
+            .expect_err("haiku xhigh must fail loud");
+        assert!(
+            err.contains("unsupported reasoning_effort") && err.contains("xhigh"),
+            "structured unsupported effort: {err}"
+        );
+    }
+
+    #[test]
+    fn client_minimal_effort_maps_to_low_on_output_config() {
+        // WHY: OpenAI minimal is below Anthropic's lowest rung; map to low on
+        // output_config (adapter-local alias), matching thinking budget mapping.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        let canon = CanonicalRequest {
+            model: "sonnet".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("minimal".into()),
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
+        assert_eq!(
+            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn door1_effort_on_output_config_model_skips_thinking_budget_bump() {
+        // WHY (issue #20): sonnet supports output_config.effort; client effort
+        // drives that knob and must not also emit legacy thinking budgets (can
+        // 400 on modern Anthropic). max_tokens comes from the pin (64000), not
+        // budget+1024. Haiku (no effort surface) still uses the thinking path
+        // — see haiku_client_effort_does_not_inject_output_config.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        for effort in ["high", "max"] {
             let canon = CanonicalRequest {
                 model: "sonnet".into(),
                 messages: vec![CanonicalMessage {
@@ -1540,18 +1812,49 @@ mod tests {
             };
             let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
             assert_eq!(
-                anth.max_tokens, expected_max,
-                "sonnet effort={effort}: max_tokens must be budget+1024 under the catalog ceiling"
+                anth.output_config.as_ref().map(|o| o.effort.as_str()),
+                Some(effort),
+                "sonnet effort={effort} on output_config"
             );
-            // Sanity: max_tokens must strictly exceed the thinking budget, else
-            // Anthropic rejects the request.
-            let budget = anth.thinking.as_ref().unwrap().budget_tokens.unwrap();
             assert!(
-                anth.max_tokens > budget,
-                "max_tokens {} must exceed thinking budget {budget}",
-                anth.max_tokens
+                anth.thinking.is_none(),
+                "sonnet effort={effort} must not also set thinking: {:?}",
+                anth.thinking
+            );
+            assert_eq!(
+                anth.max_tokens, 64_000,
+                "sonnet effort={effort}: pin max_tokens when no thinking bump"
             );
         }
+    }
+
+    #[test]
+    fn door1_explicit_budget_tokens_keeps_thinking_with_output_config() {
+        // WHY: client-supplied budget_tokens is explicit legacy thinking; keep
+        // it even when output_config.effort is also set from effort string.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        let canon = CanonicalRequest {
+            model: "sonnet".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("high".into()),
+                budget_tokens: Some(4096),
+            }),
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
+        assert_eq!(
+            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            Some("high")
+        );
+        assert_eq!(
+            anth.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(4096)
+        );
     }
 
     #[test]

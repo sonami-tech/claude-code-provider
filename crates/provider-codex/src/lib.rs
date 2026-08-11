@@ -1604,7 +1604,7 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
     }
     if let Some(CanonicalReasoning { effort, .. }) = &req.reasoning
         && let Some(effort) = effort.as_deref()
-        && let Some(effort) = codex_reasoning_effort(effort)
+        && let Some(effort) = codex_reasoning_effort(effort, &req.model)?
     {
         body["reasoning"] = json!({ "effort": effort });
     }
@@ -1648,19 +1648,32 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
     Ok(body)
 }
 
-/// Map canonical effort onto OpenAI Responses vocabulary.
-/// `"max"` (Claude-centric) clamps to `"high"`. Empty/`none` still emit as
-/// `"none"` so Codex can disable reasoning (unlike Grok, which has no omit-to-
-/// disable contract for the default-high models).
-fn codex_reasoning_effort(effort: &str) -> Option<&'static str> {
+/// Map canonical effort onto OpenAI Responses vocabulary used by Codex.
+///
+/// Documented aliases: `max`→`high`. Empty omits the field. Explicit `"none"`
+/// still emits so Codex can disable reasoning (unlike Grok). First-class
+/// `xhigh` is kept (OpenAI/Codex wire). Unmappable values (e.g. `ultra`) fail
+/// loud — never silent omit (issue #20).
+fn codex_reasoning_effort(
+    effort: &str,
+    model: &str,
+) -> Result<Option<&'static str>, ProviderError> {
+    const SUPPORTED: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
     match effort {
-        "" => None,
-        "none" => Some("none"),
-        "minimal" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" | "max" => Some("high"),
-        _ => None,
+        "" => Ok(None),
+        "none" => Ok(Some("none")),
+        "minimal" => Ok(Some("minimal")),
+        "low" => Ok(Some("low")),
+        "medium" => Ok(Some("medium")),
+        "high" | "max" => Ok(Some("high")),
+        "xhigh" => Ok(Some("xhigh")),
+        other => Err(ProviderError::unsupported_reasoning_effort(
+            "codex",
+            Some(model),
+            "responses",
+            other,
+            SUPPORTED,
+        )),
     }
 }
 
@@ -2658,6 +2671,56 @@ query_params = { api-version = "2026-01-01" }
         // REST body still carries the cap for OpenAI api.openai.com Responses.
         let rest = codex_responses_body(&req, false).unwrap();
         assert_eq!(rest["max_output_tokens"], 256);
+    }
+
+    #[test]
+    fn codex_unmappable_effort_fails_loud_not_silent_omit() {
+        // WHY (issue #20): unmappable explicit client efforts must not be
+        // silently dropped from the Responses body; fail with structured error.
+        // OpenAI/Codex wire includes xhigh; ultra is the unmappable example.
+        let base = CanonicalRequest {
+            model: "gpt-5.5".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        for bad in ["ultra", "extreme"] {
+            let mut req = base.clone();
+            req.reasoning = Some(CanonicalReasoning {
+                effort: Some(bad.into()),
+                budget_tokens: None,
+            });
+            let err =
+                codex_responses_body(&req, false).expect_err("unmappable effort must fail loud");
+            match err {
+                ProviderError::BadRequest(msg) => {
+                    assert!(
+                        msg.contains("unsupported reasoning_effort")
+                            && msg.contains("provider=codex")
+                            && msg.contains(bad)
+                            && msg.contains("supported=["),
+                        "structured unsupported-effort error: {msg}"
+                    );
+                }
+                other => panic!("expected BadRequest, got {other:?}"),
+            }
+        }
+        // Documented alias max→high still maps; xhigh is first-class OpenAI.
+        let mut req = base.clone();
+        req.reasoning = Some(CanonicalReasoning {
+            effort: Some("max".into()),
+            budget_tokens: None,
+        });
+        let body = codex_responses_body(&req, false).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+        req.reasoning = Some(CanonicalReasoning {
+            effort: Some("xhigh".into()),
+            budget_tokens: None,
+        });
+        let body = codex_responses_body(&req, false).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 
     #[tokio::test]

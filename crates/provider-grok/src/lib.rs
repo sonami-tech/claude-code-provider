@@ -1108,11 +1108,11 @@ fn to_xai_chat_request(
     }
 
     // Map canonical reasoning -> xAI chat.completions form (top level for this surface).
-    // xAI documents low|medium|high; clamp canonical extras from the chat vocabulary.
+    // xAI documents low|medium|high; unmappable explicit efforts fail loud (issue #20).
     if let Some(CanonicalReasoning {
         effort: Some(eff), ..
     }) = &req.reasoning
-        && let Some(eff) = grok_reasoning_effort(eff)
+        && let Some(eff) = grok_reasoning_effort(eff, &req.model, "chat.completions")?
     {
         body["reasoning_effort"] = json!(eff);
     }
@@ -1291,7 +1291,7 @@ fn to_grok_responses_request(
         effort: Some(effort),
         ..
     }) = &req.reasoning
-        && let Some(effort) = grok_reasoning_effort(effort)
+        && let Some(effort) = grok_reasoning_effort(effort, &req.model, "responses")?
     {
         // Responses-standard reasoning; NOT the CLI's {summary:"concise"} preference.
         body["reasoning"] = json!({ "effort": effort });
@@ -1301,15 +1301,28 @@ fn to_grok_responses_request(
 }
 
 /// Map canonical effort onto xAI's documented set (`low|medium|high`).
-/// `"none"` omits the field. `"minimal"`/`"max"` clamp to the nearest rung.
-fn grok_reasoning_effort(effort: &str) -> Option<&'static str> {
+///
+/// Documented aliases: `minimal`→`low`, `max`→`high`. Explicit `"none"`/empty
+/// omit the field. Unmappable values (e.g. `xhigh`, `ultra`) fail loud — never
+/// silent omit (issue #20).
+fn grok_reasoning_effort(
+    effort: &str,
+    model: &str,
+    path: &str,
+) -> Result<Option<&'static str>, ProviderError> {
+    const SUPPORTED: &[&str] = &["low", "medium", "high"];
     match effort {
-        "" | "none" => None,
-        "minimal" | "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" | "max" => Some("high"),
-        // Unknown: omit rather than 400 upstream. Chat already rejects unknowns.
-        _ => None,
+        "" | "none" => Ok(None),
+        "minimal" | "low" => Ok(Some("low")),
+        "medium" => Ok(Some("medium")),
+        "high" | "max" => Ok(Some("high")),
+        other => Err(ProviderError::unsupported_reasoning_effort(
+            "grok",
+            Some(model),
+            path,
+            other,
+            SUPPORTED,
+        )),
     }
 }
 
@@ -2783,6 +2796,62 @@ mod tests {
         assert_eq!(b["max_completion_tokens"], 10);
         assert_eq!(b["reasoning_effort"], "high");
         assert_eq!(b["service_tier"], "priority");
+    }
+
+    #[test]
+    fn grok_unmappable_effort_fails_loud_not_silent_omit() {
+        // WHY (issue #20): xAI wire is low|medium|high only. Explicit client
+        // xhigh/ultra must not be silently dropped; fail with structured error.
+        let base = CanonicalRequest {
+            model: "grok-4.5".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        for bad in ["xhigh", "ultra"] {
+            let mut r = base.clone();
+            r.reasoning = Some(CanonicalReasoning {
+                effort: Some(bad.into()),
+                budget_tokens: None,
+            });
+            let err = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG)
+                .expect_err("unmappable effort must fail loud");
+            match err {
+                ProviderError::BadRequest(msg) => {
+                    assert!(
+                        msg.contains("unsupported reasoning_effort")
+                            && msg.contains("provider=grok")
+                            && msg.contains(bad)
+                            && msg.contains("supported=["),
+                        "structured unsupported-effort error: {msg}"
+                    );
+                }
+                other => panic!("expected BadRequest, got {other:?}"),
+            }
+            // Responses path same contract.
+            let err = to_grok_responses_request(&r, GROK_CATALOG, false)
+                .expect_err("responses unmappable effort must fail loud");
+            assert!(
+                matches!(err, ProviderError::BadRequest(ref msg) if msg.contains(bad)),
+                "responses path: {err:?}"
+            );
+        }
+        // Documented aliases still map.
+        let mut r = base.clone();
+        r.reasoning = Some(CanonicalReasoning {
+            effort: Some("minimal".into()),
+            budget_tokens: None,
+        });
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG).unwrap();
+        assert_eq!(b["reasoning_effort"], "low");
+        r.reasoning = Some(CanonicalReasoning {
+            effort: Some("max".into()),
+            budget_tokens: None,
+        });
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG).unwrap();
+        assert_eq!(b["reasoning_effort"], "high");
     }
 
     #[test]

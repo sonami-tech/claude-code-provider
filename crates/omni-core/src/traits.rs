@@ -101,4 +101,32 @@ impl ProviderError {
             message: message.into(),
         }
     }
+
+    /// Structured fail-loud error when an adapter cannot express a client
+    /// `reasoning_effort` on the upstream wire. Never use silent omit for an
+    /// explicit client effort (issue #20).
+    ///
+    /// Message shape is stable for clients and tests: provider, path, requested
+    /// value, optional model/pin, optional advisory supported list.
+    pub fn unsupported_reasoning_effort(
+        provider: &str,
+        model: Option<&str>,
+        path: &str,
+        requested: &str,
+        supported: &[&str],
+    ) -> Self {
+        let mut msg = format!(
+            "unsupported reasoning_effort: provider={provider} path={path} requested={requested}"
+        );
+        if let Some(model) = model {
+            msg.push_str(" model=");
+            msg.push_str(model);
+        }
+        if !supported.is_empty() {
+            msg.push_str(" supported=[");
+            msg.push_str(&supported.join(", "));
+            msg.push(']');
+        }
+        Self::BadRequest(msg)
+    }
 }

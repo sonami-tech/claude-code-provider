@@ -35,7 +35,8 @@ pub use env::{env_nonempty, headers_from_env, parse_custom_headers};
 pub use error::{AppError, classify_upstream};
 pub use http::{
     ChatCompletionRequest, ChatCompletionResponse, ChatContentPart, ChatImageUrl, ChatMessage,
-    ChatMessageContent, from_canonical, sse_from_canonical_stream, to_canonical, unix_now_secs,
+    ChatMessageContent, MAX_REASONING_EFFORT_LEN, from_canonical, sse_from_canonical_stream,
+    to_canonical, unix_now_secs, validate_reasoning_effort_lexical,
 };
 pub use oauth_refresh::{
     MAX_CREDENTIAL_RECOVERY_TURNS, NEAR_EXPIRY_SKEW_MS, NEAR_EXPIRY_SKEW_SECS,
