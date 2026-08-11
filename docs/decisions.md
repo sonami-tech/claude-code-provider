@@ -1,5 +1,43 @@
 # Key Decisions and Findings
 
+## Gateway philosophy (issue #27)
+
+- Decision: Omni is a **many-to-many gateway**. One endpoint serves multiple
+  providers and multiple inbound interfaces (OpenAI chat, Responses, Anthropic
+  Messages, and related paths). Clients and providers connect without inventing
+  a third omni-only request dialect (canonical types are internal only).
+- Decision: **Pass through or translate.** Prefer pass-through when the wire
+  allows it; otherwise translate into the provider's native form. Fields that
+  change the end result must not be silently stripped. Silent omit of
+  meaningful client intent is a bug.
+- Decision: **Minimal surface / defaults.** Defaults exist only for
+  compatibility when the client omits a value, and only in the smallest form
+  that keeps the request valid. Do not invent maintenance-heavy defaults that
+  go stale.
+- Decision: **Client intent first.** Precedence is **explicit client value →
+  minimal compat/capture default when absent → absent**. Fingerprint or
+  capture fidelity must not win over meaningful client intent (Door-2
+  honor-client cases included; see issue #22). Claude effort is the concrete
+  instance: client effort > fingerprint pin default > absent
+  (issues #20 / #24).
+- Decision: **Fail loud when unmappable.** If a backend cannot honor
+  meaningful client intent (a value that changes the end result), return a
+  clear error rather than silent drop. Aligned with open-edge reasoning effort
+  and adapter map-or-fail (issues #20 / #24). Documented protocol-lossy gaps
+  on translated paths stay listed in `docs/anthropic-compat.md`; those are
+  explicit exceptions, not a license to strip other intent.
+- Rationale: operators want one local endpoint for many clients and providers.
+  A third dialect or silent field stripping forces client-side workarounds and
+  hides bugs. Minimal compat defaults keep requests valid without freezing a
+  stale "omni default profile." Fail-loud keeps errors actionable when a
+  backend cannot honor intent.
+- Non-goals for this decision: implementing behavior changes (philosophy
+  applies now; code work stays on #18, #19, #22, #25, #26, and related
+  issues); new config knobs; replacing the compatibility matrix or roadmap
+  with philosophy text.
+- Source of truth: `docs/README.md` (operator summary), `docs/DESIGN.md`
+  (principles + dual-mode Anthropic notes), this entry (citation anchor).
+
 ## Architecture
 
 - Decision: one server binary (`omni`) with separate provider crates and a

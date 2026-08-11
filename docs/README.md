@@ -4,6 +4,36 @@ OpenAI-compatible Rust proxy that serves Anthropic Claude, xAI Grok, and Codex
 from one `omni` server binary. Provider-specific protocol, credential, and
 fingerprint logic remains isolated in provider crates.
 
+## Gateway philosophy
+
+Omni is a **many-to-many gateway**: any supported client shape to any supported
+provider, with a minimal gateway surface. Clients should not need a third
+request dialect beyond the inbound APIs Omni already speaks (canonical types
+are internal only).
+
+1. **Many-to-many.** One endpoint, multiple providers and inbound interfaces
+   (OpenAI chat, Responses, Anthropic Messages, and related paths).
+2. **Pass through or translate.** Fields that change the end result must not be
+   silently stripped. Prefer pass-through when the wire allows it; otherwise
+   translate into the provider's native form. Silent omit of meaningful client
+   intent is a bug.
+3. **Minimal surface.** Defaults exist only for compatibility when the client
+   omits a value, and only in the smallest form that keeps the request valid.
+   Avoid maintenance-heavy defaults that go stale.
+4. **Client intent first.** Precedence: explicit client value → minimal
+   compat/capture default when absent → absent. Fingerprint or capture fidelity
+   must not win over meaningful client intent (including Door-2 honor-client
+   cases; see #22).
+5. **Fail loud when unmappable.** If a backend cannot honor meaningful client
+   intent (a value that changes the end result), return a clear error rather
+   than silent drop (aligned with the reasoning-effort contract; see below and
+   issues #20 / #24). Documented protocol-lossy gaps on translated paths stay
+   listed in [`anthropic-compat.md`](anthropic-compat.md); those are explicit
+   exceptions, not a license to strip intent.
+
+Design narrative: [`DESIGN.md`](DESIGN.md). Decision record:
+[`decisions.md`](decisions.md).
+
 ## Binary
 
 - `omni` - the only server binary. Routes by canonical upstream model id

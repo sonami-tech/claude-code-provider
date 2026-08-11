@@ -1,5 +1,44 @@
 # Design: Single Server Binary, Isolated Providers
 
+## Gateway principles
+
+Product framing for how the gateway treats client requests and provider wires
+(issue #27). User-facing summary: `docs/README.md`. ADR-style anchor:
+`docs/decisions.md`.
+
+1. **Many-to-many.** One `omni` endpoint serves multiple providers and multiple
+   inbound interfaces. Clients and providers connect without a third omni-only
+   request dialect (canonical types are internal only).
+2. **Pass through or translate.** Prefer pass-through when the upstream wire
+   can carry the field. Otherwise translate into the provider's native form.
+   Fields that change the end result must not be silently stripped; silent omit
+   of meaningful client intent is a bug.
+3. **Minimal surface / defaults.** Fill defaults only for compatibility when
+   the client omits a value, and only in the smallest form that keeps the
+   request valid. Do not invent maintenance-heavy defaults that go stale and
+   break compatibility.
+4. **Client intent first.** Precedence is **explicit client value → minimal
+   compat/capture default when absent → absent**. Fingerprint or capture
+   fidelity must not override meaningful client intent on this gateway
+   (Door-2 honor-client cases included; see issue #22). Claude effort is the
+   worked example: client effort > fingerprint pin default > absent
+   (issues #20 / #24).
+5. **Fail loud when unmappable.** When a backend cannot honor meaningful client
+   intent (a value that changes the end result), fail with a clear structured
+   error rather than silent drop (same contract as open-edge
+   `reasoning_effort` and adapter map-or-fail). Documented protocol-lossy
+   exceptions on translated paths remain listed in `docs/anthropic-compat.md`
+   (for example `top_k`, `cache_control`); those are not silent intent bugs
+   when explicitly documented, and they are not a license to strip other
+   intent.
+
+**Dual-mode Anthropic** stays consistent with these rules: Claude uses native
+passthrough (fingerprint and wire defaults apply only where the client did not
+supply the value). Grok/Codex use translated Anthropic→canonical→provider
+paths; translation is best-effort protocol fidelity (`docs/anthropic-compat.md`)
+but must not strip meaningful client intent in favor of capture or fingerprint
+habits. Lossy protocol gaps are documented; silent intent drops are not.
+
 ## Decision
 
 The workspace ships one server binary: `omni`.
