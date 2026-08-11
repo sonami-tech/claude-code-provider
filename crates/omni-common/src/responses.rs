@@ -1391,6 +1391,7 @@ fn responses_error_reason(finish_reason: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::MAX_REASONING_EFFORT_LEN;
     use omni_core::{
         CanonicalContent, CanonicalImageSource, CanonicalResponseMetadata, CanonicalStreamEvent,
         CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, ProviderError,
@@ -1626,12 +1627,30 @@ mod tests {
 
     #[test]
     fn to_canonical_rejects_lexically_invalid_effort() {
-        // WHY (issue #20): lexical hygiene only, shared with chat.
-        let req = parse(r#"{"model":"m","input":"q","reasoning":{"effort":""}}"#);
-        let err = responses_to_canonical(&req).expect_err("empty effort must reject");
+        // WHY (issue #20 / #23): lexical hygiene only, shared with chat
+        // (empty, over-long, unsafe charset). No closed valid-values list.
+        let empty = parse(r#"{"model":"m","input":"q","reasoning":{"effort":""}}"#);
+        let err = responses_to_canonical(&empty).expect_err("empty effort must reject");
         assert!(
             err.contains("reasoning_effort") && err.contains("empty"),
             "error must name empty: {err}"
+        );
+
+        let bad_chars = parse(r#"{"model":"m","input":"q","reasoning":{"effort":"hi there"}}"#);
+        let err = responses_to_canonical(&bad_chars).expect_err("unsafe charset must reject");
+        assert!(
+            err.contains("reasoning_effort") && err.contains("unsafe"),
+            "error must name charset: {err}"
+        );
+
+        let too_long = "a".repeat(MAX_REASONING_EFFORT_LEN + 1);
+        let long = parse(&format!(
+            r#"{{"model":"m","input":"q","reasoning":{{"effort":"{too_long}"}}}}"#
+        ));
+        let err = responses_to_canonical(&long).expect_err("over-long effort must reject");
+        assert!(
+            err.contains("reasoning_effort") && err.contains("max"),
+            "error must name length bound: {err}"
         );
     }
 
