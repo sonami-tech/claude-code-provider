@@ -39,6 +39,26 @@
 - Source of truth: `docs/README.md` (operator summary), `docs/DESIGN.md`
   (principles + dual-mode Anthropic notes), this entry (citation anchor).
 
+## Claude max_tokens and thinking budget (issue #19)
+
+- Decision: **Passthrough.** Omni must not auto-bump client `max_tokens` when a
+  Claude thinking budget would prefer a larger limit. Send the client
+  `max_tokens` as given. If the client omitted `max_tokens`, only fingerprint
+  wire defaults fill the capture value; thinking budget does not rewrite it.
+- Rationale: client intent first (#27). Auto-bump hid undersized client caps and
+  diverged from the values the caller set. Upstream may reject
+  `max_tokens <= thinking.budget_tokens`; that stays a client/request concern,
+  not a gateway mutation.
+- Behavior change: both Claude doors (OpenAI→Anthropic translate and native
+  `/v1/messages`) previously raised `max_tokens` to `budget+1024` (capped) when
+  thinking was enabled and `max_tokens` was at or below the budget. That bump is
+  removed in `finalize_claude_wire_request`.
+- Non-goals: rejecting low `max_tokens` at the gateway; changing wire-default
+  fill when `max_tokens` is omitted; changing thinking/effort mapping itself.
+- Source of truth: `crates/provider-claude/src/translate.rs`
+  (`finalize_claude_wire_request`), tests in that file and
+  `anthropic_passthrough.rs`.
+
 ## Architecture
 
 - Decision: one server binary (`omni`) with separate provider crates and a

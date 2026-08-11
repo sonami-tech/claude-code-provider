@@ -377,12 +377,12 @@ pub fn build_messages_request_from_canonical(
         None
     };
 
-    // Leave max_tokens at the sentinel 0 when the client supplied neither an
-    // explicit value nor a thinking budget. The provider-level forge tail
-    // (finalize_claude_wire_request) runs the thinking-budget bump and then
+    // Leave max_tokens at the sentinel 0 when the client omitted it. The
+    // provider-level forge tail (finalize_claude_wire_request) runs
     // apply_profile_wire_defaults, so the sentinel must survive this build
     // untouched. Filling a concrete value here would pre-empt the tail and
-    // deviate from the fingerprint baseline.
+    // deviate from the fingerprint baseline. Thinking budget never auto-bumps
+    // max_tokens (issue #19).
     let max_tokens = req.max_tokens.unwrap_or(0);
 
     let thinking = derive_thinking_from_canonical(req.reasoning.as_ref());
@@ -448,7 +448,7 @@ pub fn build_messages_request_from_canonical(
         thinking,
         output_config,
         // Auto-cache marker is injected later by finalize_claude_wire_request
-        // (step 6), gated on the first-party + enabled check. None here keeps
+        // (step 5), gated on the first-party + enabled check. None here keeps
         // the direct-builder output identical to the fingerprint baseline.
         cache_control: None,
     })
@@ -933,13 +933,18 @@ fn apply_client_effort_to_output_config(
 /// Ordering is load-bearing and MUST NOT be reordered:
 /// 1. outbound model id (verbatim pin vs profile canonical)
 /// 2. prompt replacements (before identity, so the billing suffix sees final text)
-/// 3. thinking-budget bump (before wire defaults, so it sees the sentinel 0)
-/// 4. wire defaults (fills only still-unset fields)
-/// 5. identity injection (the billing suffix is computed over the final body)
-/// 6. auto-cache marker (LAST: a pure top-level appendage; it does not touch the
-///    system/message prefix identity computed by step 5)
+/// 3. wire defaults (fills only still-unset fields)
+/// 4. identity injection (the billing suffix is computed over the final body)
+/// 5. auto-cache marker (LAST: a pure top-level appendage; it does not touch the
+///    system/message prefix identity computed by step 4)
 ///
-/// `supports_auto_cache` gates step 6: it is only true on first-party Anthropic
+/// Intentionally does **not** raise `max_tokens` when a thinking budget would
+/// prefer more room (issue #19). Client `max_tokens` is sent as given; if the
+/// client omitted it, wire defaults fill the fingerprint capture value only.
+/// Upstream may reject `max_tokens <= thinking.budget_tokens`; that is a
+/// client/request concern, not a gateway auto-bump.
+///
+/// `supports_auto_cache` gates step 5: it is only true on first-party Anthropic
 /// routes with auto-caching enabled (Bedrock/Vertex and custom gateways pass
 /// false). See the caller in lib.rs for the gate.
 ///
@@ -967,40 +972,20 @@ pub fn finalize_claude_wire_request(
     // applied them in the build); Door 2 passes its real replacements here.
     apply_prompt_replacements(req, replacements);
 
-    // 3. Thinking-budget bump. Runs against the CURRENT max_tokens (still the
-    // sentinel 0 when the client omitted it) so it must precede wire defaults.
-    // Ceiling = catalog max_tokens for a known model (unchanged from today);
-    // a fixed 64k for an unknown model. Effort-derived budgets top out at 32768
-    // (< 64000), so this can only produce an invalid (<=budget) result when a
-    // native client supplies an explicit budget >= ceiling (pre-existing).
-    if let Some(budget) = req
-        .thinking
-        .as_ref()
-        .filter(|t| t.kind == "enabled")
-        .and_then(|t| t.budget_tokens)
-        && req.max_tokens <= budget
-    {
-        let ceiling = resolved
-            .map(|d| d.max_tokens.min(u32::MAX as u64) as u32)
-            .unwrap_or(64_000);
-        req.max_tokens = budget.saturating_add(1024).min(ceiling);
-    }
-
-    // 4. Fill the captured Claude Code wire defaults for any field the client
+    // 3. Fill the captured Claude Code wire defaults for any field the client
     // left unset (max_tokens sentinel 0, temperature None, output_config None).
-    // Step 3 already wrote a non-zero max_tokens when thinking is active, so
-    // this leaves that alone. NOTE: this is NOT a no-op wrapper - it also
-    // re-defaults an explicit max_tokens:0, intentionally.
-    // Client non-none effort is already on output_config from Door-1 build and
-    // is not overwritten here (issue #20). Explicit "none" is cleared after
-    // this tail in prepare_anthropic_request.
+    // NOTE: this is NOT a no-op wrapper - it also re-defaults an explicit
+    // max_tokens:0, intentionally. Client non-none effort is already on
+    // output_config from Door-1 build and is not overwritten here (issue #20).
+    // Explicit "none" is cleared after this tail in prepare_anthropic_request.
+    // Thinking budget does not influence max_tokens here (issue #19).
     apply_profile_wire_defaults(req, profile);
 
-    // 5. Identity: the billing suffix is computed over the final body and
+    // 4. Identity: the billing suffix is computed over the final body and
     // uses the (post-replacement) first user text.
     prepend_claude_code_identity(req, profile, inject_identity);
 
-    // 6. Auto-cache marker LAST. A single top-level `cache_control` puts Anthropic
+    // 5. Auto-cache marker LAST. A single top-level `cache_control` puts Anthropic
     // in automatic-caching mode: the server anchors one breakpoint on the last
     // cacheable block and advances it as the conversation grows. This is a pure
     // sibling field (serialized after everything else), so it does NOT alter the
@@ -1827,11 +1812,11 @@ mod tests {
     }
 
     #[test]
-    fn door1_effort_on_output_config_model_skips_thinking_budget_bump() {
+    fn door1_effort_on_output_config_model_skips_thinking_budget() {
         // WHY (issue #20): sonnet supports output_config.effort; client effort
         // drives that knob and must not also emit legacy thinking budgets (can
-        // 400 on modern Anthropic). max_tokens comes from the pin (64000), not
-        // budget+1024. Haiku (no effort surface) still uses the thinking path
+        // 400 on modern Anthropic). max_tokens comes from the pin (64000).
+        // Haiku (no effort surface) still uses the thinking path
         // — see haiku_client_effort_does_not_inject_output_config.
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
@@ -1861,9 +1846,68 @@ mod tests {
             );
             assert_eq!(
                 anth.max_tokens, 64_000,
-                "sonnet effort={effort}: pin max_tokens when no thinking bump"
+                "sonnet effort={effort}: pin max_tokens (no thinking path)"
             );
         }
+    }
+
+    #[test]
+    fn door1_thinking_budget_does_not_raise_client_max_tokens() {
+        // WHY (issue #19): when the client sets max_tokens below a thinking
+        // budget, omni must NOT auto-bump max_tokens. Cover both explicit
+        // budget_tokens and effort-mapped budget (haiku has no output_config
+        // effort surface, so effort maps to thinking).
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+
+        let explicit = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            max_tokens: Some(100),
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("high".into()),
+                budget_tokens: Some(4096),
+            }),
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&explicit, profile, &repl, false, false).unwrap();
+        assert_eq!(
+            anth.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(4096),
+            "explicit thinking budget must still be present"
+        );
+        assert_eq!(
+            anth.max_tokens, 100,
+            "client max_tokens must not be raised for explicit thinking budget"
+        );
+
+        // effort high -> budget_for_effort = 16384 on haiku thinking path
+        let effort_mapped = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            max_tokens: Some(100),
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("high".into()),
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&effort_mapped, profile, &repl, false, false).unwrap();
+        assert_eq!(
+            anth.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(16384),
+            "effort-mapped thinking budget must still be present"
+        );
+        assert_eq!(
+            anth.max_tokens, 100,
+            "client max_tokens must not be raised for effort-mapped thinking budget"
+        );
     }
 
     #[test]

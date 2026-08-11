@@ -226,8 +226,8 @@ fn reconcile_client_request(
     let mut req = client.to_messages_request();
     // Pure pass-through: resolve exact canonical/alias, otherwise forward the id
     // raw (no strict-family reject). The shared forge tail applies the model id,
-    // this door's real prompt replacements, the thinking-budget bump, wire
-    // defaults, and identity - in that order.
+    // this door's real prompt replacements, wire defaults, and identity - in
+    // that order. Thinking budget never auto-bumps max_tokens (issue #19).
     let resolved = profile.resolve_model(&client.model);
     finalize_claude_wire_request(
         &mut req,
@@ -899,7 +899,9 @@ mod tests {
     }
 
     #[test]
-    fn thinking_budget_forces_larger_max_tokens() {
+    fn thinking_budget_does_not_raise_client_max_tokens() {
+        // WHY (issue #19): passthrough. Client max_tokens is sent as given even
+        // when thinking.budget_tokens is larger. Omni must not auto-bump.
         let body = serde_json::json!({
             "model": "claude-haiku-4-5",
             "max_tokens": 100,
@@ -914,18 +916,21 @@ mod tests {
             false,
         )
         .expect("reconcile ok");
-        assert!(req.max_tokens > 4096);
+        assert_eq!(
+            req.max_tokens, 100,
+            "client max_tokens must not be raised for thinking budget"
+        );
+        assert_eq!(
+            req.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(4096)
+        );
     }
 
     #[test]
-    fn door2_thinking_bump_converges_onto_door1_algorithm() {
-        // WHY (forge-tail unification, intended CHANGE): Door 2 now runs the
-        // thinking-budget bump BEFORE wire defaults (via the shared tail), same
-        // as Door 1. Previously Door 2 filled the wire default (32000) first, so a
-        // budget BELOW 32000 with an omitted max_tokens emitted 32000. Now it
-        // emits budget+1024 = 17408, converging onto Door 1's result. Both are
-        // valid (> budget). This test locks the convergence so a regression that
-        // reordered the tail (wire-defaults-first) would fail here.
+    fn door2_omitted_max_tokens_uses_wire_default_not_thinking_bump() {
+        // WHY (issue #19): when the client omits max_tokens, only fingerprint
+        // wire defaults fill it. Thinking budget must not replace that with
+        // budget+1024.
         let body = serde_json::json!({
             "model": "sonnet",
             "messages": [{"role": "user", "content": "Say OK"}],
@@ -940,8 +945,12 @@ mod tests {
         )
         .expect("reconcile ok");
         assert_eq!(
-            req.max_tokens, 17408,
-            "budget 16384 + omitted max_tokens must bump to budget+1024, not the wire default 32000"
+            req.max_tokens, 64_000,
+            "omitted max_tokens must use wire default, not budget+1024"
+        );
+        assert_eq!(
+            req.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(16384)
         );
     }
 
