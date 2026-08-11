@@ -1655,6 +1655,24 @@ mod tests {
     }
 
     #[test]
+    fn to_canonical_accepts_exact_max_reasoning_effort_length() {
+        // WHY (issue #29): MAX+1 rejects; exact-MAX must accept on the real
+        // Responses entry path (responses_to_canonical), not a reimplemented
+        // validator. Parity with chat to_canonical accept bound.
+        let exact = "a".repeat(MAX_REASONING_EFFORT_LEN);
+        let req = parse(&format!(
+            r#"{{"model":"m","input":"q","reasoning":{{"effort":"{exact}"}}}}"#
+        ));
+        let canon = responses_to_canonical(&req).unwrap_or_else(|e| {
+            panic!("exact-MAX length effort must accept on Responses path: {e}")
+        });
+        assert_eq!(
+            canon.reasoning.expect("reasoning mapped").effort.as_deref(),
+            Some(exact.as_str())
+        );
+    }
+
+    #[test]
     fn to_canonical_preserves_top_level_extras_for_provider() {
         // WHY: Responses-native Codex features such as previous_response_id are
         // top-level fields with no canonical equivalent. The inbound adapter

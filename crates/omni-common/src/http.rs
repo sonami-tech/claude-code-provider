@@ -1072,6 +1072,24 @@ mod tests {
     }
 
     #[test]
+    fn to_canonical_accepts_exact_max_reasoning_effort_length() {
+        // WHY (issue #29): MAX+1 rejects; exact-MAX must accept on the real
+        // chat entry path (to_canonical), not a reimplemented validator.
+        let exact = "a".repeat(MAX_REASONING_EFFORT_LEN);
+        let req: ChatCompletionRequest = serde_json::from_str(&format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],
+                "reasoning_effort":"{exact}"}}"#
+        ))
+        .unwrap();
+        let canon = to_canonical(&req)
+            .unwrap_or_else(|e| panic!("exact-MAX length effort must accept on chat path: {e}"));
+        assert_eq!(
+            canon.reasoning.expect("reasoning mapped").effort.as_deref(),
+            Some(exact.as_str())
+        );
+    }
+
+    #[test]
     fn to_canonical_rejects_non_string_reasoning_effort() {
         // WHY: a non-string effort is malformed input; reject by name.
         let req: ChatCompletionRequest = serde_json::from_str(

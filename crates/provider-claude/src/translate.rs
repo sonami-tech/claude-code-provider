@@ -1771,21 +1771,29 @@ mod tests {
         };
         let err = prepare_anthropic_request(&canon, profile, &repl, false, false)
             .expect_err("haiku xhigh must fail loud");
+        // Real fail path (prepare_anthropic_request → apply_client_effort):
+        // shared helper includes model= for the resolved outbound pin id.
         assert!(
             err.contains("unsupported reasoning_effort")
                 && err.contains("provider=claude")
                 && err.contains("path=messages")
                 && err.contains("requested=xhigh")
+                && err.contains("model=")
                 && err.contains("supported=["),
-            "structured unsupported effort: {err}"
+            "structured unsupported effort (incl. model=): {err}"
         );
         // Field order matches ProviderError::unsupported_reasoning_effort:
-        // provider, path, requested, then optional model, then supported.
+        // provider, path, requested, optional model, then supported.
         let provider_pos = err.find("provider=claude").expect("provider field");
         let path_pos = err.find("path=messages").expect("path field");
         let requested_pos = err.find("requested=xhigh").expect("requested field");
+        let model_pos = err.find("model=").expect("model field");
+        let supported_pos = err.find("supported=[").expect("supported field");
         assert!(
-            provider_pos < path_pos && path_pos < requested_pos,
+            provider_pos < path_pos
+                && path_pos < requested_pos
+                && requested_pos < model_pos
+                && model_pos < supported_pos,
             "shared helper field order: {err}"
         );
     }
