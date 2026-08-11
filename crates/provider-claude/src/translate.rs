@@ -813,25 +813,23 @@ pub fn prepare_anthropic_request(
     repl: &Replacements,
     inject_identity: bool,
     supports_auto_cache: bool,
-) -> Result<MessagesRequest, String> {
+) -> Result<MessagesRequest, ProviderError> {
     let resolved = profile.resolve_model(&canon.model);
     // Door 1 applies prompt replacements during the canonical build (repl is
     // threaded into build_messages_request_from_canonical), so the shared tail
     // must NOT re-apply them or the billing suffix would be computed over
     // double-replaced text. Pass an empty Replacements to the tail.
-    let mut anth = build_messages_request_from_canonical(canon, resolved, repl)?;
+    // Shaping failures (unrepresentable content, bad tools/images) are client
+    // faults -> BadRequest. Effort boundary already returns ProviderError
+    // (issue #30: no String unwrap/re-wrap).
+    let mut anth = build_messages_request_from_canonical(canon, resolved, repl)
+        .map_err(ProviderError::BadRequest)?;
 
     // Issue #20: client effort -> output_config.effort before wire defaults so
     // pin cannot overwrite. Only on models that support the effort surface
     // (pin output_effort or effort beta). Else keep thinking-budget path; if
     // that also cannot express the value, fail loud (no silent omit).
-    // ProviderError::BadRequest messages are unwrapped so the outer
-    // prepare path keeps Result<_, String> for other shaping errors; callers
-    // re-wrap with ProviderError::BadRequest (issue #25).
-    apply_client_effort_to_output_config(&mut anth, canon, profile).map_err(|e| match e {
-        ProviderError::BadRequest(msg) => msg,
-        other => other.to_string(),
-    })?;
+    apply_client_effort_to_output_config(&mut anth, canon, profile)?;
 
     // Prefer output_config.effort when set from client. Legacy thinking budgets
     // only when the client supplied an explicit budget_tokens (or the model has
@@ -1771,30 +1769,35 @@ mod tests {
         };
         let err = prepare_anthropic_request(&canon, profile, &repl, false, false)
             .expect_err("haiku xhigh must fail loud");
+        // End-to-end ProviderError::BadRequest (issue #30); no String unwrap.
         // Real fail path (prepare_anthropic_request → apply_client_effort):
-        // shared helper includes model= for the resolved outbound pin id.
+        // shared helper includes model= for the resolved outbound pin id (#28).
+        let msg = match &err {
+            ProviderError::BadRequest(m) => m.as_str(),
+            other => panic!("unsupported effort must be BadRequest, got {other:?}"),
+        };
         assert!(
-            err.contains("unsupported reasoning_effort")
-                && err.contains("provider=claude")
-                && err.contains("path=messages")
-                && err.contains("requested=xhigh")
-                && err.contains("model=")
-                && err.contains("supported=["),
-            "structured unsupported effort (incl. model=): {err}"
+            msg.contains("unsupported reasoning_effort")
+                && msg.contains("provider=claude")
+                && msg.contains("path=messages")
+                && msg.contains("requested=xhigh")
+                && msg.contains("model=")
+                && msg.contains("supported=["),
+            "structured unsupported effort (incl. model=): {msg}"
         );
         // Field order matches ProviderError::unsupported_reasoning_effort:
         // provider, path, requested, optional model, then supported.
-        let provider_pos = err.find("provider=claude").expect("provider field");
-        let path_pos = err.find("path=messages").expect("path field");
-        let requested_pos = err.find("requested=xhigh").expect("requested field");
-        let model_pos = err.find("model=").expect("model field");
-        let supported_pos = err.find("supported=[").expect("supported field");
+        let provider_pos = msg.find("provider=claude").expect("provider field");
+        let path_pos = msg.find("path=messages").expect("path field");
+        let requested_pos = msg.find("requested=xhigh").expect("requested field");
+        let model_pos = msg.find("model=").expect("model field");
+        let supported_pos = msg.find("supported=[").expect("supported field");
         assert!(
             provider_pos < path_pos
                 && path_pos < requested_pos
                 && requested_pos < model_pos
                 && model_pos < supported_pos,
-            "shared helper field order: {err}"
+            "shared helper field order: {msg}"
         );
     }
 

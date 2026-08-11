@@ -494,16 +494,16 @@ impl LlmProvider for ClaudeProvider {
 
         // 2. Build the exact wire request (model resolution inside profile),
         //    apply replacements, THEN identity injection (claude-only).
+        // Request-shaping failures (unrepresentable content, malformed tool args,
+        // bad image URL, unsupported role, unsupported effort) are the client's
+        // fault -> ProviderError::BadRequest (400), not 500.
         let anth_req = translate::prepare_anthropic_request(
             &req,
             self.profile,
             &repl,
             true, // always inject for the gate (callers that want --no-preamble use a different path)
             self.supports_auto_cache(),
-        )
-        // Request-shaping failures (unrepresentable content, malformed tool args,
-        // bad image URL, unsupported role) are the client's fault -> 400, not 500.
-        .map_err(ProviderError::BadRequest)?;
+        )?;
 
         // 3. Serialize for finalize (cch lives in the billing text inside system).
         let body_val = serde_json::to_value(&anth_req).map_err(|e| {
@@ -561,15 +561,14 @@ impl LlmProvider for ClaudeProvider {
         // the non-stream path. Build, serialize, then set stream=true on the
         // JSON value (the typed builder set Some(false)).
         let repl = Replacements::empty();
+        // Request-shaping failures are client faults -> ProviderError::BadRequest.
         let anth_req = translate::prepare_anthropic_request(
             &req,
             self.profile,
             &repl,
             true,
             self.supports_auto_cache(),
-        )
-        // Request-shaping failures are client faults -> 400, not 500.
-        .map_err(ProviderError::BadRequest)?;
+        )?;
         let mut body_val = serde_json::to_value(&anth_req).map_err(|e| {
             ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}")))
         })?;

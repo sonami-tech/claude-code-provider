@@ -196,11 +196,11 @@ pseudo-streaming.
   `CanonicalReasoning`. Empty strings fail at the edge; JSON `null` is absent.
 - Decision: model-catalog effort lists are **discovery-only**. They never gate
   or reject a request that passes lexical hygiene.
-- Decision: Grok and Codex **fail loud** on unmappable explicit effort via
-  `ProviderError::unsupported_reasoning_effort` (structured BadRequest). Claude
-  fails with the same message shape via its translation BadRequest path. Known
-  aliases remain (`minimal`→`low` on Grok; `max`→`high` on both; Codex keeps
-  first-class `xhigh`). Silent omit of client effort is a bug.
+- Decision: Grok, Codex, and Claude **fail loud** on unmappable explicit effort
+  via `ProviderError::unsupported_reasoning_effort` (structured BadRequest).
+  Claude's `prepare_anthropic_request` returns `ProviderError` end to end
+  (issue #30). Known aliases remain (`minimal`→`low` on Grok; `max`→`high` on
+  both; Codex keeps first-class `xhigh`). Silent omit of client effort is a bug.
 - Decision: Claude precedence is **client effort > fingerprint pin default >
   absent**. Client effort sets `output_config.effort` before pin wire defaults.
   Pin defaults apply only when effort is absent. Explicit `none` suppresses pin
@@ -212,8 +212,8 @@ pseudo-streaming.
   forces silent drops. Open edge + per-adapter map-or-fail preserves client
   intent and keeps errors actionable.
 - Source of truth: `omni_common::validate_reasoning_effort_lexical`,
-  `ProviderError::unsupported_reasoning_effort` (Grok/Codex), Claude mapper in
-  `provider-claude` (issue #20 commit). User summary: `docs/README.md`.
+  `ProviderError::unsupported_reasoning_effort` (Grok/Codex/Claude), Claude
+  mapper in `provider-claude` (issues #20/#25/#30). User summary: `docs/README.md`.
   Design: `docs/DESIGN.md`.
 
 ## Grok omit effort when client omits (issue #18)

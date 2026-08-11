@@ -148,8 +148,8 @@ values that lexical hygiene accepts.
 client effort. Unmappable values return HTTP 400 BadRequest with a stable
 `unsupported reasoning_effort` message shape (provider, path, requested value,
 optional model, optional supported list). Grok and Codex use
-`ProviderError::unsupported_reasoning_effort`; Claude emits the same message
-shape via its translation BadRequest path.
+`ProviderError::unsupported_reasoning_effort` (Claude via
+`prepare_anthropic_request`, same structured BadRequest).
 
 - **Grok:** wire `low|medium|high`. Aliases: `minimal`→`low`, `max`→`high`.
   Explicit `"none"` omits the field. `xhigh` and other unknowns fail loud.
@@ -175,7 +175,7 @@ shape via its translation BadRequest path.
   express the value.
 
 Shared edge helper: `omni_common::validate_reasoning_effort_lexical`. Shared
-Grok/Codex constructor: `ProviderError::unsupported_reasoning_effort`.
+constructor: `ProviderError::unsupported_reasoning_effort` (Grok/Codex/Claude).
 User-facing summary: `docs/README.md`. Decision record: `docs/decisions.md`.
 
 ## Codex/OpenAI Backend
