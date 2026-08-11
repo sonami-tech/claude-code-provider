@@ -228,7 +228,23 @@ Adapter mapping (summary):
 
 Claude precedence: **client effort > fingerprint pin default > absent**.
 Effort-capable models prefer `output_config.effort` over effort-derived thinking
-budgets. Design notes: `docs/DESIGN.md`. Decision record: `docs/decisions.md`.
+budgets.
+
+**Grok omit (issue #18):** When the client omits effort, Omni omits the upstream
+field too. The provider/model default then applies (often `high` on grok-4.5).
+No force-floor and no invented disable in this scope; clients that need a
+specific level must set it explicitly.
+
+**Claude free-string (issue #26):** On the OpenAI chat/Responses → Claude path,
+effort-capable models pass free-string client effort through to
+`output_config.effort` (only `minimal`→`low` is remapped; `max` and other names
+are kept as-is, unlike Grok/Codex `max`→`high`). Explicit `"none"` still
+suppresses pin fill and does not set `output_config.effort`. There is no closed
+local Claude effort allowlist. Unknown names may 400 from upstream by design.
+Fail loud only when the adapter cannot express the value (for example Haiku +
+`xhigh`, where the thinking-budget ladder has no mapping).
+
+Design notes: `docs/DESIGN.md`. Decision record: `docs/decisions.md`.
 
 Provider maintenance docs live under `docs/providers/`. Live provider tests are
 explicitly opt-in:

@@ -39,6 +39,17 @@ Default tests use wiremock. Live calls require `OMNI_LIVE_TESTS=1`.
 Capture and refresh-capture work uses `python3 -m tools.capture`; see
 `docs/providers/grok/CAPTURE.md`.
 
+## Reasoning effort
+
+Maps explicit client effort to xAI `low|medium|high` (aliases `minimal`→`low`,
+`max`→`high`). Explicit `"none"` omits the field. Unmappable values fail loud
+(issue #20).
+
+**Omit when client omits (issue #18):** if the client does not set effort, Omni
+does not send one. The provider/model default applies (often `high` on
+grok-4.5). No force-floor and no invented disable. Capture notes:
+`docs/providers/grok/CAPTURE.md`. Operator summary: `docs/README.md`.
+
 ## Provider Extras
 
 Grok accepts these provider extras on OpenAI-compatible inbound surfaces:

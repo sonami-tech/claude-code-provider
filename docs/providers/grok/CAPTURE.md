@@ -144,6 +144,8 @@ operator override, not a second catalog mode.
 
 - Responses (default): nested `"reasoning": { "effort": "..." }`
 - Custom chat: top-level `"reasoning_effort": "low"|"medium"|"high"`
-- On `grok-4.5`, CLI default is `high` and reasoning cannot be disabled. Omni maps
-  `CanonicalReasoning.effort` when the client sets it; it does not invent a default
-  when the client omits reasoning.
+- On `grok-4.5`, CLI default is `high` and reasoning cannot be disabled.
+- **Omit contract (issue #18):** client omits effort (or sends `"none"`) → Omni
+  omits the upstream field → provider/model default applies (often `high`). No
+  force-floor and no invented disable. Explicit set values map or fail loud
+  (issue #20).

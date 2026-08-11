@@ -153,6 +153,10 @@ shape via its translation BadRequest path.
 
 - **Grok:** wire `low|medium|high`. Aliases: `minimal`→`low`, `max`→`high`.
   Explicit `"none"` omits the field. `xhigh` and other unknowns fail loud.
+  When the client **omits** effort entirely, Omni also omits the upstream field
+  (issue #18). No invented default, force-floor, or disable. The
+  provider/model default applies (often `high` on grok-4.5; capture notes:
+  `docs/providers/grok/CAPTURE.md`).
 - **Codex:** wire `none|minimal|low|medium|high|xhigh`. Alias: `max`→`high`.
   Explicit `"none"` still emits so Codex can disable reasoning. Unknowns
   (e.g. `ultra`) fail loud.
@@ -163,6 +167,12 @@ shape via its translation BadRequest path.
   an effort surface prefer `output_config` over effort-derived thinking
   budgets; models without it (e.g. Haiku) use the thinking-budget ladder and
   fail loud when the ladder cannot express the value.
+  On the OpenAI chat/Responses path, effort-capable models pass free-string
+  **non-`none`** effort through to `output_config.effort` (issue #26); only
+  `minimal`→`low` is remapped (`max` and others stay as-is). There is no closed
+  local Claude effort allowlist. Upstream may 400 unknown names by design.
+  Fail loud only when the thinking-budget ladder (or effort surface) cannot
+  express the value.
 
 Shared edge helper: `omni_common::validate_reasoning_effort_lexical`. Shared
 Grok/Codex constructor: `ProviderError::unsupported_reasoning_effort`.

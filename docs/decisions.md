@@ -32,9 +32,10 @@
   stale "omni default profile." Fail-loud keeps errors actionable when a
   backend cannot honor intent.
 - Non-goals for this decision: implementing behavior changes (philosophy
-  applies now; code work stays on #18, #19, #22, #25, #26, and related
-  issues); new config knobs; replacing the compatibility matrix or roadmap
-  with philosophy text.
+  applies now; remaining product work stays on #19, #22, and related
+  issues; #18 / #26 are documented contracts below; #25 shipped in the
+  shared unsupported-effort error path); new config knobs; replacing the
+  compatibility matrix or roadmap with philosophy text.
 - Source of truth: `docs/README.md` (operator summary), `docs/DESIGN.md`
   (principles + dual-mode Anthropic notes), this entry (citation anchor).
 
@@ -214,3 +215,52 @@ pseudo-streaming.
   `ProviderError::unsupported_reasoning_effort` (Grok/Codex), Claude mapper in
   `provider-claude` (issue #20 commit). User summary: `docs/README.md`.
   Design: `docs/DESIGN.md`.
+
+## Grok omit effort when client omits (issue #18)
+
+- Decision: when a Grok client **omits** effort, Omni keeps omitting it on the
+  upstream wire. No invented default, no force-floor, and no new disable that
+  is not on the wire (this issue’s scope is documentation of that contract).
+- Decision: the provider/model default then applies. On grok-4.5 that default
+  is often `high`, and CLI capture notes that reasoning cannot be disabled
+  there (`docs/providers/grok/CAPTURE.md`).
+- Decision: explicit client effort still maps or fails loud per issue #20
+  (`low|medium|high`; aliases; `"none"` omits). Clients that need a specific
+  level must set it.
+- Rationale: inventing a floor or a fake disable would fight the model default
+  and invent wire that does not exist. Leave absent as absent; document the
+  consequence.
+- Non-goals: changing Grok mapping; product knobs for “minimum effort” or
+  force-disable; inventing an upstream disable flag.
+- Source of truth: `grok_reasoning_effort` / body builders in
+  `crates/provider-grok` (omit when absent or `"none"`). User summary:
+  `docs/README.md`. Design: `docs/DESIGN.md`. Capture: `docs/providers/grok/CAPTURE.md`.
+
+## Claude free-string effort pass-through (issue #26)
+
+- Decision: on the **OpenAI chat/Responses → Claude** path, for **effort-capable**
+  models (pin exposes `output_config.effort` or the effort beta), free-string
+  **non-`none`** client effort passes through to `output_config.effort`. Only
+  the documented alias `minimal`→`low` is remapped; other strings (including
+  `xhigh`, `max`, and future names) are not closed by a local Claude effort
+  allowlist. Explicit `"none"` still suppresses pin fill and does not set
+  `output_config.effort` (same precedence as issue #20).
+- Decision: this pass-through is the Door-1 / OpenAI-inbound mapper contract.
+  Native Anthropic `/v1/messages` keeps its closed request allowlist (client
+  `output_config` remains unsupported there unless a rebaseline says otherwise).
+- Decision: unknown or model-unsupported names may **400 from upstream by
+  design**. Omni does not maintain a stale closed list of Anthropic effort
+  tokens to reject earlier.
+- Decision: fail loud locally only when the adapter **cannot express** the
+  value (for example models with no effort surface where the thinking-budget
+  ladder cannot map the value). Same structured
+  `unsupported reasoning_effort` shape as issue #20 / #25.
+- Rationale: matches open-edge + map-or-fail (#20). A local Claude allowlist
+  goes stale as Anthropic adds levels; pass-through keeps client intent and
+  lets the provider own validity.
+- Non-goals: early reject lists of “known unsupported” Claude tokens; changing
+  pin precedence (still client > pin default > absent); changing native
+  Anthropic allowlist behavior.
+- Source of truth: `claude_output_effort_value` /
+  `apply_client_effort_to_output_config` in `crates/provider-claude/src/translate.rs`.
+  User summary: `docs/README.md`. Design: `docs/DESIGN.md`.

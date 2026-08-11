@@ -28,6 +28,18 @@ flags (`--claude-version`, `OMNI_CLAUDE_VERSION`, match-system) are removed
 Offline tests pin the captured bytes. Live Anthropic calls are opt-in via
 `OMNI_LIVE_TESTS=1`.
 
+## Reasoning effort
+
+OpenAI chat/Responses effort is free-string at the edge (issues #20 / #24). On
+the **OpenAI inbound → Claude** path, **effort-capable** models pass free-string
+**non-`none`** effort through to `output_config.effort` (issue #26). Only
+`minimal`→`low` is remapped (`max` kept as-is). There is no closed local Claude
+effort allowlist; unknown names may 400 from upstream by design. Fail loud only
+when the thinking-budget ladder cannot map the value (e.g. Haiku + `xhigh`).
+Precedence remains **client effort > pin default > absent**. This does not
+change native Anthropic `/v1/messages` (closed allowlist still drops client
+`output_config`). Operator summary: `docs/README.md`.
+
 ## Provider Extras
 
 Claude's OpenAI-compatible path has no provider extras passthrough today.
