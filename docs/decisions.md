@@ -146,3 +146,33 @@ pseudo-streaming.
   `tools/live_http_suite` (issue #15). Opt-in only
   (`python3 -m tools.live_http_suite`); not spawned by cargo, not run in CI.
   Separate from `OMNI_LIVE_TESTS`.
+
+## Reasoning effort open edge and fail-loud adapters (issue #20)
+
+- Decision: treat effort as a free string at the OpenAI chat and Responses
+  edges (chat: top-level `reasoning_effort` or nested `reasoning.effort`;
+  Responses: nested `reasoning.effort`). Validate **lexical hygiene only**
+  (non-empty, max 32 chars, charset `A-Z a-z 0-9 _ -`). Drop any global
+  valid-values allowlist so real levels such as `xhigh` reach
+  `CanonicalReasoning`. Empty strings fail at the edge; JSON `null` is absent.
+- Decision: model-catalog effort lists are **discovery-only**. They never gate
+  or reject a request that passes lexical hygiene.
+- Decision: Grok and Codex **fail loud** on unmappable explicit effort via
+  `ProviderError::unsupported_reasoning_effort` (structured BadRequest). Claude
+  fails with the same message shape via its translation BadRequest path. Known
+  aliases remain (`minimal`→`low` on Grok; `max`→`high` on both; Codex keeps
+  first-class `xhigh`). Silent omit of client effort is a bug.
+- Decision: Claude precedence is **client effort > fingerprint pin default >
+  absent**. Client effort sets `output_config.effort` before pin wire defaults.
+  Pin defaults apply only when effort is absent. Explicit `none` suppresses pin
+  fill. Effort-capable models prefer `output_config` over effort-derived
+  thinking budgets; models without that surface (e.g. Haiku) use thinking
+  budgets and fail loud when unmappable.
+- Rationale: clients and providers add new effort names faster than a gateway
+  allowlist can track. Closing the edge name set either blocks real traffic or
+  forces silent drops. Open edge + per-adapter map-or-fail preserves client
+  intent and keeps errors actionable.
+- Source of truth: `omni_common::validate_reasoning_effort_lexical`,
+  `ProviderError::unsupported_reasoning_effort` (Grok/Codex), Claude mapper in
+  `provider-claude` (issue #20 commit). User summary: `docs/README.md`.
+  Design: `docs/DESIGN.md`.

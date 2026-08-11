@@ -91,6 +91,44 @@ cargo run -p omni -- --port 18321
 - Do not add provider-specific server binaries unless there is a concrete
   compatibility requirement.
 
+## Reasoning effort (issue #20)
+
+OpenAI chat and Responses lift free-string effort into
+`CanonicalReasoning.effort`. Wire shapes: chat top-level `reasoning_effort`
+(or nested `reasoning.effort`; top-level wins when both are present);
+Responses nested `reasoning.effort`. Edge validation is **lexical only**
+(non-empty, length ≤ 32, safe charset `A-Z a-z 0-9 _ -`). Empty strings fail at
+the edge; JSON `null` means absent. Explicit `"none"` is preserved in canonical
+so adapters can disable (Codex) or omit (Claude/Grok).
+
+**Catalog never gates.** Model-catalog effort advertisements are discovery
+hints for UIs. They do not close the request name set and must not reject
+values that lexical hygiene accepts.
+
+**Adapters map or fail loud.** Providers must not silently drop an explicit
+client effort. Unmappable values return HTTP 400 BadRequest with a stable
+`unsupported reasoning_effort` message shape (provider, path, requested value,
+optional model, optional supported list). Grok and Codex use
+`ProviderError::unsupported_reasoning_effort`; Claude emits the same message
+shape via its translation BadRequest path.
+
+- **Grok:** wire `low|medium|high`. Aliases: `minimal`→`low`, `max`→`high`.
+  Explicit `"none"` omits the field. `xhigh` and other unknowns fail loud.
+- **Codex:** wire `none|minimal|low|medium|high|xhigh`. Alias: `max`→`high`.
+  Explicit `"none"` still emits so Codex can disable reasoning. Unknowns
+  (e.g. `ultra`) fail loud.
+- **Claude:** precedence is **client effort > pin default > absent**. Client
+  non-none effort sets `output_config.effort` before fingerprint wire defaults
+  (so pin cannot overwrite). Pin defaults (e.g. Fable `xhigh`) apply only when
+  client effort is absent. Explicit `"none"` suppresses pin fill. Models with
+  an effort surface prefer `output_config` over effort-derived thinking
+  budgets; models without it (e.g. Haiku) use the thinking-budget ladder and
+  fail loud when the ladder cannot express the value.
+
+Shared edge helper: `omni_common::validate_reasoning_effort_lexical`. Shared
+Grok/Codex constructor: `ProviderError::unsupported_reasoning_effort`.
+User-facing summary: `docs/README.md`. Decision record: `docs/decisions.md`.
+
 ## Codex/OpenAI Backend
 
 The Codex backend is implemented in `provider-codex` and implements

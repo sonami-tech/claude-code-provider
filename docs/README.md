@@ -175,6 +175,31 @@ Inbound compatibility:
 Anthropic inbound is dual-mode: Claude is native; Grok/Codex are translated.
 `count_tokens` remains Claude-only. Full notes: `docs/anthropic-compat.md`.
 
+### Reasoning effort (issue #20)
+
+Chat (`reasoning_effort` top-level, or nested `reasoning.effort`) and Responses
+(`reasoning.effort`) accept free-string effort with **lexical hygiene only**
+(non-empty, max 32 chars, charset `A-Z a-z 0-9 _ -`). There is no global
+valid-values allowlist at the edge, so levels such as `xhigh` reach canonical.
+Empty strings fail at the edge; JSON `null` means absent.
+
+Catalog-advertised effort lists are **discovery-only** and never reject a
+request. Adapters map known aliases or **fail loud** with a structured
+`unsupported reasoning_effort` error (HTTP 400) when the upstream wire cannot
+express the value (no silent omit of explicit client effort).
+
+Adapter mapping (summary):
+
+| Backend | Maps / keeps | `"none"` | Fails loud (examples) |
+|---|---|---|---|
+| **Grok** | `low`/`medium`/`high`; `minimal`→`low`, `max`→`high` | omits field | `xhigh`, `ultra`, other unknowns |
+| **Codex** | `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; `max`→`high` | emits `none` | `ultra`, other unknowns |
+| **Claude** | client effort wins; pin default only when absent | suppresses pin | unmappable without `output_config.effort` (e.g. Haiku + `xhigh`) |
+
+Claude precedence: **client effort > fingerprint pin default > absent**.
+Effort-capable models prefer `output_config.effort` over effort-derived thinking
+budgets. Design notes: `docs/DESIGN.md`. Decision record: `docs/decisions.md`.
+
 Provider maintenance docs live under `docs/providers/`. Live provider tests are
 explicitly opt-in:
 
