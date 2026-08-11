@@ -128,24 +128,6 @@ pub(crate) fn catalog_contains_unique_names(models: &'static [ModelDef]) -> bool
     true
 }
 
-/// Validate the reasoning_effort field.
-/// Returns the effort string to pass to --effort, or None if the flag should be omitted.
-/// (Adapted: returns Result<Option<&'static str>, String> to avoid pulling AppError here.)
-pub fn validate_effort(effort: Option<&str>) -> Result<Option<&'static str>, String> {
-    match effort {
-        None => Ok(None),
-        Some("none") => Ok(None),
-        Some("low") => Ok(Some("low")),
-        Some("medium") => Ok(Some("medium")),
-        Some("high") => Ok(Some("high")),
-        Some("max") => Ok(Some("max")),
-        Some(other) => Err(format!(
-            "Invalid reasoning_effort: '{}'. Valid values: none, low, medium, high, max",
-            other
-        )),
-    }
-}
-
 #[derive(Serialize)]
 pub struct ModelInfo {
     pub id: String,
@@ -257,22 +239,6 @@ mod tests {
         assert!(profile().resolve_model("gpt-4").is_none());
         assert!(profile().resolve_model("unknown").is_none());
         assert!(profile().resolve_model("").is_none());
-    }
-
-    #[test]
-    fn validate_effort_valid_values() {
-        assert_eq!(validate_effort(None).unwrap(), None);
-        assert_eq!(validate_effort(Some("none")).unwrap(), None);
-        assert_eq!(validate_effort(Some("low")).unwrap(), Some("low"));
-        assert_eq!(validate_effort(Some("medium")).unwrap(), Some("medium"));
-        assert_eq!(validate_effort(Some("high")).unwrap(), Some("high"));
-        assert_eq!(validate_effort(Some("max")).unwrap(), Some("max"));
-    }
-
-    #[test]
-    fn validate_effort_invalid() {
-        assert!(validate_effort(Some("extreme")).is_err());
-        assert!(validate_effort(Some("")).is_err());
     }
 
     #[test]

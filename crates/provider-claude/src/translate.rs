@@ -20,7 +20,7 @@ use omni_common::Replacements;
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
     CanonicalReasoningBlock, CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata,
-    CanonicalTool, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
+    CanonicalTool, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, ProviderError,
 };
 
 use crate::anthropic_passthrough::apply_prompt_replacements;
@@ -825,7 +825,13 @@ pub fn prepare_anthropic_request(
     // pin cannot overwrite. Only on models that support the effort surface
     // (pin output_effort or effort beta). Else keep thinking-budget path; if
     // that also cannot express the value, fail loud (no silent omit).
-    apply_client_effort_to_output_config(&mut anth, canon, profile)?;
+    // ProviderError::BadRequest messages are unwrapped so the outer
+    // prepare path keeps Result<_, String> for other shaping errors; callers
+    // re-wrap with ProviderError::BadRequest (issue #25).
+    apply_client_effort_to_output_config(&mut anth, canon, profile).map_err(|e| match e {
+        ProviderError::BadRequest(msg) => msg,
+        other => other.to_string(),
+    })?;
 
     // Prefer output_config.effort when set from client. Legacy thinking budgets
     // only when the client supplied an explicit budget_tokens (or the model has
@@ -891,7 +897,7 @@ fn apply_client_effort_to_output_config(
     anth: &mut MessagesRequest,
     canon: &CanonicalRequest,
     profile: &FingerprintProfile,
-) -> Result<(), String> {
+) -> Result<(), ProviderError> {
     let Some(effort) = canon.reasoning.as_ref().and_then(|r| r.effort.as_deref()) else {
         return Ok(());
     };
@@ -908,9 +914,15 @@ fn apply_client_effort_to_output_config(
     }
     // No output_config surface (e.g. Haiku pin). Thinking budget may still
     // express known ladder values; unmappable efforts must not silently vanish.
+    // Shared structured shape (issue #25); thinking-budget-only models still
+    // fail loud for values with no budget mapping.
     if budget_for_effort(effort) == 0 {
-        return Err(format!(
-            "unsupported reasoning_effort: provider=claude path=messages model={model} requested={effort} supported=[low, medium, high, max] (thinking budget only; output_config.effort unavailable on this model)"
+        return Err(ProviderError::unsupported_reasoning_effort(
+            "claude",
+            Some(model),
+            "messages",
+            effort,
+            &["low", "medium", "high", "max"],
         ));
     }
     Ok(())
@@ -1739,8 +1751,10 @@ mod tests {
 
     #[test]
     fn haiku_unmappable_effort_fails_loud() {
-        // WHY: xhigh has no thinking budget and haiku has no output_config
-        // surface; must fail loud, not silent omit.
+        // WHY (issues #20/#25): xhigh has no thinking budget and haiku has no
+        // output_config surface; must fail loud with the shared structured
+        // unsupported-effort shape (same fields as Grok/Codex), not silent omit
+        // or a hand-built string.
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
         let canon = CanonicalRequest {
@@ -1758,8 +1772,21 @@ mod tests {
         let err = prepare_anthropic_request(&canon, profile, &repl, false, false)
             .expect_err("haiku xhigh must fail loud");
         assert!(
-            err.contains("unsupported reasoning_effort") && err.contains("xhigh"),
+            err.contains("unsupported reasoning_effort")
+                && err.contains("provider=claude")
+                && err.contains("path=messages")
+                && err.contains("requested=xhigh")
+                && err.contains("supported=["),
             "structured unsupported effort: {err}"
+        );
+        // Field order matches ProviderError::unsupported_reasoning_effort:
+        // provider, path, requested, then optional model, then supported.
+        let provider_pos = err.find("provider=claude").expect("provider field");
+        let path_pos = err.find("path=messages").expect("path field");
+        let requested_pos = err.find("requested=xhigh").expect("requested field");
+        assert!(
+            provider_pos < path_pos && path_pos < requested_pos,
+            "shared helper field order: {err}"
         );
     }
 
