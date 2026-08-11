@@ -56,7 +56,11 @@ Claude's OpenAI-compatible path has no provider extras passthrough today.
 Unsupported provider extras fail loudly before a fingerprint-sensitive wire
 request is built.
 
-Claude native `/v1/messages` uses a closed request allowlist. Fields such as
-`betas`, `metadata`, `service_tier`, `mcp_servers`, `container`, and
-`output_config` remain intentionally unsupported unless a fingerprint rebaseline
-proves they belong on the Claude Code path.
+Claude native `/v1/messages` uses a closed request allowlist. Fingerprint and
+billing fields (`betas`, `metadata`, `service_tier`, `mcp_servers`, `container`)
+remain intentionally unsupported on that door.
+
+`output_config` / effort is **client intent** (issue #22): when the client sets
+it, Door-2 passes it through. Capture/pin defaults apply only when the client
+left `output_config` unset. Precedence: **client > pin default > absent**
+(same idea as OpenAI-compat chat / issues #20 / #24 / #27).

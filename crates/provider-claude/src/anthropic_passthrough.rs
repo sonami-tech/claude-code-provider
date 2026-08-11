@@ -15,16 +15,20 @@ use serde_json::Value;
 
 use crate::fingerprint::{FingerprintProfile, RequestContext};
 use crate::translate::{
-    Message, MessagesRequest, SystemField, Thinking, Tool, ToolChoice, finalize_claude_wire_request,
+    Message, MessagesRequest, OutputConfig, SystemField, Thinking, Tool, ToolChoice,
+    finalize_claude_wire_request,
 };
 use crate::upstream::RawFrame;
 use crate::{ClaudeProvider, ProviderError, UpstreamError};
 
 /// A client-supplied `/v1/messages` body, deserialized into a closed allowlist.
 ///
-/// Fields that alter the Claude Code fingerprint or billing context, such as
-/// `betas`, `metadata`, `service_tier`, `mcp_servers`, `container`, and
-/// `output_config`, are intentionally absent and never forwarded.
+/// Fingerprint/billing-owned fields (`betas`, `metadata`, `service_tier`,
+/// `mcp_servers`, `container`) stay absent and are never forwarded.
+///
+/// `output_config` is client-intent: when the client sets it, Door-2 passes it
+/// through. Capture/pin defaults fill only when the client left it unset
+/// (precedence client > pin default > absent; issues #20 / #22 / #27).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientMessagesRequest {
     pub model: String,
@@ -49,6 +53,10 @@ pub struct ClientMessagesRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub thinking: Option<Thinking>,
+    /// Native Anthropic effort surface. Client-set values are honored; pin
+    /// defaults apply only when this is `None` (issue #22).
+    #[serde(default)]
+    pub output_config: Option<OutputConfig>,
 }
 
 impl ClientMessagesRequest {
@@ -67,7 +75,9 @@ impl ClientMessagesRequest {
             stream: self.stream,
             metadata: None,
             thinking: self.thinking.clone(),
-            output_config: None,
+            // Client > pin default > absent (issue #22). Pin fill happens later
+            // in finalize_claude_wire_request → apply_profile_wire_defaults.
+            output_config: self.output_config.clone(),
             // Native passthrough never injects a gateway-owned top-level marker
             // (deferred: see PR1 scope). The client's own block-level markers
             // ride inside messages/system/tools and are preserved untouched.
@@ -118,6 +128,7 @@ const FORWARDED_FIELDS: &[&str] = &[
     "stop_sequences",
     "stream",
     "thinking",
+    "output_config",
 ];
 
 /// Top-level body keys not forwarded by the closed allowlist. Returned sorted
@@ -1043,6 +1054,8 @@ mod tests {
 
     #[test]
     fn closed_allowlist_drops_fingerprint_fields() {
+        // WHY (issue #22): output_config is client intent, not a fingerprint-
+        // owned strip. Only true fingerprint/billing fields stay dropped.
         let body = serde_json::json!({
             "model": "claude-haiku-4-5",
             "max_tokens": 100,
@@ -1062,7 +1075,6 @@ mod tests {
                 "container",
                 "mcp_servers",
                 "metadata",
-                "output_config",
                 "service_tier"
             ]
         );
@@ -1073,6 +1085,201 @@ mod tests {
         assert!(wire.get("metadata").is_none());
         assert!(wire.get("betas").is_none());
         assert!(wire.get("service_tier").is_none());
+        // Client output_config survives prepare (honor client on Door-2).
+        assert_eq!(
+            wire.get("output_config")
+                .and_then(|o| o.get("effort"))
+                .and_then(|e| e.as_str()),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn door2_client_output_config_effort_preserved_over_pin() {
+        // WHY (issue #22): Door-2 must not strip client output_config for
+        // fingerprint fidelity. Client effort wins over capture pin default
+        // (Fable pin is xhigh; client low must reach the wire).
+        let body = serde_json::json!({
+            "model": "claude-fable-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say OK"}],
+            "output_config": {"effort": "low"}
+        });
+        let prepared =
+            prepare_client_messages_request(body, default_profile(), &empty_repl(), false)
+                .expect("prepare ok");
+        let wire = prepared.body();
+        assert_eq!(
+            wire.get("output_config")
+                .and_then(|o| o.get("effort"))
+                .and_then(|e| e.as_str()),
+            Some("low"),
+            "client output_config.effort must win over Fable pin default xhigh"
+        );
+        // Also via reconcile (same prepare path guts).
+        let body = serde_json::json!({
+            "model": "sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say OK"}],
+            "output_config": {"effort": "max"}
+        });
+        let req = reconcile_client_request(
+            &parse_client(body),
+            default_profile(),
+            &empty_repl(),
+            false,
+            false,
+        )
+        .expect("reconcile ok");
+        assert_eq!(
+            req.output_config.as_ref().and_then(|o| o.effort.as_deref()),
+            Some("max"),
+            "client max must not be replaced by sonnet pin high"
+        );
+    }
+
+    #[test]
+    fn door2_absent_output_config_gets_pin_default() {
+        // WHY (issue #22): pin/capture default applies only when the client left
+        // output_config unset. Same precedence as Door-1 / OpenAI-compat chat.
+        let body = serde_json::json!({
+            "model": "sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say OK"}]
+        });
+        let prepared =
+            prepare_client_messages_request(body, default_profile(), &empty_repl(), false)
+                .expect("prepare ok");
+        assert_eq!(
+            prepared
+                .body()
+                .get("output_config")
+                .and_then(|o| o.get("effort"))
+                .and_then(|e| e.as_str()),
+            Some("high"),
+            "sonnet pin default effort when client omitted output_config"
+        );
+
+        let body = serde_json::json!({
+            "model": "claude-fable-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say OK"}]
+        });
+        let req = reconcile_client_request(
+            &parse_client(body),
+            default_profile(),
+            &empty_repl(),
+            false,
+            false,
+        )
+        .expect("reconcile ok");
+        assert_eq!(
+            req.output_config.as_ref().and_then(|o| o.effort.as_deref()),
+            Some("xhigh"),
+            "Fable pin default when client omitted output_config"
+        );
+
+        // Haiku pin has no output_effort: stay absent (do not invent).
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say OK"}]
+        });
+        let req = reconcile_client_request(
+            &parse_client(body),
+            default_profile(),
+            &empty_repl(),
+            false,
+            false,
+        )
+        .expect("reconcile ok");
+        assert!(
+            req.output_config.is_none(),
+            "haiku pin has no output_effort: {:?}",
+            req.output_config
+        );
+    }
+
+    #[test]
+    fn door2_client_output_config_on_haiku_is_not_stripped() {
+        // WHY (issue #22): even when the pin has no effort surface, a client
+        // that set output_config is honored (pass-through). Upstream may 400;
+        // silent strip of client intent is the bug this issue closes.
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say OK"}],
+            "output_config": {"effort": "high"}
+        });
+        let prepared =
+            prepare_client_messages_request(body, default_profile(), &empty_repl(), false)
+                .expect("prepare ok");
+        assert_eq!(
+            prepared
+                .body()
+                .get("output_config")
+                .and_then(|o| o.get("effort"))
+                .and_then(|e| e.as_str()),
+            Some("high"),
+            "client-set output_config on haiku must not be fingerprint-stripped"
+        );
+    }
+
+    #[test]
+    fn door2_output_config_preserves_format_and_format_only() {
+        // WHY (issue #22 panel): OutputConfig must not silently drop non-effort
+        // members (e.g. format) or 400 on format-only objects. Client object
+        // is pass-through; pin fills only when the whole field is absent.
+        let body = serde_json::json!({
+            "model": "sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say OK"}],
+            "output_config": {
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": {"type": "object"}}
+            }
+        });
+        let prepared =
+            prepare_client_messages_request(body, default_profile(), &empty_repl(), false)
+                .expect("prepare ok");
+        let oc = prepared.body().get("output_config").expect("output_config");
+        assert_eq!(oc.get("effort").and_then(|e| e.as_str()), Some("low"));
+        assert_eq!(
+            oc.get("format")
+                .and_then(|f| f.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("json_schema"),
+            "format must survive round-trip (not effort-only strip)"
+        );
+
+        let body = serde_json::json!({
+            "model": "sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say OK"}],
+            "output_config": {
+                "format": {"type": "json_object"}
+            }
+        });
+        let prepared =
+            prepare_client_messages_request(body, default_profile(), &empty_repl(), false)
+                .expect("format-only must not fail deserialize");
+        let oc = prepared.body().get("output_config").expect("output_config");
+        assert!(
+            oc.get("effort").is_none(),
+            "format-only must not invent effort: {oc:?}"
+        );
+        assert_eq!(
+            oc.get("format")
+                .and_then(|f| f.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("json_object")
+        );
+        // Client set output_config (format-only): pin must not inject effort.
+        assert_ne!(
+            oc.get("effort").and_then(|e| e.as_str()),
+            Some("high"),
+            "pin must not merge effort onto client-set format-only output_config"
+        );
     }
 
     #[test]

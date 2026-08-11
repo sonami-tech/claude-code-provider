@@ -13,6 +13,8 @@
 //! adapter here maps the supported subset while still routing the request
 //! through the full fingerprint + cch + identity path.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -202,9 +204,18 @@ pub struct Thinking {
     pub budget_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Anthropic `output_config` object.
+///
+/// `effort` is the Claude Code pin / Door-1 surface. Other members (e.g.
+/// `format` for structured outputs) are preserved via flatten so Door-2 native
+/// pass-through does not silently strip client intent (issue #22).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OutputConfig {
-    pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Unknown / future Anthropic keys under `output_config` (e.g. `format`).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -906,7 +917,8 @@ fn apply_client_effort_to_output_config(
     let model = anth.model.as_str();
     if model_supports_output_effort(profile, model) {
         anth.output_config = Some(OutputConfig {
-            effort: claude_output_effort_value(effort).to_string(),
+            effort: Some(claude_output_effort_value(effort).to_string()),
+            extra: BTreeMap::new(),
         });
         return Ok(());
     }
@@ -1023,7 +1035,8 @@ pub fn apply_profile_wire_defaults(req: &mut MessagesRequest, profile: &Fingerpr
         && let Some(effort) = defaults.output_effort
     {
         req.output_config = Some(OutputConfig {
-            effort: effort.to_string(),
+            effort: Some(effort.to_string()),
+            extra: BTreeMap::new(),
         });
     }
 }
@@ -1563,7 +1576,9 @@ mod tests {
             );
             assert_eq!(anth.temperature, *exp_temp, "wire temperature for {alias}");
             assert_eq!(
-                anth.output_config.as_ref().map(|o| o.effort.as_str()),
+                anth.output_config
+                    .as_ref()
+                    .and_then(|o| o.effort.as_deref()),
                 *exp_effort,
                 "wire output_config.effort for {alias}"
             );
@@ -1598,7 +1613,9 @@ mod tests {
         );
         // output_config still filled from wire default (client did not set it).
         assert_eq!(
-            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            anth.output_config
+                .as_ref()
+                .and_then(|o| o.effort.as_deref()),
             Some("high")
         );
     }
@@ -1623,7 +1640,9 @@ mod tests {
         };
         let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
         assert_eq!(
-            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            anth.output_config
+                .as_ref()
+                .and_then(|o| o.effort.as_deref()),
             Some("low"),
             "client effort must win over Fable pin default xhigh"
         );
@@ -1649,7 +1668,9 @@ mod tests {
         };
         let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
         assert_eq!(
-            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            anth.output_config
+                .as_ref()
+                .and_then(|o| o.effort.as_deref()),
             Some("xhigh")
         );
     }
@@ -1669,7 +1690,9 @@ mod tests {
         };
         let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
         assert_eq!(
-            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            anth.output_config
+                .as_ref()
+                .and_then(|o| o.effort.as_deref()),
             Some("xhigh"),
             "Fable capture-backed pin default when effort absent"
         );
@@ -1806,7 +1829,9 @@ mod tests {
         };
         let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
         assert_eq!(
-            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            anth.output_config
+                .as_ref()
+                .and_then(|o| o.effort.as_deref()),
             Some("low")
         );
     }
@@ -1835,7 +1860,9 @@ mod tests {
             };
             let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
             assert_eq!(
-                anth.output_config.as_ref().map(|o| o.effort.as_str()),
+                anth.output_config
+                    .as_ref()
+                    .and_then(|o| o.effort.as_deref()),
                 Some(effort),
                 "sonnet effort={effort} on output_config"
             );
@@ -1930,7 +1957,9 @@ mod tests {
         };
         let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
         assert_eq!(
-            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            anth.output_config
+                .as_ref()
+                .and_then(|o| o.effort.as_deref()),
             Some("high")
         );
         assert_eq!(

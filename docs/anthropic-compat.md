@@ -9,6 +9,14 @@ OpenAI chat (`resolve_provider_and_model`).
 | **grok** / **codex** | Translated through canonical. Best-effort Anthropic shape. |
 | other / missing | Anthropic-shaped 400 |
 
+### Claude Door-2 `output_config` (issue #22)
+
+On native Claude `/v1/messages`, client `output_config` is **honored**
+(pass-through of the object, including `effort` and other members such as
+`format`). Fingerprint pin defaults fill only when the client left
+`output_config` unset. Precedence: **client > pin default > absent**.
+Fingerprint fidelity does not strip client intent.
+
 Full contracts: `docs/anthropic-frontend-multi-backend-plan.md`.
 
 ## count_tokens
