@@ -15,7 +15,7 @@ pub struct ModelDef {
     pub max_tokens: u64,
 }
 
-/// Active Claude Code model catalog (pin 2.1.221; catalog shape from 2.1.220 capture).
+/// Active Claude Code model catalog (pin 2.1.228; catalog shape from 2.1.220 capture).
 /// Opus is `claude-opus-5`, sonnet is `claude-sonnet-5`, haiku is dated, fable stays.
 pub static MODEL_CATALOG: &[ModelDef] = &[
     ModelDef {

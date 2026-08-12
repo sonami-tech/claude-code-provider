@@ -9,7 +9,7 @@
 //! - --providers claude,grok,codex   or   OMNI_PROVIDERS=... (comma sep, order preserved).
 //!   When omitted, Omni enables all locally detected providers.
 //! - --bind 127.0.0.1 by default, or --public as shorthand for --bind 0.0.0.0
-//! - Canonical model routing: real model ids (e.g. "claude-sonnet-5", "grok-4.5")
+//! - Canonical model routing: real model ids (e.g. "claude-sonnet-5", "grok-4.6")
 //!   route directly when they uniquely identify an enabled provider.
 //! - Alias routing: "fable", "opus", "sonnet", "haiku", "grok", and "gpt"
 //!   resolve to current provider-owned model ids when unique.
@@ -3091,9 +3091,9 @@ mod tests {
         );
 
         let (k, m) = resolve_provider_and_model("grok", &catalogs).unwrap();
-        assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.5"));
+        assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.6"));
 
-        // composer is no longer a Grok catalog alias (grok-shell 0.2.118).
+        // composer is no longer a Grok catalog alias (grok-shell 1.0.3).
         let err = resolve_provider_and_model("composer", &catalogs).unwrap_err();
         assert!(
             err.contains("unknown model"),
@@ -3155,7 +3155,7 @@ mod tests {
             "opus=claude-opus-5",
             "haiku=claude-haiku-4-5-20251001",
             "fable=claude-fable-5",
-            "grok=grok-4.5",
+            "grok=grok-4.6",
             "gpt=",
         ] {
             assert!(
@@ -3168,7 +3168,7 @@ mod tests {
             !text.contains("codex="),
             "startup alias log must not advertise the pruned codex alias: {text}"
         );
-        // composer dropped from grok-shell 0.2.118 advertised catalog.
+        // composer dropped from grok-shell 1.0.3 advertised catalog.
         assert!(
             !text.contains("composer="),
             "startup alias log must not advertise retired composer alias: {text}"
@@ -3187,6 +3187,7 @@ mod tests {
         assert!(text.contains("claude=["));
         assert!(text.contains("claude-sonnet-5"));
         assert!(text.contains("grok=["));
+        assert!(text.contains("grok-4.6"));
         assert!(text.contains("grok-4.5"));
         assert!(
             !text.contains("grok-composer-2.5-fast"),
@@ -5060,12 +5061,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .filter_map(|m| m["id"].as_str().map(str::to_string))
             .collect();
         assert!(
+            ids.iter().any(|id| id == "grok-4.6"),
+            "grok default catalog entry missing: {ids:?}"
+        );
+        assert!(
             ids.iter().any(|id| id == "grok-4.5"),
             "grok real catalog entry missing: {ids:?}"
         );
         assert!(
             !ids.iter().any(|id| id == "grok-composer-2.5-fast"),
-            "composer is no longer in the grok-shell 0.2.118 catalog: {ids:?}"
+            "composer is no longer in the grok-shell 1.0.3 catalog: {ids:?}"
         );
         assert!(
             ids.iter().any(|id| id.starts_with("claude-")),
@@ -7530,8 +7535,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        // Bare alias "grok" resolves to the catalog default (currently grok-4.5).
-        assert_eq!(v["model"], "grok-4.5");
+        // Bare alias "grok" resolves to the catalog default (currently grok-4.6).
+        assert_eq!(v["model"], "grok-4.6");
     }
 
     #[tokio::test]
@@ -7581,8 +7586,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             },
         );
         let (state, _guard) = state_with_stats(providers);
-        // Use the current default-model triple (alias → grok-4.5).
-        for model in ["grok", "grok-4.5", "grok:grok-4.5"] {
+        // Use the current default-model triple (alias → grok-4.6).
+        for model in ["grok", "grok-4.6", "grok:grok-4.6"] {
             let req = ChatCompletionRequest {
                 model: model.into(),
                 messages: vec![ChatMessage {
@@ -7606,7 +7611,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         }
 
         let snap = state.stats.as_ref().unwrap().snapshot();
-        assert_eq!(snap.models["grok:grok-4.5"].requests, 3);
+        assert_eq!(snap.models["grok:grok-4.6"].requests, 3);
         assert_eq!(snap.models.len(), 1);
     }
 
@@ -7789,7 +7794,7 @@ rule = [
         assert_eq!(kc, "claude");
         assert_eq!(mc, "y");
         let (kg, mg) = resolve_provider_and_model("grok", &catalogs).unwrap();
-        assert_eq!((kg.as_str(), mg.as_str()), ("grok", "grok-4.5"));
+        assert_eq!((kg.as_str(), mg.as_str()), ("grok", "grok-4.6"));
         assert!(resolve_provider_and_model("bare", &catalogs).is_err());
     }
 

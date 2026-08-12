@@ -112,25 +112,30 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-Re-baselined against grok-shell **0.2.118** on **2026-08-04**.
+Re-baselined against grok-shell **1.0.3** on **2026-08-12**.
 
 ### Default path (cli-chat-proxy.grok.com)
 
 Catalog (`/v1/models`):
 
-- `grok-4.5` (default; alias `grok`; reasoning efforts `low`/`medium`/`high`, default `high`)
+- `grok-4.6` (default; alias `grok`; reasoning efforts `low`/`medium`/`high`, default `high`)
+- `grok-4.5` (still advertised; no inbound alias)
 
-`grok-composer-2.5-fast` is no longer advertised by the CLI on this version.
+`grok models` also lists other-vendor ids (Claude/GPT/DeepSeek/Kimi). Those are
+not on `cli-chat-proxy.grok.com /v1/models` and are not pinned.
 
 Wire notes from live MITM of `grok --single`:
 - Host: `cli-chat-proxy.grok.com`, path `POST /v1/responses`
-- UA / version: `grok-shell/0.2.118 (linux; x86_64)`, `x-grok-client-version: 0.2.118`
+- UA / version: `grok-shell/1.0.3 (linux; x86_64)`, `x-grok-client-version: 1.0.3`
 - Fingerprint headers: `x-xai-token-auth`, `x-authenticateresponse`,
   `x-grok-client-identifier`, `x-grok-client-mode: headless`,
   `x-grok-model-override`, `accept: text/event-stream`
-- Main chat body: `model: "grok-4.5"`, `reasoning: { "effort": "high", "summary": "concise" }`,
-  `include: ["reasoning.encrypted_content"]`, `store: false`, `stream: true`
-- Session-title side call still uses model `grok-build` (not advertised in `/v1/models`)
+- Main chat body: `model: "grok-4.6"`, `reasoning: { "effort": "high", "summary": "concise" }`,
+  `include: ["reasoning.encrypted_content", "no_inline_citations"]`, `store: false`, `stream: true`
+- Session-title side call uses the selected chat model (not `grok-build`)
+- CLI also sends session/compaction headers (`x-compaction-at`,
+  `x-compactions-remaining`, `x-grok-doom-loop-check`); Omni still omits those
+  on single-shot requests
 
 `/v1/models` emits only canonical upstream ids. Omni accepts aliases inbound only.
 
