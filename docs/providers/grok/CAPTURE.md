@@ -86,7 +86,13 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 5. Obtain this pin's catalog from captured `GET /v1/models` on
    `cli-chat-proxy.grok.com` (`python3 -m tools.capture catalog --provider grok
    --flow-file ...`). If that listing is missing or empty, stop. Do not keep
-   the previous pin's catalog. The `grok models` UI is not the catalog source.
+   the previous pin's catalog.
+
+   The shared capture already uses a clean tmpfs HOME. Do **not** take the
+   catalog or default from the operator machine's `grok models` UI or from
+   `~/.grok/config.toml` (`[models] default`, custom `[model.*]` entries).
+   Those are local overrides. Confirm the pin default from the no-`--model`
+   `POST /v1/responses` body and from proxy `default_model`.
 
 6. Update code/tests:
 
@@ -126,8 +132,10 @@ Catalog (`/v1/models`):
 - `grok-4.6` (default; alias `grok`; reasoning efforts `low`/`medium`/`high`, default `high`)
 - `grok-4.5` (still advertised; no inbound alias)
 
-`grok models` also lists other-vendor ids (Claude/GPT/DeepSeek/Kimi). Those are
-not on `cli-chat-proxy.grok.com /v1/models` and are not pinned.
+An operator `grok models` listing may show custom models and a non-Grok
+default (for example `gpt-luna` from `[models] default` in
+`~/.grok/config.toml`). That is not the provider catalog. This pin uses only
+`cli-chat-proxy.grok.com /v1/models` from the clean-HOME capture.
 
 Wire notes from live MITM of `grok --single`:
 - Host: `cli-chat-proxy.grok.com`, path `POST /v1/responses`

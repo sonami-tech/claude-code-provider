@@ -18,9 +18,14 @@ previous pin's model list.
 Catalog sources:
 
 - Claude: model ids on captured `POST /v1/messages`
-- Grok: `GET /v1/models` on `cli-chat-proxy.grok.com` (not the `grok models` UI)
+- Grok: `GET /v1/models` on `cli-chat-proxy.grok.com` from a **clean-HOME**
+  capture. Do not use the operator `grok models` UI or
+  `~/.grok/config.toml` `[models] default`. Those can be local overrides
+  (custom models, a non-Grok default). The pin default is the no-`--model`
+  chat body plus the proxy `default_model` / `/v1/models` list.
 - Codex: `codex debug models --bundled` (not ChatGPT `/codex/models`; a custom
-  Responses `base_url` is not a reason to skip)
+  Responses `base_url` is not a reason to skip). Do not treat
+  `~/.codex/config.toml` `model =` as the catalog.
 
 ```sh
 python3 -m tools.capture catalog --provider claude --flow-file <capture.flow>
