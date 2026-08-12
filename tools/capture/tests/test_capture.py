@@ -1260,12 +1260,16 @@ class RunnerLiveTests(unittest.TestCase):
                                                 source_home=self.fake_home,
                                             ),
                                         ):
-                                            return run_capture(
-                                                provider="claude",
-                                                mode="general",
-                                                live_flag=True,
-                                                workdir=work,
-                                            )
+                                            with mock.patch(
+                                                "tools.capture.runner.require_rebaseline_catalog",
+                                                return_value=["claude-opus-5"],
+                                            ):
+                                                return run_capture(
+                                                    provider="claude",
+                                                    mode="general",
+                                                    live_flag=True,
+                                                    workdir=work,
+                                                )
 
     def test_missing_flow_reader_fails_before_provider_commands(self) -> None:
         work = self._mock_workdir()
@@ -1373,6 +1377,60 @@ class RunnerLiveTests(unittest.TestCase):
         self.assertIn("exit 1", str(ctx.exception))
         self.assertFalse(work.root.exists())
 
+    def test_missing_catalog_is_fatal(self) -> None:
+        from tools.capture.catalog import CatalogError
+
+        work = self._mock_workdir()
+        work.flow_path.write_bytes(b"flow")
+        completed = subprocess.CompletedProcess(args=["claude"], returncode=0)
+
+        def fake_run(*_args, **_kwargs):
+            return completed
+
+        with mock.patch("tools.capture.runner._pgrep_available", return_value=True):
+            with mock.patch("tools.capture.runner.require_mitmproxy_flow_reader"):
+                with mock.patch("tools.capture.runner._wait_for_port"):
+                    with mock.patch("tools.capture.runner._stop_mitm"):
+                        with mock.patch("tools.capture.runner.subprocess.Popen") as popen:
+                            popen.return_value.pid = 1234
+                            with mock.patch(
+                                "tools.capture.runner.subprocess.run",
+                                side_effect=fake_run,
+                            ):
+                                with mock.patch(
+                                    "tools.capture.runner.hosts_in_flow_file",
+                                    return_value={"api.anthropic.com"},
+                                ):
+                                    with mock.patch(
+                                        "tools.capture.runner.extract_flow_markdown",
+                                        return_value=0,
+                                    ):
+                                        with mock.patch(
+                                            "tools.capture.runner.stage_credentials",
+                                            return_value=stage_credentials(
+                                                provider="claude",
+                                                clean_home=work.clean_home,
+                                                clean_codex_home=None,
+                                                mode="general",
+                                                source_home=self.fake_home,
+                                            ),
+                                        ):
+                                            with mock.patch(
+                                                "tools.capture.runner.require_rebaseline_catalog",
+                                                side_effect=CatalogError(
+                                                    "claude rebaseline cannot obtain a model catalog"
+                                                ),
+                                            ):
+                                                with self.assertRaises(CatalogError) as ctx:
+                                                    run_capture(
+                                                        provider="claude",
+                                                        mode="general",
+                                                        live_flag=True,
+                                                        workdir=work,
+                                                    )
+        self.assertIn("cannot obtain a model catalog", str(ctx.exception))
+        self.assertFalse(work.root.exists())
+
     def test_success_removes_staged_credentials(self) -> None:
         work = self._mock_workdir()
         work.flow_path.write_bytes(b"flow")
@@ -1381,6 +1439,7 @@ class RunnerLiveTests(unittest.TestCase):
         self.assertEqual(result["mode"], "general")
         self.assertEqual(result["extract_text"], "# extract\n")
         self.assertEqual(result["captured_hosts"], ["api.anthropic.com"])
+        self.assertEqual(result["catalog_ids"], ["claude-opus-5"])
         self.assertIn("expected_hosts", result)
         self.assertNotIn("workdir", result)
         self.assertNotIn("flow_path", result)
@@ -1438,6 +1497,88 @@ class RefreshHelperTests(unittest.TestCase):
                 force_codex_expiry_stale(path)
         finally:
             path.unlink(missing_ok=True)
+
+
+class CatalogTests(unittest.TestCase):
+    def test_grok_jsonl_reads_v1_models(self) -> None:
+        from tools.capture.catalog import catalog_ids_from_jsonl
+
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "method": "GET",
+                        "url": "https://cli-chat-proxy.grok.com/v1/models",
+                        "response_body": {
+                            "data": [{"id": "grok-4.6"}, {"id": "grok-4.5"}]
+                        },
+                    }
+                )
+                + "\n"
+            )
+            path = Path(handle.name)
+        try:
+            self.assertEqual(
+                catalog_ids_from_jsonl(path, provider="grok"),
+                ["grok-4.6", "grok-4.5"],
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_empty_grok_jsonl_is_fatal(self) -> None:
+        from tools.capture.catalog import CatalogError, require_rebaseline_catalog
+
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "method": "POST",
+                        "url": "https://cli-chat-proxy.grok.com/v1/responses",
+                        "body": {"model": "grok-4.6"},
+                    }
+                )
+                + "\n"
+            )
+            path = Path(handle.name)
+        try:
+            with self.assertRaises(CatalogError) as ctx:
+                require_rebaseline_catalog("grok", jsonl_path=path)
+            self.assertIn("Do not carry a previous pin's catalog", str(ctx.exception))
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_codex_debug_models_failure_is_fatal(self) -> None:
+        from tools.capture.catalog import CatalogError, require_rebaseline_catalog
+
+        failed = subprocess.CompletedProcess(
+            args=["codex", "debug", "models", "--bundled"],
+            returncode=1,
+            stdout="",
+            stderr="no catalog",
+        )
+        with mock.patch("tools.capture.catalog.subprocess.run", return_value=failed):
+            with self.assertRaises(CatalogError) as ctx:
+                require_rebaseline_catalog("codex")
+        self.assertIn("Do not carry a previous pin's catalog", str(ctx.exception))
+
+    def test_codex_lists_visibility_list_only(self) -> None:
+        from tools.capture.catalog import catalog_ids_from_codex_cli
+
+        payload = {
+            "models": [
+                {"slug": "gpt-5.6-sol", "visibility": "list"},
+                {"slug": "gpt-5.4-mini", "visibility": "hide"},
+                {"slug": "codex-auto-review", "visibility": "hide"},
+            ]
+        }
+        ok = subprocess.CompletedProcess(
+            args=["codex", "debug", "models", "--bundled"],
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with mock.patch("tools.capture.catalog.subprocess.run", return_value=ok):
+            self.assertEqual(catalog_ids_from_codex_cli(), ["gpt-5.6-sol"])
 
 
 if __name__ == "__main__":

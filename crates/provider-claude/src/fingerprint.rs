@@ -357,7 +357,7 @@ const MODEL_BETA_OVERRIDES: &[ModelBetaOverride] = &[
 ];
 
 // Active-pin wire: opus-5 + sonnet-5 64k/no-temp/high; haiku 32k/no-temp/no-effort.
-// Fable carries xhigh from prior capture (uncaptured on this pin account).
+// Fable row is in this pin's catalog; this capture did not send a fable request.
 const MODEL_WIRE_OVERRIDES: &[ModelWireOverride] = &[
     ModelWireOverride {
         model: "claude-fable-5",

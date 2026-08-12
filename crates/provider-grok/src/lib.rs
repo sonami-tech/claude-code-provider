@@ -68,8 +68,8 @@ const CLI_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
 // What the installed grok-shell CLI advertises on cli-chat-proxy.grok.com /v1/models:
 // `grok-4.6` and `grok-4.5`. Settings default_model is grok-4.6. The `grok models`
 // CLI listing also shows other-vendor ids; those are not on the wire catalog and
-// are not pinned here. Aliases are inbound-only conveniences (never emitted
-// from /v1/models).
+// are not pinned here. If GET /v1/models is missing from a rebaseline capture,
+// stop; do not keep a previous pin's catalog.
 //
 // Live capture from grok-shell 1.0.3: fingerprint headers keep token-auth,
 // authenticate-response, client version/identifier, UA, model-override, accept

@@ -91,6 +91,9 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
      `output_config`, `metadata`, `context_management`, `stream`, and system
      block structure.
    - Confirm default model from the no-`--model` capture.
+   - Obtain this pin's catalog from captured `POST /v1/messages` model ids
+     (`python3 -m tools.capture catalog --provider claude --flow-file ...`).
+     If that listing is empty, stop. Do not keep the previous pin's catalog.
    - Confirm all pinned catalog models are accepted.
    - Confirm the billing suffix and cch behavior.
    - If any checksum or body mutation cannot be reproduced exactly, do not
@@ -100,7 +103,8 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 
    - Overwrite the active `FingerprintProfile` in
      `crates/provider-claude/src/fingerprint.rs` with the new capture.
-   - Overwrite the single model catalog in `crates/provider-claude/src/models.rs`.
+   - Overwrite the single model catalog in `crates/provider-claude/src/models.rs`
+     from this pin's listing only.
    - Rename shared constants if the pin version changes (do not keep historical
      `*_VERSION` symbol names that disagree with the live pin).
    - Update active-pin goldens and local vectors. History lives in git tags and
@@ -165,6 +169,5 @@ unchanged: the existing Sha256Utf16SampleV1 suffix reproduces the captured
 installed CLI. Because there is no checksum to recompute, this no-cch profile
 ships no clean-room cch vectors.
 
-`claude-fable-5` remains pinned in the catalog (not re-exercised this capture;
-account availability is independent of wire shape). Capture used `opus`,
-`sonnet`, and `haiku`.
+Capture used `opus`, `sonnet`, and `haiku`. `claude-fable-5` is still in the
+2.1.228 catalog table; this capture did not send a fable request.

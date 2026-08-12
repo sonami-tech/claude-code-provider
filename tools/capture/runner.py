@@ -12,6 +12,7 @@ from typing import Sequence
 
 from tools.capture.approvals import require_capture_approvals
 from tools.capture.credentials import plan_credentials, stage_credentials
+from tools.capture.catalog import CatalogError, require_rebaseline_catalog
 from tools.capture.extract import (
     ExtractionError,
     extract_flow_markdown,
@@ -298,6 +299,16 @@ def run_capture(
 
         extract_text = work.extract_path.read_text(encoding="utf-8")
 
+        catalog_ids: list[str] | None = None
+        if mode == "general":
+            catalog_ids = require_rebaseline_catalog(
+                provider, flow_path=work.flow_path
+            )
+            print(
+                f"[capture] catalog ({provider}): {', '.join(catalog_ids)}",
+                file=sys.stderr,
+            )
+
         result: dict[str, object] = {
             "provider": provider,
             "mode": mode,
@@ -305,6 +316,8 @@ def run_capture(
             "captured_hosts": sorted(captured_hosts),
             "expected_hosts": list(expected),
         }
+        if catalog_ids is not None:
+            result["catalog_ids"] = catalog_ids
         if work.keep_flow:
             result["workdir"] = str(work.root)
             result["flow_path"] = str(work.flow_path)
@@ -315,7 +328,7 @@ def run_capture(
             file=sys.stderr,
         )
         return result
-    except (CaptureError, ExtractionError, TmpfsError):
+    except (CaptureError, ExtractionError, CatalogError, TmpfsError):
         raise
     except Exception as exc:
         raise CaptureError(str(exc)) from exc

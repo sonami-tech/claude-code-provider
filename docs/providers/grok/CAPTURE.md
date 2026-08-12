@@ -83,14 +83,19 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
    intentionally simple so sanitized exports from mitmproxy or browser tooling can
    be normalized without preserving raw secrets.
 
-5. Update code/tests:
+5. Obtain this pin's catalog from captured `GET /v1/models` on
+   `cli-chat-proxy.grok.com` (`python3 -m tools.capture catalog --provider grok
+   --flow-file ...`). If that listing is missing or empty, stop. Do not keep
+   the previous pin's catalog. The `grok models` UI is not the catalog source.
+
+6. Update code/tests:
 
    - `crates/provider-grok/src/lib.rs` for request/response mapping.
    - `crates/provider-grok/src/credentials.rs` for credential file changes.
    - Wiremock tests for auth, body shape, errors, and streaming frames.
    - `docs/grok-gate.md` if gate behavior changes.
 
-6. Verify:
+7. Verify:
 
    ```sh
    cargo test -p provider-grok
@@ -98,7 +103,7 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
    cargo clippy --workspace --all-targets -- -D warnings
    ```
 
-7. Optional live smoke, only with approval:
+8. Optional live smoke, only with approval:
 
    ```sh
    OMNI_LIVE_TESTS=1 cargo test -p provider-grok test_send_real_if_key_present

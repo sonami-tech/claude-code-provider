@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from tools.capture.approvals import ApprovalError
+from tools.capture.catalog import CatalogError, require_rebaseline_catalog
 from tools.capture.extract import extract_flow_markdown, extract_jsonl_markdown
 from tools.capture.extract import ExtractionError
 from tools.capture.runner import CaptureError, run_capture
@@ -100,6 +101,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow zero matching records (default: fail closed)",
     )
 
+    catalog = sub.add_parser(
+        "catalog",
+        help="Read this pin's catalog listing (fail closed; never carry a previous pin)",
+    )
+    catalog.add_argument("--provider", choices=["claude", "grok", "codex"], required=True)
+    catalog.add_argument(
+        "--flow-file",
+        type=Path,
+        help="mitmproxy .flow (required for claude and grok)",
+    )
+    catalog.add_argument(
+        "--jsonl",
+        type=Path,
+        help="Sanitized JSONL capture (claude and grok)",
+    )
+
     return parser
 
 
@@ -149,7 +166,18 @@ def main(argv: list[str] | None = None) -> int:
                 body_bytes=args.body_bytes,
                 require_matches=not args.allow_empty,
             )
-    except (ApprovalError, CaptureError, ExtractionError, TmpfsError, RuntimeError) as exc:
+
+        if args.command == "catalog":
+            import json
+
+            ids = require_rebaseline_catalog(
+                args.provider,
+                flow_path=args.flow_file,
+                jsonl_path=args.jsonl,
+            )
+            print(json.dumps({"provider": args.provider, "catalog": ids}, indent=2))
+            return 0
+    except (ApprovalError, CaptureError, CatalogError, ExtractionError, TmpfsError, RuntimeError) as exc:
         print(f"[capture] FATAL: {exc}", file=sys.stderr)
         return 1
     except BrokenPipeError:

@@ -87,6 +87,15 @@ Unsupported extras fail loudly.
 
 ## Capture
 
+Rebaseline overwrites the single pin, including the model catalog. The catalog
+source is `codex debug models --bundled` (`visibility=list` slugs). A custom
+Responses `base_url` is not a reason to skip. If that command fails or lists
+no models, stop. Do not keep the previous pin's catalog.
+
+```sh
+python3 -m tools.capture catalog --provider codex
+```
+
 Use the shared capture framework in `tools/capture/` when Codex wire behavior,
 auth refresh, or custom `base_url` routing changes:
 

@@ -11,6 +11,25 @@ Each provider ships **one live pin**. Multi-version selection is gone:
 `OMNI_MATCH_SYSTEM`, `OMNI_MATCH_SYSTEM_EXACT` are removed. Rebaseline
 **overwrites** the pin. Use an older Omni release for older wire.
 
+A rebaseline must obtain a **fresh catalog listing** from this pin's source.
+If that listing cannot be read, stop and surface the error. Do not keep the
+previous pin's model list.
+
+Catalog sources:
+
+- Claude: model ids on captured `POST /v1/messages`
+- Grok: `GET /v1/models` on `cli-chat-proxy.grok.com` (not the `grok models` UI)
+- Codex: `codex debug models --bundled` (not ChatGPT `/codex/models`; a custom
+  Responses `base_url` is not a reason to skip)
+
+```sh
+python3 -m tools.capture catalog --provider claude --flow-file <capture.flow>
+python3 -m tools.capture catalog --provider grok --flow-file <capture.flow>
+python3 -m tools.capture catalog --provider codex
+```
+
+General live capture runs this check and fails closed if the listing is empty.
+
 - Claude: `docs/providers/claude/README.md`
 - Grok: `docs/providers/grok/README.md`
 - Codex: `docs/providers/codex/README.md`

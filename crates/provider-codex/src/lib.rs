@@ -56,15 +56,12 @@ const CONSERVATIVE_WINDOW_ID: &str = "00000000-0000-4000-8000-000000000000:0";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
-// Codex catalog from `codex debug models` on CLI 0.147.0 (2026-08-12). Live and
-// bundled dumps match. Visibility=list is what the CLI advertises to callers:
-// gpt-5.6-sol (default), gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.2.
-// Hidden slugs (gpt-5.4, gpt-5.4-mini, internal codex-auto-review) stay out of
-// the caller catalog. `mini` / `gpt-mini` map to luna, the listed fast tier.
-//
-// Wire (originator, beta features, UA template) was re-observed the same day
-// via shared tools.capture; this host uses a custom Responses base_url, so
-// ChatGPT `/codex/models` was not used as the catalog source.
+// Codex catalog from `codex debug models --bundled` on CLI 0.147.0 (2026-08-12).
+// Visibility=list slugs only: gpt-5.6-sol (default), gpt-5.6-terra,
+// gpt-5.6-luna, gpt-5.5, gpt-5.2. Hidden slugs stay out of the caller catalog.
+// `mini` / `gpt-mini` map to luna. If that listing cannot be read, rebaseline
+// must fail; do not keep a previous pin's catalog. Custom Responses base_url
+// does not change this source.
 /// Pinned Codex CLI version (UA + header fingerprint). Single live pin.
 pub const CODEX_VERSION: &str = "0.147.0";
 
