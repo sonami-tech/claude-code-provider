@@ -53,32 +53,28 @@ const CONSERVATIVE_ORIGINATOR: &str = "codex_exec";
 const CONSERVATIVE_BETA_FEATURES: &str = "remote_compaction_v2";
 const CONSERVATIVE_CLIENT_REQUEST_ID: &str = "00000000-0000-4000-8000-000000000000";
 const CONSERVATIVE_WINDOW_ID: &str = "00000000-0000-4000-8000-000000000000:0";
-const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
-// Codex catalogs, verified 2026-06-22 via live capture of the installed codex
-// 0.142.0 CLI against the ChatGPT backend (chatgpt.com/backend-api/codex), plan
-// type = free. The /codex/models endpoint advertised gpt-5.5 and gpt-5.4-mini
-// (plus an internal codex-auto-review model, excluded from the caller catalog),
-// and streamed /responses accepted exactly that same set - so on this plan
-// CONSERVATIVE == EXTENDED (no work-but-unlisted extras; the gate is strict).
-// This is plan-dependent: a platform sk- key / higher plan would likely expose
-// more, which a future version entry would capture.
+// Codex catalog from `codex debug models` on CLI 0.147.0 (2026-08-12). Live and
+// bundled dumps match. Visibility=list is what the CLI advertises to callers:
+// gpt-5.6-sol (default), gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.2.
+// Hidden slugs (gpt-5.4, gpt-5.4-mini, internal codex-auto-review) stay out of
+// the caller catalog. `mini` / `gpt-mini` map to luna, the listed fast tier.
 //
-// Version bumped to 0.147.0 on 2026-08-12. The installed CLI's request wire was
-// re-observed live via shared tools.capture (originator codex_exec,
-// x-codex-beta-features remote_compaction_v2, user-agent template, body key set
-// unchanged from 0.146.0; only the version string moved). This host's Codex
-// config points at a custom Responses base_url, so the native ChatGPT-backend
-// catalog was not re-probed this cycle; the model set below is carried from the
-// 0.142.0 verification.
+// Wire (originator, beta features, UA template) was re-observed the same day
+// via shared tools.capture; this host uses a custom Responses base_url, so
+// ChatGPT `/codex/models` was not used as the catalog source.
 /// Pinned Codex CLI version (UA + header fingerprint). Single live pin.
 pub const CODEX_VERSION: &str = "0.147.0";
 
 /// Model catalog for the active pin.
 const CODEX_CATALOG: &[CatalogModel] = &[
-    CatalogModel::new("gpt-5.5", &["gpt"]),
-    CatalogModel::new("gpt-5.4-mini", &["mini", "gpt-mini"]),
+    CatalogModel::new("gpt-5.6-sol", &["gpt", "sol"]),
+    CatalogModel::new("gpt-5.6-terra", &["terra"]),
+    CatalogModel::new("gpt-5.6-luna", &["luna", "mini", "gpt-mini"]),
+    CatalogModel::new("gpt-5.5", &[]),
+    CatalogModel::new("gpt-5.2", &[]),
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -2269,8 +2265,8 @@ model = "gpt-native"
 
     #[test]
     fn active_catalog_advertises_verified_models_alongside_configured() {
-        // WHY: /v1/models must surface the verified single-pin catalog (gpt-5.5,
-        // gpt-5.4-mini) AND the actually-configured model. Both must appear.
+        // WHY: /v1/models must surface the verified single-pin catalog (5.6
+        // family plus still-listed 5.5/5.2) AND the actually-configured model.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new("", None);
         // Clear any OMNI override from a prior test in the shared process.
@@ -2280,8 +2276,16 @@ model = "gpt-native"
         }
         let provider = CodexProvider::new().unwrap();
         let ids: Vec<String> = provider.models_list().into_iter().map(|m| m.id).collect();
+        assert!(ids.iter().any(|id| id == "gpt-5.6-sol"), "ids: {ids:?}");
+        assert!(ids.iter().any(|id| id == "gpt-5.6-terra"), "ids: {ids:?}");
+        assert!(ids.iter().any(|id| id == "gpt-5.6-luna"), "ids: {ids:?}");
         assert!(ids.iter().any(|id| id == "gpt-5.5"), "ids: {ids:?}");
-        assert!(ids.iter().any(|id| id == "gpt-5.4-mini"), "ids: {ids:?}");
+        assert!(ids.iter().any(|id| id == "gpt-5.2"), "ids: {ids:?}");
+        assert!(
+            !ids.iter()
+                .any(|id| id == "gpt-5.4-mini" || id == "codex-auto-review"),
+            "hidden/internal slugs must stay out of the caller catalog: {ids:?}"
+        );
     }
 
     #[test]
@@ -2296,7 +2300,16 @@ model = "gpt-native"
         let provider = CodexProvider::new().unwrap();
         assert_eq!(provider.version, "0.147.0");
         let ids: Vec<_> = provider.active_catalog().iter().map(|m| m.id).collect();
-        assert_eq!(ids, ["gpt-5.5", "gpt-5.4-mini"]);
+        assert_eq!(
+            ids,
+            [
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.2"
+            ]
+        );
     }
 
     #[test]
