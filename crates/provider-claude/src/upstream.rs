@@ -761,7 +761,9 @@ use reqwest::{Client, header::HeaderMap};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use omni_common::{headers_from_env, parse_custom_headers};
+use omni_common::{
+    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT, headers_from_env, parse_custom_headers,
+};
 
 use crate::credentials::Credentials;
 use crate::fingerprint::{FingerprintProfile, RequestContext, build_headers, default_profile};
@@ -837,8 +839,8 @@ impl UpstreamClient {
             .http2_prior_knowledge()
             .http2_keep_alive_interval(Some(Duration::from_secs(30)))
             .tcp_keepalive(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600))
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+            .timeout(UPSTREAM_REQUEST_TIMEOUT)
             .pool_idle_timeout(Some(Duration::from_secs(90)))
             .pool_max_idle_per_host(8)
             .build()

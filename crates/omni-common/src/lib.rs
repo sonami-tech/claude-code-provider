@@ -19,6 +19,7 @@ pub mod span_stream;
 pub mod stats;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+pub mod timeouts;
 
 pub use anthropic::{
     AnthropicMapError, AnthropicProtocolError, anthropic_to_canonical, canonical_to_anthropic,
@@ -50,3 +51,4 @@ pub use responses::{
     sse_from_canonical_stream_responses,
 };
 pub use stats::{ActiveRequestGuard, Stats, StatsSnapshot, TokenUsage};
+pub use timeouts::{OAUTH_REQUEST_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT};

@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use omni_common::OAUTH_REQUEST_TIMEOUT;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -358,7 +359,7 @@ pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), U
 
     let client = reqwest::Client::builder()
         .use_rustls_tls()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(OAUTH_REQUEST_TIMEOUT)
         .build()
         .map_err(UpstreamError::Transport)?;
 

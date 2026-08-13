@@ -40,6 +40,7 @@
 
 use std::path::{Path, PathBuf};
 
+use omni_common::OAUTH_REQUEST_TIMEOUT;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{info, warn};
@@ -663,7 +664,7 @@ pub async fn refresh_oauth_inplace(
 
     let client = reqwest::Client::builder()
         .use_rustls_tls()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(OAUTH_REQUEST_TIMEOUT)
         .build()
         .map_err(|e| GrokCredentialsError::Refresh(e.to_string()))?;
 

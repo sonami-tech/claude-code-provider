@@ -27,7 +27,9 @@ use omni_common::Replacements;
 use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesStreamParser,
 };
-use omni_common::{env_nonempty, headers_from_env};
+use omni_common::{
+    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT, env_nonempty, headers_from_env,
+};
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
@@ -150,7 +152,8 @@ impl GrokProvider {
     pub fn new(api_key: Option<String>) -> Result<Self, ProviderError> {
         let client = Client::builder()
             .user_agent("omni/0.1 (+https://github.com/omni-llm-provider; rust-reqwest)")
-            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+            .timeout(UPSTREAM_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| {
                 ProviderError::Other(anyhow::Error::msg(format!(

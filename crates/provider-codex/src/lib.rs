@@ -25,7 +25,9 @@ use futures_util::{SinkExt, StreamExt};
 use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesSseEvent, ResponsesStreamParser,
 };
-use omni_common::{env_nonempty, headers_from_env};
+use omni_common::{
+    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT, env_nonempty, headers_from_env,
+};
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
@@ -93,7 +95,8 @@ impl CodexProvider {
     pub fn new() -> Result<Self, ProviderError> {
         let client = Client::builder()
             .user_agent(format!("omni/{} provider-codex", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(600))
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+            .timeout(UPSTREAM_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| ProviderError::Other(anyhow::anyhow!("http client: {e}")))?;
         Ok(Self {
