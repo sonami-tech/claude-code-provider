@@ -238,15 +238,33 @@ impl GrokCredentials {
     /// 3. `~/.xai/.credentials.json` — static-key fallback (no `user_id`), only
     ///    when the CLI login is absent/unusable.
     pub async fn load_resolved_cli_async() -> Result<Self, GrokCredentialsError> {
+        Self::load_resolved_cli_from_disk(false).await
+    }
+
+    /// Same path walk as [`load_resolved_cli_async`], but force-refresh each file
+    /// (401-once replay). Does not invent a second credential source.
+    pub async fn load_resolved_cli_async_force_refresh() -> Result<Self, GrokCredentialsError> {
+        Self::load_resolved_cli_from_disk(true).await
+    }
+
+    async fn load_from_path(path: &Path, force: bool) -> Result<Self, GrokCredentialsError> {
+        if force {
+            Self::load_fresh_async_force_refresh(path).await
+        } else {
+            Self::load_fresh_async(path).await
+        }
+    }
+
+    async fn load_resolved_cli_from_disk(force: bool) -> Result<Self, GrokCredentialsError> {
         if let Some(p) = std::env::var_os("XAI_CREDENTIALS_PATH") {
-            return Self::load_fresh_async(Path::new(&p)).await;
+            return Self::load_from_path(Path::new(&p), force).await;
         }
 
         let mut ambient_cli_error = None;
         if let Some(cli_path) = Self::grok_cli_path()
             && tokio::fs::try_exists(&cli_path).await.unwrap_or(false)
         {
-            match Self::load_fresh_async(&cli_path).await {
+            match Self::load_from_path(&cli_path, force).await {
                 Ok(creds) => return Ok(creds),
                 // A present-but-unusable CLI login (no usable key) falls through to
                 // the static-key file rather than breaking an otherwise valid setup.
@@ -260,7 +278,7 @@ impl GrokCredentials {
         if let Some(home) = dirs::home_dir() {
             let static_path = home.join(".xai").join(".credentials.json");
             if tokio::fs::try_exists(&static_path).await.unwrap_or(false) {
-                return Self::load_fresh_async(&static_path).await;
+                return Self::load_from_path(&static_path, force).await;
             }
         }
 

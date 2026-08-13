@@ -15,7 +15,9 @@
 //! with only the configured custom auth (default CLI credentials never leak there).
 //!
 //! Auth (default path): fresh per request via [`credentials::GrokCredentials::load_resolved_cli_async`]
-//! (prefers Grok CLI OIDC for `x-grok-user-id`). Custom endpoints use only their configured auth.
+//! (prefers Grok CLI OIDC for `x-grok-user-id`). Expired tokens fail closed. Upstream 401
+//! force-refreshes once and replays the inference request once (issue #31). Custom endpoints
+//! use only their configured auth and do not 401-replay via CLI files.
 //!
 //! Reasoning maps to Responses nested `reasoning.effort`. Streaming is SSE via the shared
 //! Responses parser. Custom-endpoint chat path still supports chat-completions mapping for
@@ -337,9 +339,9 @@ impl GrokProvider {
 
     /// Resolve the effective bearer key the same way for every request: load the operator's
     /// credentials fresh ($XAI_CREDENTIALS_PATH -> usable ~/.xai/.credentials.json ->
-    /// ~/.grok/auth.json), never cached so a CLI re-login or key rotation is picked up,
-    /// warning-but-continuing if the token reports expired. Shared by `send` and `send_stream`
-    /// so the two paths cannot drift.
+    /// ~/.grok/auth.json), never cached so a CLI re-login or key rotation is picked up.
+    /// A still-expired OIDC token is a hard auth error (issue #31; no warn-and-send).
+    /// Shared by `send` and `send_stream` so the two paths cannot drift.
     ///
     /// If no source yields a key, fall back to an explicit ctor key (set only by `new(Some(..))` /
     /// `new_for_test`; production `new(None)` never sets one), and otherwise return a clear `Auth`
@@ -357,11 +359,9 @@ impl GrokProvider {
             Ok(creds) => {
                 if let Err(e) = creds.check_expired() {
                     let source = GrokCredentials::describe_cli_auth_source();
-                    warn!(
-                        error = %e,
-                        source = %source,
-                        "grok OIDC token past expiry (continuing; re-run the Grok CLI login if requests 401)"
-                    );
+                    return Err(ProviderError::Auth(format!(
+                        "failed to load Grok credentials ({source}): {e}"
+                    )));
                 }
                 Ok(creds.api_key)
             }
@@ -440,9 +440,10 @@ impl GrokProvider {
     /// `new(Some(..))` / test constructors) short-circuits the disk chain and is
     /// used directly, paired with its `fallback_user_id`. Otherwise the CLI file
     /// chain is used (prefers Grok CLI OIDC so `x-grok-user-id` is present; see
-    /// [`credentials::GrokCredentials::load_resolved_cli_async`]), with an expired
-    /// OIDC token warning-but-continuing. A `Custom` auth config is for a different
-    /// gateway and is rejected with `NoSource` (callers use the custom chat path).
+    /// [`credentials::GrokCredentials::load_resolved_cli_async`]). A still-expired
+    /// OIDC token is a hard error (issue #31; no warn-and-send). A `Custom` auth
+    /// config is for a different gateway and is rejected with `NoSource` (callers
+    /// use the custom chat path).
     async fn resolve_cli_credentials(
         &self,
     ) -> Result<GrokCredentials, credentials::GrokCredentialsError> {
@@ -461,15 +462,20 @@ impl GrokProvider {
             });
         }
         let creds = GrokCredentials::load_resolved_cli_async().await?;
-        if let Err(e) = creds.check_expired() {
-            let source = GrokCredentials::describe_cli_auth_source();
-            warn!(
-                error = %e,
-                source = %source,
-                "grok OIDC token past expiry (continuing; re-run the Grok CLI login if requests 401)"
-            );
-        }
+        creds.check_expired()?;
         Ok(creds)
+    }
+
+    /// Disk CLI-file auth (not ctor fallback, not custom endpoint). Only this
+    /// path may 401-replay via the default credential files.
+    fn uses_disk_cli_auth(&self) -> bool {
+        matches!(
+            &self.auth,
+            GrokAuthConfig::Default {
+                fallback_api_key: None,
+                ..
+            }
+        )
     }
 
     /// Build the grok-shell request headers for
@@ -494,7 +500,14 @@ impl GrokProvider {
         creds: &GrokCredentials,
         model: &str,
     ) -> Result<header::HeaderMap, ProviderError> {
-        let version = self.version;
+        Self::cli_headers_for(self.version, creds, model)
+    }
+
+    fn cli_headers_for(
+        version: &'static str,
+        creds: &GrokCredentials,
+        model: &str,
+    ) -> Result<header::HeaderMap, ProviderError> {
         let user_agent = CLI_USER_AGENT_TEMPLATE.replace("{version}", version);
 
         let mut headers = header::HeaderMap::new();
@@ -608,9 +621,48 @@ impl GrokProvider {
         // Redactor carries the EXACT resolved bearer/key so a non-prefixed operator
         // token cannot leak through an upstream error body (Finding 4).
         let redactor = GrokErrorRedactor::for_credentials(&creds);
+        let can_replay = self.uses_disk_cli_auth();
+        let version = self.version;
 
         let stream = async_stream::stream! {
-            let send_result = client.post(&url).headers(headers).json(&body).send().await;
+            let mut headers = headers;
+            let mut redactor = redactor;
+            let mut send_result = client
+                .post(&url)
+                .headers(headers.clone())
+                .json(&body)
+                .send()
+                .await;
+
+            // Stream-open only: one force-refresh + one reopen on default-path 401.
+            if can_replay
+                && send_result
+                    .as_ref()
+                    .is_ok_and(|resp| resp.status().as_u16() == 401)
+            {
+                match GrokCredentials::load_resolved_cli_async_force_refresh().await {
+                    Ok(fresh) if fresh.check_expired().is_ok() => {
+                        match Self::cli_headers_for(version, &fresh, &model) {
+                            Ok(next_headers) => {
+                                warn!("upstream 401 on stream open, re-read Grok credentials");
+                                headers = next_headers;
+                                redactor = GrokErrorRedactor::for_credentials(&fresh);
+                                send_result = client
+                                    .post(&url)
+                                    .headers(headers.clone())
+                                    .json(&body)
+                                    .send()
+                                    .await;
+                            }
+                            Err(e) => {
+                                yield Err(e);
+                                return;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
             let http_resp = match send_result {
                 Ok(resp) => resp,
@@ -1780,6 +1832,16 @@ enum SseLine {
     Ignore,
 }
 
+fn is_upstream_status(err: &ProviderError, want: u16) -> bool {
+    matches!(
+        err,
+        ProviderError::Upstream {
+            status: Some(status),
+            ..
+        } if *status == want
+    )
+}
+
 fn classify_sse_line(line: &str) -> SseLine {
     let trimmed = line.trim_end();
     if trimmed.is_empty() || trimmed.starts_with(':') {
@@ -1814,11 +1876,25 @@ impl LlmProvider for GrokProvider {
         }
 
         // Default path: grok-shell CLI wire (Responses at cli-chat-proxy).
-        match self.resolve_cli_credentials().await {
-            Ok(creds) => self.send_cli(req, creds).await,
-            Err(e) => Err(ProviderError::Auth(format!(
-                "failed to load Grok credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
-            ))),
+        let creds = match self.resolve_cli_credentials().await {
+            Ok(creds) => creds,
+            Err(e) => {
+                return Err(ProviderError::Auth(format!(
+                    "failed to load Grok credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+                )));
+            }
+        };
+        match self.send_cli(req.clone(), creds).await {
+            Err(e) if is_upstream_status(&e, 401) && self.uses_disk_cli_auth() => {
+                match GrokCredentials::load_resolved_cli_async_force_refresh().await {
+                    Ok(fresh) if fresh.check_expired().is_ok() => {
+                        warn!("upstream 401, re-read Grok credentials and retrying");
+                        self.send_cli(req, fresh).await
+                    }
+                    _ => Err(e),
+                }
+            }
+            other => other,
         }
     }
 
@@ -1839,12 +1915,10 @@ impl LlmProvider for GrokProvider {
         }
 
         match self.resolve_cli_credentials().await {
-            Ok(creds) => return self.send_stream_cli(req, creds).await,
-            Err(e) => {
-                return Err(ProviderError::Auth(format!(
-                    "failed to load Grok credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
-                )));
-            }
+            Ok(creds) => self.send_stream_cli(req, creds).await,
+            Err(e) => Err(ProviderError::Auth(format!(
+                "failed to load Grok credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+            ))),
         }
     }
 }
@@ -3389,7 +3463,9 @@ mod tests {
                     "type": "authentication_error"
                 }
             })))
-            .expect(1)
+            // Static key cannot rotate; default-path 401 still re-reads and
+            // replays the inference request once (issue #31).
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -3427,6 +3503,292 @@ mod tests {
                 );
             }
             other => panic!("expected 401 Upstream for bad key, got {:?}", other),
+        }
+    }
+
+    fn grok_cli_auth_json(key: &str, expires_at: &str) -> String {
+        format!(
+            r#"{{ "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {{
+                "key": "{key}",
+                "auth_mode": "oidc",
+                "refresh_token": "rt-rotating-grace",
+                "oidc_client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+                "principal_id": "11111111-2222-3333-4444-555555555555",
+                "expires_at": "{expires_at}",
+                "user_id": "11111111-2222-3333-4444-555555555555"
+            }} }}"#
+        )
+    }
+
+    struct OauthEnvGuard {
+        flag: Option<std::ffi::OsString>,
+        url: Option<std::ffi::OsString>,
+        path: Option<std::ffi::OsString>,
+        creds_path: std::path::PathBuf,
+    }
+
+    impl OauthEnvGuard {
+        fn install(creds: &str, token_url: &str) -> Self {
+            let creds_path = std::env::temp_dir().join(format!(
+                "xai-oidc-issue31-{}-{}.json",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::write(&creds_path, creds).unwrap();
+            let flag = std::env::var_os("OMNI_OAUTH_REFRESH");
+            let url = std::env::var_os("OMNI_GROK_OAUTH_TOKEN_URL");
+            let path = std::env::var_os("XAI_CREDENTIALS_PATH");
+            unsafe {
+                std::env::set_var("OMNI_OAUTH_REFRESH", "1");
+                std::env::set_var("OMNI_GROK_OAUTH_TOKEN_URL", token_url);
+                std::env::set_var("XAI_CREDENTIALS_PATH", &creds_path);
+            }
+            Self {
+                flag,
+                url,
+                path,
+                creds_path,
+            }
+        }
+    }
+
+    impl Drop for OauthEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.flag {
+                    Some(v) => std::env::set_var("OMNI_OAUTH_REFRESH", v),
+                    None => std::env::remove_var("OMNI_OAUTH_REFRESH"),
+                }
+                match &self.url {
+                    Some(v) => std::env::set_var("OMNI_GROK_OAUTH_TOKEN_URL", v),
+                    None => std::env::remove_var("OMNI_GROK_OAUTH_TOKEN_URL"),
+                }
+                match &self.path {
+                    Some(v) => std::env::set_var("XAI_CREDENTIALS_PATH", v),
+                    None => std::env::remove_var("XAI_CREDENTIALS_PATH"),
+                }
+            }
+            let _ = std::fs::remove_file(&self.creds_path);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn default_path_401_force_refresh_replays_nonstream() {
+        // WHY: issue #31. Default CLI-file Grok send must force-refresh once on
+        // upstream 401 and replay the same inference request with the new token.
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "jwt-after-401",
+                "refresh_token": "rt-after-401",
+                "expires_in": 21600
+            })))
+            .expect(1)
+            .mount(&token_server)
+            .await;
+
+        let infer = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer jwt-clock-ok-stale"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "invalid token"}
+            })))
+            .expect(1)
+            .mount(&infer)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer jwt-after-401"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_recovered",
+                "model": "grok-4.5",
+                "status": "completed",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"recovered"}]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&infer)
+            .await;
+
+        let token_url = format!("{}/oauth2/token", token_server.uri());
+        let _oauth = OauthEnvGuard::install(
+            &grok_cli_auth_json("jwt-clock-ok-stale", "2999-01-01T00:00:00Z"),
+            &token_url,
+        );
+        let p = GrokProvider::new(None).unwrap().with_base_url(infer.uri());
+        let resp = p
+            .send(base_req_model("grok-4.5"))
+            .await
+            .expect("401 recovery must replay send");
+        assert_eq!(resp.content, "recovered");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn default_path_401_force_refresh_replays_stream_open() {
+        // WHY: issue #31. Stream-open 401 on the default CLI path must
+        // force-refresh once and reopen the stream. No mid-stream replay.
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "jwt-stream-after-401",
+                "refresh_token": "rt-stream-after-401",
+                "expires_in": 21600
+            })))
+            .expect(1)
+            .mount(&token_server)
+            .await;
+
+        let sse_body = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let infer = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer jwt-stream-stale"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "invalid token"}
+            })))
+            .expect(1)
+            .mount(&infer)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer jwt-stream-after-401"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .expect(1)
+            .mount(&infer)
+            .await;
+
+        let token_url = format!("{}/oauth2/token", token_server.uri());
+        let _oauth = OauthEnvGuard::install(
+            &grok_cli_auth_json("jwt-stream-stale", "2999-01-01T00:00:00Z"),
+            &token_url,
+        );
+        let p = GrokProvider::new(None).unwrap().with_base_url(infer.uri());
+        let stream = p
+            .send_stream(base_req_model("grok-4.5"))
+            .await
+            .expect("stream opens");
+        let events: Vec<CanonicalStreamEvent> = stream
+            .map(|r| r.expect("401 recovery must reopen stream"))
+            .collect()
+            .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CanonicalStreamEvent::TextDelta(t) if t == "ok")),
+            "expected recovered stream text, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn expired_after_recovery_fails_closed_no_send() {
+        // WHY: issue #31. After recovery turns a still-expired Grok token is a
+        // hard auth error. send() must not warn-and-send a dead token.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid_grant"))
+            .expect(3)
+            .mount(&token_server)
+            .await;
+
+        let infer = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&infer)
+            .await;
+
+        let token_url = format!("{}/oauth2/token", token_server.uri());
+        let _oauth = OauthEnvGuard::install(
+            &grok_cli_auth_json("jwt-dead", "2000-01-01T00:00:00Z"),
+            &token_url,
+        );
+        let p = GrokProvider::new(None).unwrap().with_base_url(infer.uri());
+        let err = p
+            .send(base_req_model("grok-4.5"))
+            .await
+            .expect_err("must fail closed");
+        match err {
+            ProviderError::Auth(msg) => assert!(
+                msg.contains("expired") || msg.contains("failed to load Grok credentials"),
+                "expected expired auth error, got {msg}"
+            ),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn default_path_429_and_5xx_pass_through_once() {
+        // WHY: issue #31. 429 and 5xx are upstream/model failures, not
+        // credential maintenance. Default-path send must not retry them.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "should-not-refresh",
+                "refresh_token": "should-not-rotate",
+                "expires_in": 21600
+            })))
+            .expect(0)
+            .mount(&token_server)
+            .await;
+
+        for status in [429_u16, 503] {
+            let infer = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("upstream busy"))
+                .expect(1)
+                .mount(&infer)
+                .await;
+
+            let token_url = format!("{}/oauth2/token", token_server.uri());
+            let _oauth = OauthEnvGuard::install(
+                &grok_cli_auth_json("jwt-live-no-retry", "2999-01-01T00:00:00Z"),
+                &token_url,
+            );
+            let p = GrokProvider::new(None).unwrap().with_base_url(infer.uri());
+            let err = p
+                .send(base_req_model("grok-4.5"))
+                .await
+                .expect_err("upstream status must pass through");
+            assert!(
+                matches!(
+                    err,
+                    ProviderError::Upstream {
+                        status: Some(got),
+                        ..
+                    } if got == status
+                ),
+                "expected upstream {status}, got {err:?}"
+            );
         }
     }
 
@@ -3629,10 +3991,10 @@ mod tests {
     #[test]
     fn test_creds_check_expired_direct() {
         // Explicit unit for "check_expired" in the creds requirements list.
-        // Intent: send() always calls it after fresh load (warn+continue on err). A static
-        // API key (no expires_at_ms) is always Ok; an OIDC token from ~/.grok/auth.json is
-        // Ok while future-dated and Err once past expiry, which is what tells the user to
-        // re-run the Grok CLI login. We assert all three so the contract can't silently break.
+        // Intent: send() always calls it after fresh load and fails closed on err
+        // (issue #31). A static API key (no expires_at_ms) is always Ok; an OIDC
+        // token from ~/.grok/auth.json is Ok while future-dated and Err once past
+        // expiry. We assert all three so the contract can't silently break.
         let static_key = GrokCredentials {
             api_key: "xai-foo-bar-123".into(),
             expires_at_ms: None,

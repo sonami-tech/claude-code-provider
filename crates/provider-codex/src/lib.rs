@@ -11,7 +11,9 @@
 //! ChatGPT OAuth tokens in `auth.json` are refreshed in-place by default
 //! (see [`oauth_refresh`]); control with global/per-provider env or CLI
 //! (`OMNI_OAUTH_REFRESH`, `OMNI_CODEX_OAUTH_REFRESH`, `--no-oauth-refresh-codex`,
-//! etc.). Static API keys are never refreshed.
+//! etc.). Static API keys are never refreshed. On the default CLI-file path,
+//! upstream 401 force-refreshes once and replays the inference request once
+//! (issue #31). Custom/override endpoints do not 401-replay via those files.
 
 pub mod bootstrap;
 mod oauth_refresh;
@@ -242,6 +244,52 @@ impl CodexProvider {
         out
     }
 
+    async fn send_responses_once(
+        &self,
+        config: &CodexRequestConfig,
+        req: &CanonicalRequest,
+    ) -> Result<CanonicalResponse, ProviderError> {
+        let url = config.responses_url()?;
+        let mut headers = config.headers().await?;
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        let error_redactor = CodexErrorRedactor::from_request(&url, &headers);
+
+        let body = codex_responses_body(req, false)?;
+        let resp = self
+            .client
+            .post(url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::upstream(error_redactor.redact(&format!("codex network error: {e}")))
+            })?;
+
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| {
+            ProviderError::upstream(
+                error_redactor.redact(&format!("codex response read error: {e}")),
+            )
+        })?;
+        if !status.is_success() {
+            return Err(ProviderError::upstream_status(
+                status.as_u16(),
+                error_redactor.redact(&format!(
+                    "codex HTTP {status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                )),
+            ));
+        }
+
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::upstream(format!("decode codex response: {e}")))?;
+        responses_upstream::response_to_canonical(&value, &req.model, "codex", &error_redactor)
+    }
+
     async fn send_conservative_ws(
         &self,
         req: CanonicalRequest,
@@ -257,14 +305,14 @@ impl CodexProvider {
         req: CanonicalRequest,
         config: CodexRequestConfig,
     ) -> Result<CanonicalStream, ProviderError> {
-        let auth = config.chatgpt_auth().await?;
+        let mut auth = config.chatgpt_auth().await?;
         let models_url = config.conservative_models_url(self.version)?;
-        let headers = conservative_codex_headers(self.version, &auth)?;
-        let redactor = CodexErrorRedactor::for_secrets([auth.access_token.clone()]);
+        let mut headers = conservative_codex_headers(self.version, &auth)?;
+        let mut redactor = CodexErrorRedactor::for_secrets([auth.access_token.clone()]);
 
-        let preflight = self
+        let mut preflight = self
             .client
-            .get(models_url)
+            .get(models_url.clone())
             .headers(headers.clone())
             .send()
             .await
@@ -273,6 +321,25 @@ impl CodexProvider {
                     redactor.redact(&format!("codex conservative models preflight error: {e}")),
                 )
             })?;
+        if preflight.status().as_u16() == 401
+            && config.uses_default_cli_file_auth()
+            && config.force_refresh_cli_oauth().await.is_ok()
+        {
+            auth = config.chatgpt_auth().await?;
+            headers = conservative_codex_headers(self.version, &auth)?;
+            redactor = CodexErrorRedactor::for_secrets([auth.access_token.clone()]);
+            preflight = self
+                .client
+                .get(models_url)
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::upstream(
+                        redactor.redact(&format!("codex conservative models preflight error: {e}")),
+                    )
+                })?;
+        }
         let status = preflight.status();
         let bytes = preflight.bytes().await.map_err(|e| {
             ProviderError::upstream(redactor.redact(&format!(
@@ -416,45 +483,15 @@ impl LlmProvider for CodexProvider {
             )));
         }
 
-        let url = config.responses_url()?;
-        let mut headers = config.headers().await?;
-        headers.insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json"),
-        );
-        let error_redactor = CodexErrorRedactor::from_request(&url, &headers);
-
-        let body = codex_responses_body(&req, false)?;
-        let resp = self
-            .client
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::upstream(error_redactor.redact(&format!("codex network error: {e}")))
-            })?;
-
-        let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| {
-            ProviderError::upstream(
-                error_redactor.redact(&format!("codex response read error: {e}")),
-            )
-        })?;
-        if !status.is_success() {
-            return Err(ProviderError::upstream_status(
-                status.as_u16(),
-                error_redactor.redact(&format!(
-                    "codex HTTP {status}: {}",
-                    String::from_utf8_lossy(&bytes)
-                )),
-            ));
+        match self.send_responses_once(&config, &req).await {
+            Err(e) if is_upstream_status(&e, 401) && config.rest_401_replay_allowed() => {
+                match config.force_refresh_cli_auth().await {
+                    Ok(()) => self.send_responses_once(&config, &req).await,
+                    Err(_) => Err(e),
+                }
+            }
+            other => other,
         }
-
-        let value: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| ProviderError::upstream(format!("decode codex response: {e}")))?;
-        responses_upstream::response_to_canonical(&value, &req.model, "codex", &error_redactor)
     }
 
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
@@ -482,14 +519,50 @@ impl LlmProvider for CodexProvider {
         let body = codex_responses_body(&req, true)?;
         let error_redactor = CodexErrorRedactor::from_request(&url, &headers);
         let client = self.client.clone();
+        let can_replay = config.rest_401_replay_allowed();
+        let replay_config = config.clone();
 
         let stream = async_stream::stream! {
-            let send_result = client
-                .post(url)
-                .headers(headers)
+            let mut headers = headers;
+            let mut error_redactor = error_redactor;
+            let mut send_result = client
+                .post(url.clone())
+                .headers(headers.clone())
                 .json(&body)
                 .send()
                 .await;
+
+            if can_replay
+                && send_result
+                    .as_ref()
+                    .is_ok_and(|resp| resp.status().as_u16() == 401)
+                && replay_config.force_refresh_cli_auth().await.is_ok()
+            {
+                match replay_config.headers().await {
+                    Ok(mut next_headers) => {
+                        next_headers.insert(
+                            header::CONTENT_TYPE,
+                            header::HeaderValue::from_static("application/json"),
+                        );
+                        next_headers.insert(
+                            header::ACCEPT,
+                            header::HeaderValue::from_static("text/event-stream"),
+                        );
+                        headers = next_headers;
+                        error_redactor = CodexErrorRedactor::from_request(&url, &headers);
+                        send_result = client
+                            .post(url.clone())
+                            .headers(headers.clone())
+                            .json(&body)
+                            .send()
+                            .await;
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            }
 
             let http_resp = match send_result {
                 Ok(resp) => resp,
@@ -920,6 +993,34 @@ impl CodexRequestConfig {
         self.conservative_ws_eligible() && self.has_chatgpt_oauth_tokens()
     }
 
+    /// Default CLI-file OpenAI auth (not OMNI override, not custom env/command).
+    /// Only this path may 401-replay via `~/.codex/auth.json`.
+    fn uses_default_cli_file_auth(&self) -> bool {
+        !omni_codex_override_present()
+            && self.auth_command.is_none()
+            && self.experimental_bearer_token.is_none()
+            && self.env_key.is_none()
+            && self.requires_openai_auth
+    }
+
+    /// REST 401 replay only when this request's bearer comes from auth.json.
+    /// Env API keys win over file OAuth; do not rotate leftover ChatGPT tokens
+    /// for a 401 that used `CODEX_API_KEY` / `OPENAI_API_KEY` / `CODEX_ACCESS_TOKEN`.
+    fn rest_401_replay_allowed(&self) -> bool {
+        self.uses_default_cli_file_auth() && !env_openai_key_present()
+    }
+
+    async fn force_refresh_cli_auth(&self) -> Result<(), String> {
+        if env_openai_key_present() {
+            return Err("env API key owns this request; not rotating CLI OAuth".into());
+        }
+        oauth_refresh::force_refresh_chatgpt_tokens(&self.home.join("auth.json")).await
+    }
+
+    async fn force_refresh_cli_oauth(&self) -> Result<(), String> {
+        oauth_refresh::force_refresh_chatgpt_oauth_tokens(&self.home.join("auth.json")).await
+    }
+
     /// True when `auth.json` has a non-empty ChatGPT `access_token` + `account_id`.
     fn has_chatgpt_oauth_tokens(&self) -> bool {
         let auth_path = self.home.join("auth.json");
@@ -1158,6 +1259,12 @@ impl CodexRequestConfig {
 
 fn omni_codex_override_present() -> bool {
     env_nonempty("OMNI_CODEX_BASE_URL").is_some()
+}
+
+fn env_openai_key_present() -> bool {
+    ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"]
+        .iter()
+        .any(|key| env_nonempty(key).is_some())
 }
 
 fn is_default_openai_base(base_url: &str) -> bool {
@@ -1873,6 +1980,16 @@ fn is_sensitive_name(name: &str) -> bool {
 
 fn redact(input: &str) -> String {
     responses_upstream::redact_prefixed_secrets(input, &["sk-", "xai-", "eyJ"])
+}
+
+fn is_upstream_status(err: &ProviderError, want: u16) -> bool {
+    matches!(
+        err,
+        ProviderError::Upstream {
+            status: Some(status),
+            ..
+        } if *status == want
+    )
 }
 
 #[cfg(test)]
@@ -3263,6 +3380,365 @@ env_key = "CUSTOM_CODEX_KEY"
             .await
             .unwrap();
         assert_eq!(resp.content, "ok");
+    }
+
+    fn issue31_base_req() -> CanonicalRequest {
+        CanonicalRequest {
+            model: "gpt-5.5".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn issue31_oauth_auth(access: &str) -> String {
+        format!(
+            r#"{{"tokens":{{"access_token":"{access}","refresh_token":"rt-old","account_id":"acct-1"}}}}"#
+        )
+    }
+
+    struct CodexOauthUrlGuard {
+        flag: Option<std::ffi::OsString>,
+        url: Option<std::ffi::OsString>,
+    }
+
+    impl CodexOauthUrlGuard {
+        fn install(token_url: &str) -> Self {
+            let flag = std::env::var_os("OMNI_OAUTH_REFRESH");
+            let url = std::env::var_os("OMNI_CODEX_OAUTH_TOKEN_URL");
+            unsafe {
+                std::env::set_var("OMNI_OAUTH_REFRESH", "1");
+                std::env::set_var("OMNI_CODEX_OAUTH_TOKEN_URL", token_url);
+            }
+            Self { flag, url }
+        }
+    }
+
+    impl Drop for CodexOauthUrlGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.flag {
+                    Some(v) => std::env::set_var("OMNI_OAUTH_REFRESH", v),
+                    None => std::env::remove_var("OMNI_OAUTH_REFRESH"),
+                }
+                match &self.url {
+                    Some(v) => std::env::set_var("OMNI_CODEX_OAUTH_TOKEN_URL", v),
+                    None => std::env::remove_var("OMNI_CODEX_OAUTH_TOKEN_URL"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn default_path_401_force_refresh_replays_nonstream() {
+        // WHY: issue #31. Default CLI-file Codex send must force-refresh once
+        // on upstream 401 and replay the same inference request.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "codex-after-401",
+                "refresh_token": "rt-after-401",
+                "id_token": "id-after-401",
+                "expires_in": 864000
+            })))
+            .expect(1)
+            .mount(&token_server)
+            .await;
+
+        let infer = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer codex-stale"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "invalid token"}
+            })))
+            .expect(1)
+            .mount(&infer)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer codex-after-401"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"recovered"}]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&infer)
+            .await;
+
+        let _home = TempCodexHome::new(
+            &format!(
+                r#"
+model = "gpt-5.5"
+openai_base_url = "{}"
+"#,
+                infer.uri()
+            ),
+            Some(&issue31_oauth_auth("codex-stale")),
+        );
+        let token_url = format!("{}/oauth/token", token_server.uri());
+        let _oauth = CodexOauthUrlGuard::install(&token_url);
+        let provider = CodexProvider::new().unwrap();
+        let resp = provider
+            .send(issue31_base_req())
+            .await
+            .expect("401 recovery must replay send");
+        assert_eq!(resp.content, "recovered");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn default_path_401_force_refresh_replays_stream_open() {
+        // WHY: issue #31. Stream-open 401 on the default CLI path must
+        // force-refresh once and reopen. No mid-stream replay.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "codex-stream-after-401",
+                "refresh_token": "rt-stream-after-401",
+                "id_token": "id-stream-after-401",
+                "expires_in": 864000
+            })))
+            .expect(1)
+            .mount(&token_server)
+            .await;
+
+        let infer = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer codex-stream-stale"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "invalid token"}
+            })))
+            .expect(1)
+            .mount(&infer)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer codex-stream-after-401"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    "event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                    "text/event-stream",
+                ),
+            )
+            .expect(1)
+            .mount(&infer)
+            .await;
+
+        let _home = TempCodexHome::new(
+            &format!(
+                r#"
+model = "gpt-5.5"
+openai_base_url = "{}"
+"#,
+                infer.uri()
+            ),
+            Some(&issue31_oauth_auth("codex-stream-stale")),
+        );
+        let token_url = format!("{}/oauth/token", token_server.uri());
+        let _oauth = CodexOauthUrlGuard::install(&token_url);
+        let provider = CodexProvider::new().unwrap();
+        let mut stream = provider
+            .send_stream(issue31_base_req())
+            .await
+            .expect("stream opens");
+        let mut saw_text = false;
+        while let Some(event) = stream.next().await {
+            let event = event.expect("401 recovery must reopen stream");
+            if matches!(event, CanonicalStreamEvent::TextDelta(ref t) if t == "ok") {
+                saw_text = true;
+            }
+        }
+        assert!(saw_text, "expected recovered stream text");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn default_path_429_and_5xx_pass_through_once() {
+        // WHY: issue #31. 429 and 5xx must pass through after one upstream
+        // attempt. Codex must not treat them as credential recovery.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "should-not-refresh",
+                "refresh_token": "should-not-rotate",
+                "expires_in": 864000
+            })))
+            .expect(0)
+            .mount(&token_server)
+            .await;
+        let token_url = format!("{}/oauth/token", token_server.uri());
+        let _oauth = CodexOauthUrlGuard::install(&token_url);
+
+        for status in [429_u16, 503] {
+            let infer = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("upstream busy"))
+                .expect(1)
+                .mount(&infer)
+                .await;
+            let _home = TempCodexHome::new(
+                &format!(
+                    r#"
+model = "gpt-5.5"
+openai_base_url = "{}"
+"#,
+                    infer.uri()
+                ),
+                Some(&issue31_oauth_auth("codex-live-no-retry")),
+            );
+            let provider = CodexProvider::new().unwrap();
+            let err = provider
+                .send(issue31_base_req())
+                .await
+                .expect_err("upstream status must pass through");
+            assert!(
+                matches!(
+                    err,
+                    ProviderError::Upstream {
+                        status: Some(got),
+                        ..
+                    } if got == status
+                ),
+                "expected upstream {status}, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn omni_override_401_does_not_replay_via_cli_file() {
+        // WHY: issue #31. Custom/override endpoints must not 401-replay via
+        // default CLI auth.json.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "must-not-use",
+                "refresh_token": "must-not-rotate",
+                "expires_in": 864000
+            })))
+            .expect(0)
+            .mount(&token_server)
+            .await;
+
+        let infer = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .expect(1)
+            .mount(&infer)
+            .await;
+
+        let _home = TempCodexHome::new(
+            r#"
+model = "gpt-5.5"
+"#,
+            Some(&issue31_oauth_auth("codex-must-not-leak")),
+        );
+        unsafe {
+            std::env::set_var("OMNI_CODEX_BASE_URL", infer.uri());
+            std::env::set_var("OMNI_CODEX_AUTH_TOKEN", "omni-override-token");
+        }
+        let token_url = format!("{}/oauth/token", token_server.uri());
+        let _oauth = CodexOauthUrlGuard::install(&token_url);
+        let provider = CodexProvider::new().unwrap();
+        let err = provider
+            .send(issue31_base_req())
+            .await
+            .expect_err("override 401 must pass through");
+        assert!(
+            matches!(
+                err,
+                ProviderError::Upstream {
+                    status: Some(401),
+                    ..
+                }
+            ),
+            "expected 401, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn env_api_key_401_does_not_rotate_leftover_oauth() {
+        // WHY: issue #31 review. REST bearer from CODEX_API_KEY/OPENAI_API_KEY
+        // must not force-refresh leftover ChatGPT OAuth in auth.json on 401.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "must-not-rotate",
+                "refresh_token": "must-not-rotate",
+                "expires_in": 864000
+            })))
+            .expect(0)
+            .mount(&token_server)
+            .await;
+
+        let infer = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer sk-env-owns-request"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .expect(1)
+            .mount(&infer)
+            .await;
+
+        let _home = TempCodexHome::new(
+            &format!(
+                r#"
+model = "gpt-5.5"
+openai_base_url = "{}"
+"#,
+                infer.uri()
+            ),
+            Some(&issue31_oauth_auth("codex-leftover-oauth")),
+        );
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "sk-env-owns-request");
+        }
+        let token_url = format!("{}/oauth/token", token_server.uri());
+        let _oauth = CodexOauthUrlGuard::install(&token_url);
+        let provider = CodexProvider::new().unwrap();
+        let err = provider
+            .send(issue31_base_req())
+            .await
+            .expect_err("env-key 401 must pass through once");
+        assert!(
+            matches!(
+                err,
+                ProviderError::Upstream {
+                    status: Some(401),
+                    ..
+                }
+            ),
+            "expected 401, got {err:?}"
+        );
+        let on_disk: Value =
+            serde_json::from_slice(&std::fs::read(_home.path.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["tokens"]["refresh_token"], "rt-old",
+            "leftover OAuth RT must stay unrotated"
+        );
     }
 
     #[tokio::test]

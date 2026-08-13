@@ -413,6 +413,16 @@ pub async fn ensure_fresh_chatgpt_oauth_tokens(path: &Path) -> Result<(), String
     maybe_refresh_auth_json(path, false, false).await
 }
 
+/// Force-refresh after an upstream 401 on the REST default path.
+pub async fn force_refresh_chatgpt_tokens(path: &Path) -> Result<(), String> {
+    maybe_refresh_auth_json(path, true, true).await
+}
+
+/// Force-refresh after an upstream 401 on the ChatGPT OAuth (conservative) path.
+pub async fn force_refresh_chatgpt_oauth_tokens(path: &Path) -> Result<(), String> {
+    maybe_refresh_auth_json(path, true, false).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

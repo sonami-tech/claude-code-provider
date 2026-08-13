@@ -208,9 +208,11 @@ pseudo-streaming.
   would hide upstream faults and stack with client retry (passthrough, #27).
 - Non-goals: changing OAuth token URLs, lock/flock, or the 3-turn recovery
   loop; adding 5xx retry; custom-endpoint auth.
-- Implementation: tracked on issue #31 (approved). Code may still lag this
-  contract (Claude already 401-replays; Grok/Codex do not yet; Grok may
-  still soft-warn).
+- Implementation: issue #31 is implemented on Claude, Grok, and Codex
+  default CLI-file paths. Fail closed after recovery (Grok does not
+  warn-and-send a dead token). 5xx / stream-drop / mid-stream model errors
+  are client retries. Custom/override endpoints do not 401-replay via CLI
+  files.
 - Source of truth: this entry (citation). Operator summary: `docs/README.md`.
   Load/lock details: Credentials section above and
   `omni_common::oauth_refresh`.
