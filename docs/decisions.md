@@ -149,6 +149,11 @@ turns with a still-stale AT, fail closed with a specific error (no soft-warn
 continuing with a dead token). Write-back preserves file mode and requires a
 rotated `refresh_token` in the grant.
 
+On a default-path **upstream 401**, force-refresh once, then **replay the
+inference request once** if refresh produced a live token (issue #31). Do not
+retry 5xx or mid-stream model errors. Custom endpoints do not use CLI files
+and do not take this 401 replay. See the issue #31 entry below.
+
 Custom upstream endpoint configuration owns provider auth and must not fall
 back to default credentials:
 
@@ -174,6 +179,41 @@ back to default credentials:
 Codex OpenAI inbound supports non-streaming and `stream:true` paths. Streaming
 uses native Responses SSE parsing in `provider-codex`, not buffered
 pseudo-streaming.
+
+## Auth recovery: proxy rotates keys, 401 replays once (issue #31)
+
+- Decision: Omni **owns OAuth rotation** for the default CLI login files
+  (Claude `~/.claude/.credentials.json`, Grok `~/.grok/auth.json`, Codex
+  `~/.codex/auth.json`). The proxy runs 24/7; the vendor CLIs often do not.
+  Key rotation is part of keeping that connection up. Static API keys are
+  never refreshed.
+- Decision: **same contract on all three default paths.** Read fresh every
+  request. Refresh before send when the token is expired or inside the
+  15-minute window. Fail closed if recovery cannot produce a live token
+  (Grok must not warn-and-send a dead token).
+- Decision: on default-path **upstream 401**, force-refresh once (the file
+  clock can still look valid). If that works, **send the same inference
+  request once more** (non-stream and stream-open only; no mid-stream replay).
+  If refresh fails, return the 401. This is credential maintenance, not
+  model retry. The client should not have to know the vendor login files.
+- Decision: **do not** retry HTTP 5xx, stream drops, or upstream "Internal
+  error during token generation." Those are model/upstream failures. Return
+  them; the client retries if it wants.
+- Decision: custom / override endpoints keep isolated auth and must not
+  401-replay via the default CLI files.
+- Rationale: Omni replicates dedicated vendor APIs and holds their login
+  files. Refresh tokens rotate and revoke. Relying on the CLIs fails when
+  they are off. A 401 after a successful rotation is our token, not a flaky
+  model, so completing that one call keeps the connection stable. 5xx retry
+  would hide upstream faults and stack with client retry (passthrough, #27).
+- Non-goals: changing OAuth token URLs, lock/flock, or the 3-turn recovery
+  loop; adding 5xx retry; custom-endpoint auth.
+- Implementation: tracked on issue #31 (approved). Code may still lag this
+  contract (Claude already 401-replays; Grok/Codex do not yet; Grok may
+  still soft-warn).
+- Source of truth: this entry (citation). Operator summary: `docs/README.md`.
+  Load/lock details: Credentials section above and
+  `omni_common::oauth_refresh`.
 
 ## Observability
 

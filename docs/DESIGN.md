@@ -53,7 +53,8 @@ Provider implementations remain separate crates:
   resolution, and Responses wire mapping.
 - `omni-common` owns shared OpenAI-compatible HTTP conversion, Responses
   conversion, SSE framing, auth, stats, conversation logging, session
-  derivation, replacements, and error envelopes.
+  derivation, replacements, error envelopes, and the OAuth refresh gate
+  used by all three providers (issue #31).
 - `omni-core` owns canonical types, the `LlmProvider` trait (canonical-only),
   optional `AnthropicNativeSurface`, and `BootstrappedProvider`.
 - `crates/bin/omni` owns server startup, routing, auth wiring, stats wiring,
@@ -191,7 +192,8 @@ target Codex via the dual-mode translated path (best-effort).
 ## Custom Upstream Auth
 
 When a provider is pointed at a custom upstream endpoint, that custom
-configuration owns auth for that provider and default credentials must not leak:
+configuration owns auth for that provider and default credentials must not leak
+(no CLI-file 401 replay on these paths; issue #31):
 
 - Claude forced override: `OMNI_CLAUDE_BASE_URL` wins over
   `ANTHROPIC_BASE_URL` and uses only `OMNI_CLAUDE_AUTH_TOKEN`,

@@ -148,7 +148,10 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 Credentials are read fresh per request, never cached. Omni refreshes
 Claude/Codex/Grok OAuth tokens in-place by default (atomic write-back of
 rotated refresh tokens); disable with `--no-oauth-refresh` or
-`OMNI_OAUTH_REFRESH=0`. Claude reads
+`OMNI_OAUTH_REFRESH=0`. After a default-path upstream 401, Omni force-refreshes
+once and replays that inference request once if the new token is live
+(issue #31). It does not retry 5xx or mid-stream model errors. Recovery that
+cannot produce a live token fails closed. Claude reads
 `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`. Grok resolves
 `$XAI_CREDENTIALS_PATH`, then a usable `~/.xai/.credentials.json`, then
 `~/.grok/auth.json`. Codex reads `CODEX_API_KEY`, `OPENAI_API_KEY`,
