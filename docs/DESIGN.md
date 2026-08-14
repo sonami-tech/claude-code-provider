@@ -152,8 +152,9 @@ optional model, optional supported list). Grok and Codex use
 `ProviderError::unsupported_reasoning_effort` (Claude via
 `prepare_anthropic_request`, same structured BadRequest).
 
-- **Grok:** wire `low|medium|high`. Aliases: `minimal`→`low`, `max`→`high`.
-  Explicit `"none"` omits the field. `xhigh` and other unknowns fail loud.
+- **Grok:** wire `low|medium|high`, plus `xhigh` on `grok-4.6`. Aliases:
+  `minimal`→`low`, `max`→`high`. Explicit `"none"` omits the field. `xhigh` on
+  `grok-4.5` and other unknowns fail loud.
   When the client **omits** effort entirely, Omni also omits the upstream field
   (issue #18). No invented default, force-floor, or disable. The
   provider/model default applies (often `high` on grok-4.5; capture notes:
@@ -163,8 +164,8 @@ optional model, optional supported list). Grok and Codex use
   (e.g. `ultra`) fail loud.
 - **Claude:** precedence is **client effort > pin default > absent**. Client
   non-none effort sets `output_config.effort` before fingerprint wire defaults
-  (so pin cannot overwrite). Pin defaults (e.g. Fable `xhigh`) apply only when
-  client effort is absent. Explicit `"none"` suppresses pin fill. Models with
+  (so pin cannot overwrite). Pin defaults apply only when client effort is
+  absent. Explicit `"none"` suppresses pin fill. Models with
   an effort surface prefer `output_config` over effort-derived thinking
   budgets; models without it (e.g. Haiku) use the thinking-budget ladder and
   fail loud when the ladder cannot express the value.

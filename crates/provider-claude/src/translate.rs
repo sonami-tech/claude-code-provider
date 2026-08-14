@@ -1550,7 +1550,6 @@ mod tests {
             Option<&'static str>,
         );
         let cases: &[WireCase] = &[
-            ("fable", "claude-fable-5", 64_000, None, Some("xhigh")),
             ("opus", "claude-opus-5", 64_000, None, Some("high")),
             ("sonnet", "claude-sonnet-5", 64_000, None, Some("high")),
             // The "haiku" alias resolves to the dated canonical; 2.1.220 omits
@@ -1623,11 +1622,11 @@ mod tests {
     #[test]
     fn client_effort_sets_output_config_and_overrides_pin_default() {
         // WHY (issue #20): explicit client effort drives output_config.effort and
-        // must not be overwritten by fingerprint pin defaults (e.g. Fable xhigh).
+        // must not be overwritten by fingerprint pin defaults.
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
         let canon = CanonicalRequest {
-            model: "fable".into(),
+            model: "sonnet".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -1644,7 +1643,7 @@ mod tests {
                 .as_ref()
                 .and_then(|o| o.effort.as_deref()),
             Some("low"),
-            "client effort must win over Fable pin default xhigh"
+            "client effort must win over the Sonnet pin default"
         );
     }
 
@@ -1676,12 +1675,12 @@ mod tests {
     }
 
     #[test]
-    fn absent_effort_keeps_fable_pin_default_xhigh() {
+    fn absent_effort_keeps_sonnet_pin_default_high() {
         // WHY (issue #20): pin default applies only when client effort is absent.
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
         let canon = CanonicalRequest {
-            model: "fable".into(),
+            model: "sonnet".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -1693,8 +1692,8 @@ mod tests {
             anth.output_config
                 .as_ref()
                 .and_then(|o| o.effort.as_deref()),
-            Some("xhigh"),
-            "Fable capture-backed pin default when effort absent"
+            Some("high"),
+            "Sonnet capture-backed pin default when effort absent"
         );
     }
 
@@ -1705,7 +1704,7 @@ mod tests {
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
         let canon = CanonicalRequest {
-            model: "fable".into(),
+            model: "sonnet".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),

@@ -8,7 +8,7 @@
 //! - host `https://cli-chat-proxy.grok.com`
 //! - `POST /v1/responses` (OpenAI Responses shape)
 //! - CLI fingerprint headers + OIDC bearer (`~/.grok/auth.json` preferred)
-//! - model catalog: `grok-4.6` (alias `grok`) and `grok-4.5` as advertised by grok-shell 1.0.3
+//! - model catalog: `grok-4.6` (alias `grok`) and `grok-4.5` as advertised by grok-shell 1.0.4
 //!
 //! Custom endpoint mode (`OMNI_GROK_BASE_URL` / `with_custom_auth*`) is a separate operator
 //! override that speaks OpenAI-compatible `/chat/completions` against an arbitrary base URL
@@ -61,13 +61,13 @@ static GROK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
 
 /// User-Agent template for CLI-parity requests. `{version}` is filled from the
-/// pinned catalog version (`self.version`, e.g. "1.0.3") so the UA and
+/// pinned catalog version (`self.version`, e.g. "1.0.4") so the UA and
 /// `x-grok-client-version` cannot drift from the catalog the request claims.
-/// Verified live against grok-shell 1.0.3 (2026-08-12; first captured 0.2.60 on
-/// 2026-06-23, UA template unchanged across bumps including the 1.0.3 jump).
+/// Verified live against grok-shell 1.0.4 (2026-08-14; first captured 0.2.60 on
+/// 2026-06-23, UA template unchanged across bumps including the 1.0.x line).
 const CLI_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
 
-// Grok catalog, re-baselined 2026-08-12 via live capture (docs/providers/grok/CAPTURE.md).
+// Grok catalog, re-baselined 2026-08-14 via live capture (docs/providers/grok/CAPTURE.md).
 //
 // What the installed grok-shell CLI advertises on cli-chat-proxy.grok.com /v1/models:
 // `grok-4.6` and `grok-4.5`. Settings default_model is grok-4.6. The `grok models`
@@ -75,16 +75,16 @@ const CLI_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
 // are not pinned here. If GET /v1/models is missing from a rebaseline capture,
 // stop; do not keep a previous pin's catalog.
 //
-// Live capture from grok-shell 1.0.3: fingerprint headers keep token-auth,
+// Live capture from grok-shell 1.0.4: fingerprint headers keep token-auth,
 // authenticate-response, client version/identifier, UA, model-override, accept
 // text/event-stream, and `x-grok-client-mode: headless`. Main chat body uses
-// model grok-4.6 with reasoning.effort high + reasoning.summary concise, plus
+// model grok-4.6 with reasoning.effort high + reasoning.summary detailed, plus
 // include/store flags we still intentionally omit on Omni's user-driven
 // Responses body. Session headers (conv/req/session/agent/turn-idx),
 // x-compaction-at, x-compactions-remaining, and x-grok-doom-loop-check remain
 // intentionally omitted on single-shot Omni requests.
 /// Pinned grok-shell CLI version (UA + header fingerprint). Single live pin.
-pub const GROK_VERSION: &str = "1.0.3";
+pub const GROK_VERSION: &str = "1.0.4";
 
 /// Model catalog for the active pin.
 const GROK_CATALOG: &[CatalogModel] = &[
@@ -482,7 +482,7 @@ impl GrokProvider {
     /// `cli-chat-proxy.grok.com /v1/responses`.
     ///
     /// Header NAMES + VALUES are the fingerprint surface; order does not matter
-    /// (reqwest sets them). The 1.0.3 version string and the UA are both derived
+    /// (reqwest sets them). The 1.0.4 version string and the UA are both derived
     /// from `self.version`, so they cannot drift from the catalog the
     /// request claims.
     ///
@@ -521,7 +521,7 @@ impl GrokProvider {
         headers.insert(header::AUTHORIZATION, bearer_value);
 
         // Fixed + derived headers. Names are static; values are validated.
-        // `x-grok-client-mode: headless` was live-captured on grok-shell 1.0.3
+        // `x-grok-client-mode: headless` was live-captured on grok-shell 1.0.4
         // `--single` traffic (headless path Omni mirrors).
         let fixed: [(&'static str, &str); 9] = [
             ("content-type", "application/json"),
@@ -1164,11 +1164,11 @@ fn to_xai_chat_request(
     }
 
     // Map canonical reasoning -> xAI chat.completions form (top level for this surface).
-    // xAI documents low|medium|high; unmappable explicit efforts fail loud (issue #20).
+    // Grok 4.6 supports xhigh; Grok 4.5 supports low|medium|high.
     if let Some(CanonicalReasoning {
         effort: Some(eff), ..
     }) = &req.reasoning
-        && let Some(eff) = grok_reasoning_effort(eff, &req.model, "chat.completions")?
+        && let Some(eff) = grok_reasoning_effort(eff, model, "chat.completions")?
     {
         body["reasoning_effort"] = json!(eff);
     }
@@ -1269,7 +1269,7 @@ fn to_xai_chat_stream_request(
 // --- CLI path: OpenAI Responses request body -----------------------------------------------
 //
 // Grok talks the OpenAI *Responses* wire to cli-chat-proxy.grok.com (verified live
-// against grok-shell 1.0.3). The HEADERS are the fingerprint surface (see
+// against grok-shell 1.0.4). The HEADERS are the fingerprint surface (see
 // `cli_headers`); the BODY only needs a valid Responses shape carrying the USER's
 // request, NOT a byte-replay of the CLI's private content/tools. So this builder is
 // deliberately minimal and user-driven: typed `input` messages (system/developer
@@ -1347,37 +1347,44 @@ fn to_grok_responses_request(
         effort: Some(effort),
         ..
     }) = &req.reasoning
-        && let Some(effort) = grok_reasoning_effort(effort, &req.model, "responses")?
+        && let Some(effort) = grok_reasoning_effort(effort, model, "responses")?
     {
-        // Responses-standard reasoning; NOT the CLI's {summary:"concise"} preference.
+        // Responses-standard reasoning; do not add the CLI's summary preference.
         body["reasoning"] = json!({ "effort": effort });
     }
 
     Ok(body)
 }
 
-/// Map canonical effort onto xAI's documented set (`low|medium|high`).
+/// Map canonical effort onto the selected xAI model's advertised set.
 ///
-/// Documented aliases: `minimal`→`low`, `max`→`high`. Explicit `"none"`/empty
-/// omit the field. Unmappable values (e.g. `xhigh`, `ultra`) fail loud — never
-/// silent omit (issue #20).
+/// Grok 4.6 accepts `xhigh`; Grok 4.5 accepts `low|medium|high`. Documented
+/// aliases are `minimal`→`low` and `max`→`high`. Explicit `"none"`/empty omits
+/// the field. Other values fail loud (issue #20).
 fn grok_reasoning_effort(
     effort: &str,
     model: &str,
     path: &str,
 ) -> Result<Option<&'static str>, ProviderError> {
-    const SUPPORTED: &[&str] = &["low", "medium", "high"];
+    const STANDARD: &[&str] = &["low", "medium", "high"];
+    const WITH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
+    let supported = if model == "grok-4.6" {
+        WITH_XHIGH
+    } else {
+        STANDARD
+    };
     match effort {
         "" | "none" => Ok(None),
         "minimal" | "low" => Ok(Some("low")),
         "medium" => Ok(Some("medium")),
         "high" | "max" => Ok(Some("high")),
+        "xhigh" if model == "grok-4.6" => Ok(Some("xhigh")),
         other => Err(ProviderError::unsupported_reasoning_effort(
             "grok",
             Some(model),
             path,
             other,
-            SUPPORTED,
+            supported,
         )),
     }
 }
@@ -2000,7 +2007,7 @@ mod tests {
         assert!(aliases.contains(&("grok", "grok-4.6")));
         assert!(
             !aliases.iter().any(|(alias, _)| *alias == "composer"),
-            "composer is no longer advertised by grok-shell 1.0.3"
+            "composer is no longer advertised by grok-shell 1.0.4"
         );
 
         // Unknown shorthand stays verbatim (pass-through), not remapped.
@@ -2879,7 +2886,7 @@ mod tests {
 
     #[test]
     fn grok_unmappable_effort_fails_loud_not_silent_omit() {
-        // WHY (issue #20): xAI wire is low|medium|high only. Explicit client
+        // WHY (issue #20): Grok 4.5 wire is low|medium|high only. Explicit
         // xhigh/ultra must not be silently dropped; fail with structured error.
         let base = CanonicalRequest {
             model: "grok-4.5".into(),
@@ -2917,6 +2924,18 @@ mod tests {
                 "responses path: {err:?}"
             );
         }
+        // Grok 4.6 advertises xhigh in the 1.0.4 catalog.
+        let mut r = base.clone();
+        r.model = "grok-4.6".into();
+        r.reasoning = Some(CanonicalReasoning {
+            effort: Some("xhigh".into()),
+            budget_tokens: None,
+        });
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG).unwrap();
+        assert_eq!(b["reasoning_effort"], "xhigh");
+        let b = to_grok_responses_request(&r, GROK_CATALOG, false).unwrap();
+        assert_eq!(b["reasoning"]["effort"], "xhigh");
+
         // Documented aliases still map.
         let mut r = base.clone();
         r.reasoning = Some(CanonicalReasoning {
@@ -4702,7 +4721,7 @@ mod tests {
     #[test]
     fn model_catalog_is_cli_advertised_ids_only() {
         // WHY: Grok exposes only what the grok-shell CLI advertises (2 ids on
-        // 1.0.3). A regression that leaked retired ids (e.g. grok-4.3 or
+        // 1.0.4). A regression that leaked retired ids (e.g. grok-4.3 or
         // composer) would misrepresent the surface users can actually hit on
         // cli-chat-proxy.
         let p = GrokProvider::new(None).unwrap();
@@ -4743,11 +4762,11 @@ mod tests {
     fn active_pin_is_single_catalog_version() {
         // WHY: issue #12 ships one pin only. Catalog and UA version must stay
         // locked to the verified grok-shell release so wire headers cannot drift.
-        assert_eq!(GrokProvider::pinned_version(), "1.0.3");
+        assert_eq!(GrokProvider::pinned_version(), "1.0.4");
         let p = GrokProvider::new(None).unwrap();
         let ids: Vec<_> = p.models_list().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["grok-4.6".to_string(), "grok-4.5".to_string()]);
-        assert_eq!(p.version, "1.0.3");
+        assert_eq!(p.version, "1.0.4");
     }
 
     fn base_req() -> CanonicalRequest {
@@ -4761,7 +4780,7 @@ mod tests {
         }
     }
 
-    // ── CLI path (grok-shell 1.0.3 parity) ──────────────────────────────────
+    // ── CLI path (grok-shell 1.0.4 parity) ──────────────────────────────────
     //
     // WHY this block exists: Grok talks the installed grok-shell CLI wire to
     // cli-chat-proxy.grok.com /v1/responses (OpenAI Responses shape). Parity under
@@ -4978,7 +4997,7 @@ mod tests {
         // version/identifier/mode, UA derived from the pinned version,
         // model-override, authenticate-response, Bearer, and x-grok-user-id when
         // creds provide it) and the /v1/responses path. A drift in any of these
-        // breaks fingerprint parity with grok-shell 1.0.3. No real credentials:
+        // breaks fingerprint parity with grok-shell 1.0.4. No real credentials:
         // a fake JWT + fake uuid are injected via the test constructor.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5023,7 +5042,7 @@ mod tests {
             val("x-authenticateresponse").as_deref(),
             Some("authenticate-response")
         );
-        assert_eq!(val("x-grok-client-version").as_deref(), Some("1.0.3"));
+        assert_eq!(val("x-grok-client-version").as_deref(), Some("1.0.4"));
         assert_eq!(
             val("x-grok-client-identifier").as_deref(),
             Some("grok-shell")
@@ -5031,7 +5050,7 @@ mod tests {
         assert_eq!(val("x-grok-client-mode").as_deref(), Some("headless"));
         assert_eq!(
             val("user-agent").as_deref(),
-            Some("grok-shell/1.0.3 (linux; x86_64)"),
+            Some("grok-shell/1.0.4 (linux; x86_64)"),
             "UA must be derived from the pinned catalog version"
         );
         assert_eq!(val("x-grok-model-override").as_deref(), Some("grok-build"));

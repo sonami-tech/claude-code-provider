@@ -11,7 +11,7 @@
 //! - --bind 127.0.0.1 by default, or --public as shorthand for --bind 0.0.0.0
 //! - Canonical model routing: real model ids (e.g. "claude-sonnet-5", "grok-4.6")
 //!   route directly when they uniquely identify an enabled provider.
-//! - Alias routing: "fable", "opus", "sonnet", "haiku", "grok", and "gpt"
+//! - Alias routing: "opus", "sonnet", "haiku", "grok", and "gpt"
 //!   resolve to current provider-owned model ids when unique.
 //! - Optional prefix routing remains an escape hatch: "grok:foo", "claude:bar", or "codex:bar".
 //!
@@ -796,7 +796,7 @@ fn format_aliases_for_log(providers: &HashMap<String, ProviderEntry>) -> Option<
     // enabled providers (cap length so the launch screen stays readable).
     const MAX_ALIAS_PAIRS: usize = 24;
     let catalogs = provider_catalogs(providers);
-    let preferred = ["sonnet", "opus", "haiku", "fable", "grok", "gpt"];
+    let preferred = ["sonnet", "opus", "haiku", "grok", "gpt"];
     let mut pairs = Vec::new();
     let mut seen = HashSet::new();
     for alias in preferred {
@@ -3075,8 +3075,11 @@ mod tests {
         let (k, m) = resolve_provider_and_model("claude-sonnet-4-6", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-4-6"));
 
-        let (k, m) = resolve_provider_and_model("fable", &catalogs).unwrap();
-        assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-fable-5"));
+        let err = resolve_provider_and_model("fable", &catalogs).unwrap_err();
+        assert!(
+            err.contains("unknown model"),
+            "fable must be unroutable after the Claude 2.1.232 catalog drop: {err}"
+        );
 
         let (k, m) = resolve_provider_and_model("sonnet", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-5"));
@@ -3093,7 +3096,7 @@ mod tests {
         let (k, m) = resolve_provider_and_model("grok", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.6"));
 
-        // composer is no longer a Grok catalog alias (grok-shell 1.0.3).
+        // composer is no longer a Grok catalog alias (grok-shell 1.0.4).
         let err = resolve_provider_and_model("composer", &catalogs).unwrap_err();
         assert!(
             err.contains("unknown model"),
@@ -3154,7 +3157,6 @@ mod tests {
             "sonnet=claude-sonnet-5",
             "opus=claude-opus-5",
             "haiku=claude-haiku-4-5-20251001",
-            "fable=claude-fable-5",
             "grok=grok-4.6",
             "gpt=",
         ] {
@@ -3168,7 +3170,11 @@ mod tests {
             !text.contains("codex="),
             "startup alias log must not advertise the pruned codex alias: {text}"
         );
-        // composer dropped from grok-shell 1.0.3 advertised catalog.
+        assert!(
+            !text.contains("fable="),
+            "startup alias log must not advertise retired fable alias: {text}"
+        );
+        // composer dropped from grok-shell 1.0.4 advertised catalog.
         assert!(
             !text.contains("composer="),
             "startup alias log must not advertise retired composer alias: {text}"
@@ -5070,7 +5076,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         );
         assert!(
             !ids.iter().any(|id| id == "grok-composer-2.5-fast"),
-            "composer is no longer in the grok-shell 1.0.3 catalog: {ids:?}"
+            "composer is no longer in the grok-shell 1.0.4 catalog: {ids:?}"
         );
         assert!(
             ids.iter().any(|id| id.starts_with("claude-")),

@@ -15,7 +15,7 @@
 //! wire types + identity prepend). It never leaks into omni-common or
 //! omni-core.
 //!
-//! Active baseline: Claude Code 2.1.228 (captured 2026-08-12). Single pin only
+//! Active baseline: Claude Code 2.1.232 (captured 2026-08-14). Single pin only
 //! (issue #12). No cch field on this pin; cch algorithms remain for vectors and
 //! future pins that reintroduce checksums.
 //!
@@ -316,7 +316,7 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// preceding whitespace fails. Only block-array form allows additional
 /// content; flat-string form must equal this sentence verbatim.
 pub const CLAUDE_CODE_SYSTEM_PREAMBLE: &str =
-    "You are Claude Code, Anthropic's official CLI for Claude.";
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
 /// Active-pin default beta list (default-model resolution to opus).
 pub const BETA_DEFAULT: &str = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11";
@@ -326,14 +326,8 @@ pub const BETA_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-t
 pub const BETA_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 /// Active-pin haiku beta list.
 pub const BETA_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,extended-cache-ttl-2025-04-11";
-/// Active-pin fable beta list.
-pub const BETA_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11";
 
 const MODEL_BETA_OVERRIDES: &[ModelBetaOverride] = &[
-    ModelBetaOverride {
-        model: "claude-fable-5",
-        beta_reply: BETA_FABLE,
-    },
     ModelBetaOverride {
         model: "claude-opus-5",
         beta_reply: BETA_OPUS,
@@ -357,14 +351,7 @@ const MODEL_BETA_OVERRIDES: &[ModelBetaOverride] = &[
 ];
 
 // Active-pin wire: opus-5 + sonnet-5 64k/no-temp/high; haiku 32k/no-temp/no-effort.
-// Fable row is in this pin's catalog; this capture did not send a fable request.
 const MODEL_WIRE_OVERRIDES: &[ModelWireOverride] = &[
-    ModelWireOverride {
-        model: "claude-fable-5",
-        max_tokens: 64_000,
-        temperature: None,
-        output_effort: Some("xhigh"),
-    },
     ModelWireOverride {
         model: "claude-opus-5",
         max_tokens: 64_000,
@@ -399,18 +386,18 @@ pub const WIRE_DEFAULTS: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.228-sdk-cli";
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.232-sdk-cli";
 
-// Captured 2026-08-12 against installed Claude Code 2.1.228 via the shared
+// Captured 2026-08-14 against installed Claude Code 2.1.232 via the shared
 // tools.capture framework (mitmproxy reverse proxy + real claude CLI, clean tmpfs
 // HOME), for default, explicit opus, sonnet, and haiku. This is the sole active
-// pin (issue #12). Catalog, per-model betas, and wire defaults match 2.1.221.
-// Drift vs 2.1.221: CLI version string, stainless package 0.112.1 (was 0.94.0),
-// and no x-client-request-id on the captured header set. No cch field.
-// Captured cc_version=2.1.228.a3a for prompt "Say OK".
-pub const PROFILE_CLAUDE_2_1_228_SDK_CLI: FingerprintProfile = FingerprintProfile {
+// pin (issue #12). Catalog drops fable; per-model betas and wire defaults match
+// 2.1.228. The short identity preamble now names the Claude Agent SDK. Header
+// versions and set remain unchanged apart from the CLI version string. No cch field.
+// Captured cc_version=2.1.232.1d9 for prompt "Say OK".
+pub const PROFILE_CLAUDE_2_1_232_SDK_CLI: FingerprintProfile = FingerprintProfile {
     name: DEFAULT_PROFILE_NAME,
-    claude_cli_version: "2.1.228",
+    claude_cli_version: "2.1.232",
     stainless_package_version: "0.112.1",
     stainless_runtime_version: "v26.3.0",
     entrypoint: "sdk-cli",
@@ -425,7 +412,7 @@ pub const PROFILE_CLAUDE_2_1_228_SDK_CLI: FingerprintProfile = FingerprintProfil
 };
 
 pub fn default_profile() -> &'static FingerprintProfile {
-    &PROFILE_CLAUDE_2_1_228_SDK_CLI
+    &PROFILE_CLAUDE_2_1_232_SDK_CLI
 }
 
 pub fn is_claude_code_billing_header(text: &str) -> bool {
@@ -547,7 +534,7 @@ fn build_headers_with_profile(
     insert(&mut h, "anthropic-dangerous-direct-browser-access", "true");
     insert(&mut h, "anthropic-version", ANTHROPIC_VERSION);
     insert(&mut h, "x-app", "cli");
-    // 2.1.228 capture no longer sends x-client-request-id.
+    // 2.1.232 capture does not send x-client-request-id.
 
     h
 }
@@ -861,7 +848,6 @@ mod tests {
         let profile = default_profile();
         let creds = fixture_creds();
         let cases = [
-            ("claude-fable-5", BETA_FABLE),
             ("claude-opus-5", BETA_OPUS),
             ("claude-sonnet-5", BETA_SONNET),
             ("claude-haiku-4-5", BETA_HAIKU),
@@ -886,7 +872,6 @@ mod tests {
         let profile = default_profile();
         let creds = fixture_creds();
         let cases = [
-            ("fable", BETA_FABLE, false),
             ("opus", BETA_OPUS, false),
             ("sonnet", BETA_SONNET, false),
             ("haiku", BETA_HAIKU, false),
@@ -1017,18 +1002,15 @@ mod tests {
         // WHY: issue #12 ships exactly one pin. These bytes are the gate: UA,
         // stainless, catalog ids, and per-model beta lists must match capture.
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.228-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.228");
+        assert_eq!(profile.name, "cc-2.1.232-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.232");
         assert_eq!(profile.stainless_package_version, "0.112.1");
         assert_eq!(profile.stainless_runtime_version, "v26.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.228 (external, sdk-cli)"
+            "claude-cli/2.1.232 (external, sdk-cli)"
         );
-        assert_eq!(
-            profile.resolve_model("fable").unwrap().canonical,
-            "claude-fable-5"
-        );
+        assert!(profile.resolve_model("fable").is_none());
         assert_eq!(
             profile.resolve_model("opus").unwrap().canonical,
             "claude-opus-5"
@@ -1075,7 +1057,7 @@ mod tests {
     #[test]
     fn billing_suffix_matches_claude_code_probe() {
         // Historical suffix vectors lock the algorithm across past versions.
-        // Active pin: 2.1.228 / "Say OK" -> a3a; header has no cch field.
+        // Active pin: 2.1.232 / "Say OK" -> 1d9; header has no cch field.
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.142"), "73b");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.150"), "5bd");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.154"), "cea");
@@ -1090,9 +1072,10 @@ mod tests {
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.220"), "01b");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.221"), "116");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.228"), "a3a");
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.232"), "1d9");
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.228.a3a; cc_entrypoint=sdk-cli;"
+            "x-anthropic-billing-header: cc_version=2.1.232.1d9; cc_entrypoint=sdk-cli;"
         );
         // Synthetic cch profile still emits sentinel form for rewrite tests.
         assert_eq!(
@@ -1220,7 +1203,7 @@ mod tests {
             .expect("snapshot body missing cch marker");
         let got = &cch_json[idx + marker.len()..idx + marker.len() + 5];
         assert_eq!(
-            got, "527d7",
+            got, "827ab",
             "cch rewrite snapshot changed (re-derive literal)"
         );
     }

@@ -1097,10 +1097,9 @@ mod tests {
     #[test]
     fn door2_client_output_config_effort_preserved_over_pin() {
         // WHY (issue #22): Door-2 must not strip client output_config for
-        // fingerprint fidelity. Client effort wins over capture pin default
-        // (Fable pin is xhigh; client low must reach the wire).
+        // fingerprint fidelity. Client effort wins over the Sonnet pin default.
         let body = serde_json::json!({
-            "model": "claude-fable-5",
+            "model": "claude-sonnet-5",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "Say OK"}],
             "output_config": {"effort": "low"}
@@ -1114,7 +1113,7 @@ mod tests {
                 .and_then(|o| o.get("effort"))
                 .and_then(|e| e.as_str()),
             Some("low"),
-            "client output_config.effort must win over Fable pin default xhigh"
+            "client output_config.effort must win over the Sonnet pin default"
         );
         // Also via reconcile (same prepare path guts).
         let body = serde_json::json!({
@@ -1161,7 +1160,7 @@ mod tests {
         );
 
         let body = serde_json::json!({
-            "model": "claude-fable-5",
+            "model": "claude-sonnet-5",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "Say OK"}]
         });
@@ -1175,8 +1174,8 @@ mod tests {
         .expect("reconcile ok");
         assert_eq!(
             req.output_config.as_ref().and_then(|o| o.effort.as_deref()),
-            Some("xhigh"),
-            "Fable pin default when client omitted output_config"
+            Some("high"),
+            "Sonnet pin default when client omitted output_config"
         );
 
         // Haiku pin has no output_effort: stay absent (do not invent).

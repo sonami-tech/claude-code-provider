@@ -60,7 +60,7 @@ const CONSERVATIVE_WINDOW_ID: &str = "00000000-0000-4000-8000-000000000000:0";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
-// Codex catalog from `codex debug models --bundled` on CLI 0.147.0 (2026-08-12).
+// Codex catalog from `codex debug models --bundled` on CLI 0.147.0 (2026-08-14).
 // Visibility=list slugs only: gpt-5.6-sol (default), gpt-5.6-terra,
 // gpt-5.6-luna, gpt-5.5, gpt-5.2. Hidden slugs stay out of the caller catalog.
 // `mini` / `gpt-mini` map to luna. If that listing cannot be read, rebaseline

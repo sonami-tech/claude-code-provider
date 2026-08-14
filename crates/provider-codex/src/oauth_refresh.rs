@@ -8,8 +8,7 @@
 //! `omni_common::oauth_refresh`). Static `OPENAI_API_KEY` entries are never
 //! refreshed.
 //!
-//! Wire contract: live capture codex 0.147.0 (2026-08-12) — see
-//! `/home/username/oauth-credential-renewal-handoff.md`.
+//! Wire contract: live refresh capture codex 0.147.0 (2026-08-12).
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};

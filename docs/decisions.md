@@ -287,8 +287,8 @@ pseudo-streaming.
   is often `high`, and CLI capture notes that reasoning cannot be disabled
   there (`docs/providers/grok/CAPTURE.md`).
 - Decision: explicit client effort still maps or fails loud per issue #20
-  (`low|medium|high`; aliases; `"none"` omits). Clients that need a specific
-  level must set it.
+  (`low|medium|high`, plus `xhigh` on `grok-4.6`; aliases; `"none"` omits).
+  Clients that need a specific level must set it.
 - Rationale: inventing a floor or a fake disable would fight the model default
   and invent wire that does not exist. Leave absent as absent; document the
   consequence.
