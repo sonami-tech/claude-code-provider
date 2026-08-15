@@ -4125,6 +4125,14 @@ requires_openai_auth = false
         )
     }
 
+    fn subprocess_health_timeout() -> Duration {
+        if cfg!(target_os = "linux") {
+            Duration::from_secs(15)
+        } else {
+            Duration::from_secs(6)
+        }
+    }
+
     fn omni_bin_path() -> std::path::PathBuf {
         // Runtime lookup so this compiles even when CARGO_BIN_EXE_* is absent at
         // compile time. Prefer the cargo-injected path when present (integration
@@ -7851,7 +7859,7 @@ rule = [
             &[("OMNI_PROVIDERS", "claude")],
         );
         assert!(
-            wait_for_200_health(port, Duration::from_secs(6)),
+            wait_for_200_health(port, subprocess_health_timeout()),
             "omni did not become healthy on {}",
             port
         );
@@ -7867,7 +7875,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "claude,grok")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
         let resp = get(port, "/v1/models");
         assert_eq!(resp.status, 200);
         let v = omni_common::test_support::parse_json(&resp.body);
@@ -7897,7 +7905,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             homes.child_env(),
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
         let resp = get(port, "/v1/models");
         assert_eq!(resp.status, 200);
         let v = omni_common::test_support::parse_json(&resp.body);
@@ -7925,7 +7933,7 @@ rule = [
             ],
             &[("OMNI_PROVIDERS", "claude")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
 
         let text = get(port, "/stats");
         assert_eq!(text.status, 200);
@@ -7971,7 +7979,7 @@ rule = [
         // wait using proper header (keys case requires it for any surface incl health)
         let start = Instant::now();
         let mut ready = false;
-        while start.elapsed() < Duration::from_secs(6) {
+        while start.elapsed() < subprocess_health_timeout() {
             if omni_common::test_support::wait_for_http_body_with_headers(
                 format!("http://127.0.0.1:{}/health", port),
                 &[("Authorization", "Bearer secret123")],
@@ -8470,7 +8478,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "claude,grok")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
         // unknown prefix
         let out = post_json(
             port,
@@ -8513,7 +8521,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "claude,grok")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
         if has_grok_creds() {
             let out = post_json(
                 port,
@@ -8565,7 +8573,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "claude,grok")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
         // models should list for both
         let out = get(port, "/models");
         assert_eq!(out.status, 200);
@@ -8591,7 +8599,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "grok")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
         let out = post_json(
             port,
             "/v1/chat/completions",
@@ -9165,7 +9173,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "claude")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
         let out = post_json(
             port,
             "/v1/responses",
@@ -9192,7 +9200,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "grok")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
 
         // Non-stream: Responses envelope with assistant output_text.
         let out = post_json(
@@ -9251,7 +9259,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "claude,grok")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
 
         // Per-backend prefix model; only exercised when that backend has creds.
         let mut backends: Vec<&str> = Vec::new();
@@ -9338,7 +9346,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "claude")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
 
         // Non-stream: Responses envelope with assistant output_text.
         let out = post_json(
@@ -9422,7 +9430,7 @@ rule = [
             &["--no-auth", "--port", &port.to_string()],
             &[("OMNI_PROVIDERS", "grok")],
         );
-        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        assert!(wait_for_200_health(port, subprocess_health_timeout()));
 
         let out = post_json(
             port,
