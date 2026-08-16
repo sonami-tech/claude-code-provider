@@ -87,6 +87,7 @@ Current allowlists:
 - Grok: `service_tier`, `search_parameters`, `response_format`,
   `parallel_tool_calls`, `seed`, `stop`, `n`, `tools`
 - Codex: `store`, `previous_response_id`, `metadata`,
-  `parallel_tool_calls`, `service_tier`, `response_format`, `text`
+  `parallel_tool_calls`, `service_tier`, `text`; chat `response_format` is
+  translated to Responses `text.format`
 - Claude OpenAI-compatible path: no provider extras passthrough
 - Claude native: closed Anthropic request allowlist only

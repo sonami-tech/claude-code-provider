@@ -41,7 +41,7 @@ Details and lossy fields: `docs/anthropic-compat.md`.
 | `previous_response_id` | No | No | Yes |
 | `metadata` passthrough | No | No | Yes |
 | `service_tier` passthrough | No | Yes | Yes |
-| `response_format` passthrough | No | Yes | Yes |
+| `response_format` passthrough | No | Yes | Translated |
 | `text.format` passthrough | No | No | Yes |
 | `parallel_tool_calls` passthrough | No | Yes | Yes |
 

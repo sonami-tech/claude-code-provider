@@ -1739,7 +1739,17 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
     if let Some(extras) = &req.provider_extras
         && let Some(obj) = extras.as_object()
     {
+        // Chat `response_format` is a Codex allowlist extra, but Responses
+        // rejects that key. Map it to `text.format` before the copy loop so it
+        // never lands on the upstream body (issue #32).
+        let mapped_format = match obj.get("response_format") {
+            Some(Value::Null) | None => None,
+            Some(value) => Some(map_chat_response_format(value)?),
+        };
         for (key, value) in obj {
+            if key == "response_format" {
+                continue;
+            }
             if !codex_extra_allowed(key) {
                 return Err(ProviderError::Other(anyhow::anyhow!(
                     "unsupported provider extra for codex: {key}"
@@ -1747,8 +1757,136 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
             }
             body[key] = value.clone();
         }
+        if let Some(format) = mapped_format {
+            apply_mapped_text_format(&mut body, format)?;
+        }
     }
     Ok(body)
+}
+
+/// Chat Completions `response_format` → Responses `text.format`.
+///
+/// `json_object` maps 1:1. `json_schema` unwraps the nested
+/// `json_schema.{name,schema}` object and keeps `description`/`strict` when
+/// present. Other shapes fail loud as a named 400.
+fn map_chat_response_format(value: &Value) -> Result<Value, ProviderError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ProviderError::BadRequest("response_format must be an object".into()))?;
+    let typ = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::BadRequest("response_format.type is required".into()))?;
+    match typ {
+        "text" => {
+            reject_unknown_keys(obj, &["type"], "response_format")?;
+            Ok(json!({ "type": "text" }))
+        }
+        "json_object" => {
+            reject_unknown_keys(obj, &["type"], "response_format")?;
+            Ok(json!({ "type": "json_object" }))
+        }
+        "json_schema" => {
+            reject_unknown_keys(obj, &["type", "json_schema"], "response_format")?;
+            let schema_obj = obj
+                .get("json_schema")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    ProviderError::BadRequest(
+                        "response_format.json_schema must be an object".into(),
+                    )
+                })?;
+            reject_unknown_keys(
+                schema_obj,
+                &["name", "schema", "description", "strict"],
+                "response_format.json_schema",
+            )?;
+            let name = schema_obj.get("name").ok_or_else(|| {
+                ProviderError::BadRequest("response_format.json_schema.name is required".into())
+            })?;
+            if !name.is_string() {
+                return Err(ProviderError::BadRequest(
+                    "response_format.json_schema.name must be a string".into(),
+                ));
+            }
+            let schema = schema_obj.get("schema").ok_or_else(|| {
+                ProviderError::BadRequest("response_format.json_schema.schema is required".into())
+            })?;
+            if !schema.is_object() {
+                return Err(ProviderError::BadRequest(
+                    "response_format.json_schema.schema must be an object".into(),
+                ));
+            }
+            let mut format = json!({
+                "type": "json_schema",
+                "name": name,
+                "schema": schema,
+            });
+            if let Some(description) = schema_obj
+                .get("description")
+                .filter(|value| !value.is_null())
+            {
+                if !description.is_string() {
+                    return Err(ProviderError::BadRequest(
+                        "response_format.json_schema.description must be a string".into(),
+                    ));
+                }
+                format["description"] = description.clone();
+            }
+            if let Some(strict) = schema_obj.get("strict").filter(|value| !value.is_null()) {
+                if !strict.is_boolean() {
+                    return Err(ProviderError::BadRequest(
+                        "response_format.json_schema.strict must be a boolean".into(),
+                    ));
+                }
+                format["strict"] = strict.clone();
+            }
+            Ok(format)
+        }
+        other => Err(ProviderError::BadRequest(format!(
+            "response_format type {other} is unmappable"
+        ))),
+    }
+}
+
+fn reject_unknown_keys(
+    obj: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    prefix: &str,
+) -> Result<(), ProviderError> {
+    if let Some(key) = obj.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(ProviderError::BadRequest(format!(
+            "{prefix} has unknown field {key}"
+        )));
+    }
+    Ok(())
+}
+
+/// Merge a mapped Chat `response_format` into Responses `text.format`.
+///
+/// Absent `text` creates `{format}`. Existing `text` without `format` keeps
+/// siblings such as `verbosity`. An equivalent `text.format` is accepted; any
+/// other value is a named 400.
+fn apply_mapped_text_format(body: &mut Value, format: Value) -> Result<(), ProviderError> {
+    if body.get("text").is_none() {
+        body["text"] = json!({ "format": format });
+        return Ok(());
+    }
+    let Some(text) = body.get("text").and_then(Value::as_object) else {
+        return Err(ProviderError::BadRequest(
+            "response_format cannot merge into non-object text".into(),
+        ));
+    };
+    if let Some(existing) = text.get("format") {
+        if existing == &format {
+            return Ok(());
+        }
+        return Err(ProviderError::BadRequest(
+            "response_format conflicts with text.format".into(),
+        ));
+    }
+    body["text"]["format"] = format;
+    Ok(())
 }
 
 /// Map canonical effort onto OpenAI Responses vocabulary used by Codex.
@@ -2691,8 +2829,13 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["store"], false);
         assert_eq!(body["previous_response_id"], "resp_1");
-        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert!(
+            body.get("response_format").is_none(),
+            "chat response_format must not be copied onto Responses: {body}"
+        );
         assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["name"], "out");
+        assert_eq!(body["text"]["format"]["schema"], json!({"type": "object"}));
     }
 
     #[test]
@@ -3154,6 +3297,230 @@ requires_openai_auth = false
         assert_eq!(content[1]["type"], "input_image");
         assert_eq!(content[1]["image_url"], "https://example.com/a.png");
         assert_eq!(content[2]["image_url"], "data:image/png;base64,abcd");
+    }
+
+    fn chat_req_with_extras(extras: Value) -> CanonicalRequest {
+        CanonicalRequest {
+            model: "gpt-5.5".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            provider_extras: Some(extras),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn response_format_text_maps_to_text_format() {
+        // WHY (issue #32): Chat type=text maps 1:1 onto Responses text.format.
+        let body = codex_responses_body(
+            &chat_req_with_extras(json!({
+                "response_format": {"type": "text"}
+            })),
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["text"]["format"]["type"], "text");
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn response_format_json_object_maps_to_text_format() {
+        // WHY (issue #32): Chat json_object must become Responses text.format
+        // and must not appear as a top-level Responses key.
+        let body = codex_responses_body(
+            &chat_req_with_extras(json!({
+                "response_format": {"type": "json_object"}
+            })),
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["text"]["format"]["type"], "json_object");
+        assert!(
+            body.get("response_format").is_none(),
+            "response_format must not remain on the Responses body: {body}"
+        );
+    }
+
+    #[test]
+    fn response_format_json_schema_unwraps_to_flat_text_format() {
+        // WHY (issue #32): Chat nests name/schema/description/strict under
+        // json_schema; Responses text.format is flat.
+        let body = codex_responses_body(
+            &chat_req_with_extras(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "out",
+                        "schema": {"type": "object", "properties": {"n": {"type": "integer"}}},
+                        "description": "an answer",
+                        "strict": true
+                    }
+                }
+            })),
+            false,
+        )
+        .unwrap();
+        let format = &body["text"]["format"];
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["name"], "out");
+        assert_eq!(
+            format["schema"],
+            json!({"type": "object", "properties": {"n": {"type": "integer"}}})
+        );
+        assert_eq!(format["description"], "an answer");
+        assert_eq!(format["strict"], true);
+        assert!(
+            format.get("json_schema").is_none(),
+            "Responses format must be flat, not nested under json_schema: {format}"
+        );
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn response_format_null_optional_schema_fields_are_omitted() {
+        // WHY (issue #32): Chat/Responses allow description/strict to be null;
+        // treat null as absent instead of a named 400.
+        let body = codex_responses_body(
+            &chat_req_with_extras(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "out",
+                        "schema": {"type": "object"},
+                        "description": null,
+                        "strict": null
+                    }
+                }
+            })),
+            false,
+        )
+        .unwrap();
+        let format = &body["text"]["format"];
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["name"], "out");
+        assert!(format.get("description").is_none());
+        assert!(format.get("strict").is_none());
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn response_format_null_is_treated_as_absent() {
+        // WHY (issue #32): JSON null means the extra is absent. Do not invent
+        // text.format and do not copy the Chat key onto Responses.
+        let body = codex_responses_body(
+            &chat_req_with_extras(json!({
+                "store": false,
+                "response_format": null
+            })),
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["store"], false);
+        assert!(body.get("response_format").is_none());
+        assert!(body.get("text").is_none());
+    }
+
+    #[test]
+    fn inbound_text_only_is_unchanged() {
+        // WHY (issue #32): Responses clients already send text; mapping must
+        // not invent or rewrite format when response_format is absent.
+        let text = json!({"format": {"type": "json_object"}, "verbosity": "low"});
+        let body =
+            codex_responses_body(&chat_req_with_extras(json!({ "text": text })), false).unwrap();
+        assert_eq!(body["text"], text);
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn response_format_merges_with_text_verbosity() {
+        // WHY (issue #32): existing text siblings such as verbosity stay when
+        // response_format supplies the missing format.
+        let body = codex_responses_body(
+            &chat_req_with_extras(json!({
+                "response_format": {"type": "json_object"},
+                "text": {"verbosity": "high"}
+            })),
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["text"]["verbosity"], "high");
+        assert_eq!(body["text"]["format"]["type"], "json_object");
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn equivalent_response_format_and_text_format_are_accepted() {
+        // WHY (issue #32): dual fields with the same structured-output intent
+        // must succeed; only the Responses name remains.
+        let body = codex_responses_body(
+            &chat_req_with_extras(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "out", "schema": {"type": "object"}}
+                },
+                "text": {"format": {"type": "json_schema", "name": "out", "schema": {"type": "object"}}}
+            })),
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["name"], "out");
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn conflicting_response_format_and_text_format_fails_loud() {
+        // WHY (issue #32): conflicting structured-output fields must not pick
+        // a winner; named HTTP 400.
+        let err = codex_responses_body(
+            &chat_req_with_extras(json!({
+                "response_format": {"type": "json_object"},
+                "text": {"format": {"type": "json_schema", "name": "out", "schema": {"type": "object"}}}
+            })),
+            false,
+        )
+        .expect_err("conflicting structured output must fail loud");
+        match err {
+            ProviderError::BadRequest(msg) => {
+                assert!(
+                    msg.contains("response_format") && msg.contains("text.format"),
+                    "conflict error must name both fields: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_response_format_fails_loud() {
+        // WHY (issue #32): unmappable or malformed Chat shapes must 400 with
+        // a named error instead of copying the Chat key upstream.
+        let cases = [
+            json!("json_object"),
+            json!({"type": "json_schema"}),
+            json!({"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}),
+            json!({"type": "json_schema", "json_schema": {"name": 1, "schema": {"type": "object"}}}),
+            json!({"type": "json_object", "extra": true}),
+            json!({"type": "xml"}),
+        ];
+        for value in cases {
+            let err = codex_responses_body(
+                &chat_req_with_extras(json!({ "response_format": value })),
+                false,
+            )
+            .expect_err("malformed response_format must fail loud");
+            match err {
+                ProviderError::BadRequest(msg) => {
+                    assert!(
+                        msg.contains("response_format"),
+                        "malformed error must name response_format: {msg}"
+                    );
+                }
+                other => panic!("expected BadRequest, got {other:?}"),
+            }
+        }
     }
 
     #[test]

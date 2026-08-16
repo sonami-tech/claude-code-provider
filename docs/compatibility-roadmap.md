@@ -12,7 +12,7 @@ Last updated: 2026-06-16.
 | 0. Baseline | Done | Compatibility gaps are documented in `docs/compatibility-gaps.md`; this roadmap now tracks the active go-forward phases. |
 | 1. Extras Contract | Done | Unsupported provider extras now fail loudly, supported extras forward by provider allowlist, and docs list allowlists. |
 | 2. Multimodal Request Core | Done | Image URL and base64 image inputs are canonicalized and mapped to Claude, Grok, and Codex. |
-| 3. Responses API V1 Expansion | Done | Codex forwards state, metadata, service tier, response format, and text format; unsupported provider extras still fail loudly. |
+| 3. Responses API V1 Expansion | Done | Codex forwards state, metadata, service tier, and text format; chat response format is translated to `text.format`; unsupported provider extras still fail loudly. |
 | 4. Rich Output Preservation | Done | Usage details, provider metadata, annotations, response metadata, and non-stream Claude reasoning blocks are additive canonical fields. |
 | 5. Compatibility Matrix | Done | `docs/compatibility-matrix.md` tracks supported request, Responses, and rich-output behavior. |
 
@@ -104,7 +104,8 @@ Done when:
 - Responses streaming and non-streaming tests cover new fields.
 
 Result: Codex forwards `previous_response_id`, `metadata`, `service_tier`,
-`response_format`, `text`, and `parallel_tool_calls`. Grok continues to forward
+`text`, and `parallel_tool_calls`. Chat `response_format` is translated to
+Responses `text.format`. Grok continues to forward
 its chat-compatible extras such as `service_tier`, `response_format`, and
 `parallel_tool_calls`; Responses-native state fields remain unsupported for
 Grok. Claude OpenAI-compatible provider extras remain unsupported.

@@ -8703,6 +8703,60 @@ rule = [
     }
 
     #[tokio::test]
+    async fn test_chat_codex_accepts_response_format_extra() {
+        // WHY (issue #32): chat response_format must pass the Codex extras
+        // allowlist so the adapter can translate it. A gateway 400 here would
+        // block mapping in codex_responses_body.
+        use async_trait::async_trait;
+        struct StubOk;
+        #[async_trait]
+        impl LlmProvider for StubOk {
+            fn id(&self) -> &'static str {
+                "codex"
+            }
+            async fn send(
+                &self,
+                req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                assert_eq!(
+                    req.provider_extras
+                        .as_ref()
+                        .and_then(|extras| extras.get("response_format"))
+                        .and_then(|value| value.get("type"))
+                        .and_then(|value| value.as_str()),
+                    Some("json_object"),
+                    "edge must deliver response_format to the Codex adapter"
+                );
+                Ok(CanonicalResponse {
+                    model: req.model,
+                    content: "ok".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: Default::default(),
+                    id: None,
+                    refusal: None,
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut entry = codex_entry();
+        entry.provider = Arc::new(StubOk);
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("codex".into(), entry);
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"codex:gpt-5.5","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        call_chat_handler(state_with(map), req)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("Codex must accept chat response_format at the edge: {e:?}")
+            });
+    }
+
+    #[tokio::test]
     async fn test_chat_provider_extras_reject_for_unsupported_provider() {
         // WHY: OpenAI-compatible top-level provider extras must not disappear
         // when the selected provider cannot forward them. The handler should
