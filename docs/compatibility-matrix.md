@@ -1,6 +1,6 @@
 # Compatibility Matrix
 
-Last updated: 2026-07-12.
+Last updated: 2026-08-24.
 
 Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 `OMNI_LIVE_TESTS=1`.
@@ -10,6 +10,7 @@ Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 | Feature | Chat Completions | Responses | Claude | Grok | Codex |
 |---|---:|---:|---:|---:|---:|
 | Text messages | Yes | Yes | Yes | Yes | Yes |
+| `prompt_cache_key` | Yes | Yes | Ignored on Claude wire | Yes (Responses body; Chat currently `x-grok-conv-id`, go-forward body key) | Yes |
 | Function tools | Yes | Yes | Yes | Yes | Yes |
 | Tool result loops | Yes | Yes | Yes | Yes | Yes |
 | Image URL input | Yes | Yes | Yes | Yes | Yes |
@@ -31,8 +32,10 @@ Unsupported typed media parts fail loudly with a request error.
 | Hosted/computer tools | Passthrough | No (400) | No (400) |
 | `count_tokens` | Yes | No (400) | No (400) |
 | Fingerprint / cch | Yes | No | No |
+| `prompt_cache_key` | Ignored (not Anthropic) | Lifted today (interim; go-forward reject) | Lifted today (interim; go-forward reject) |
 
 Details and lossy fields: `docs/anthropic-compat.md`.
+Go-forward cache translation: `docs/cache-translation.md`.
 
 ## Responses Fields
 

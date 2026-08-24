@@ -53,7 +53,8 @@ thinking is never emitted on Grok/Codex Anthropic SSE/JSON.
 |---|---|
 | User text interleaved with `tool_result` in one user message | All tool results first, then trailing text/images (OAI adjacency) |
 | `top_k` | Dropped |
-| `cache_control` | Dropped |
+| `cache_control` | Dropped today. Go-forward: translate per [`cache-translation.md`](cache-translation.md). |
+| `prompt_cache_key` | Lifted today (interim). Go-forward: reject on Anthropic inbound (not an Anthropic field). |
 | `stop_sequences` | Grok → extras `stop`; Codex dropped. Response always `stop_sequence: null` |
 | Mid-conversation `role: "system"` | 400 |
 | Trailing assistant prefill | 400 |

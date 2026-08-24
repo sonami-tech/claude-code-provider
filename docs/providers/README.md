@@ -78,9 +78,15 @@ spend quota and fail on provider rate limits, account state, or model access.
 ## Provider Extras
 
 OpenAI-compatible inbound surfaces preserve top-level extension fields as
-provider extras, except gateway metadata such as `user`. The selected provider
-validates extras against its allowlist before dispatch. Unsupported extras fail
-loudly with a request error.
+provider extras, except gateway metadata such as `user`. `prompt_cache_key` is
+not an extra: Chat Completions, Responses, and translated Anthropic lift it
+onto `CanonicalRequest` (interim). Grok CLI / Codex send it as Responses
+`prompt_cache_key`; Grok custom Chat Completions currently send
+`x-grok-conv-id`. Claude ignores it (native `cache_control` / auto-cache).
+Go-forward: [`docs/cache-translation.md`](../cache-translation.md).
+
+The selected provider validates remaining extras against its allowlist before
+dispatch. Unsupported extras fail loudly with a request error.
 
 Current allowlists:
 

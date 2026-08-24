@@ -32,7 +32,8 @@ are internal only).
    exceptions, not a license to strip intent.
 
 Design narrative: [`DESIGN.md`](DESIGN.md). Decision record:
-[`decisions.md`](decisions.md).
+[`decisions.md`](decisions.md). Prompt-cache translation (working spec, not
+yet fully implemented): [`cache-translation.md`](cache-translation.md).
 
 ## Binary
 

@@ -112,6 +112,32 @@
 - Server concerns: auth, stats, bind/public flags, route registration, and model
   routing stay in `omni`.
 
+## Prompt cache translation (working)
+
+- Decision: internal cache intent plus block/tool marks. Clients keep official
+  inbound fields. Providers receive official outbound fields. See
+  `docs/cache-translation.md`.
+- Decision: compatibility wins for TTL and cache mode. Do not 400 the request
+  when those cannot be copied exactly.
+- Decision: TTL clamp-down. Pick the longest official backend value that is
+  ≤ the requested duration. Do not round up. Do not reset to the backend
+  default when a longer-but-still-≤ value exists. If nothing is ≤ the
+  request, omit TTL and use the backend native/default cache. Grok has no
+  TTL; drop it.
+- Decision: inbound Chat accepts `x-grok-conv-id` and maps it to routing
+  identity. Body `prompt_cache_key` wins if both are present. Outbound never
+  emits the header; Grok Chat and Responses both send body `prompt_cache_key`.
+- Decision: Claude slot cap. At most 4 Anthropic cache slots including
+  automatic. Keep the last 4 marks; drop extras; do not 400.
+- Decision: OpenAI `mode: explicit` with no breakpoints, routed to Claude:
+  do not inject gateway auto-cache.
+- Decision: invalid values on the inbound dialect itself are 400. Clamp-down
+  is only for legal inbound values the chosen backend cannot copy.
+- Non-goals until that file is implemented: treating
+  `CanonicalRequest.prompt_cache_key` as the final shape (interim lift only).
+- Source of truth: `docs/cache-translation.md` (working spec), provider cache
+  docs (field names and enums).
+
 ## Current Surfaces
 
 - OpenAI Chat Completions: `/v1/chat/completions`
