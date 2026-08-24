@@ -1736,6 +1736,14 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
             CanonicalToolChoice::Specific { name } => json!({"type": "function", "name": name}),
         };
     }
+    if let Some(key) = req
+        .prompt_cache_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        body["prompt_cache_key"] = json!(key);
+    }
     if let Some(extras) = &req.provider_extras
         && let Some(obj) = extras.as_object()
     {
@@ -2814,6 +2822,7 @@ query_params = { api-version = "2026-01-01" }
                 budget_tokens: None,
             }),
             metadata: Default::default(),
+            prompt_cache_key: Some("sess-1".into()),
             provider_extras: Some(json!({
                 "store": false,
                 "previous_response_id": "resp_1",
@@ -2827,6 +2836,7 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(body["tools"][0]["name"], "lookup");
         assert_eq!(body["tool_choice"]["name"], "lookup");
         assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["prompt_cache_key"], "sess-1");
         assert_eq!(body["store"], false);
         assert_eq!(body["previous_response_id"], "resp_1");
         assert!(
@@ -5390,6 +5400,102 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 name: None,
                 arguments_delta: "{}".into(),
             }
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn codex_prompt_cache_key_reads_across_turns_live() {
+        // Live opt-in: two turns with the same prompt_cache_key and a stable
+        // prefix. Codex reports cached_tokens as cache_read on a hit. Model is
+        // whatever the installed Codex config currently uses.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if !omni_common::test_support::live_tests_enabled() {
+            eprintln!(
+                "skipping codex_prompt_cache_key_reads_across_turns_live: set OMNI_LIVE_TESTS=1"
+            );
+            return;
+        }
+        if !CodexProvider::detected() {
+            eprintln!(
+                "skipping codex_prompt_cache_key_reads_across_turns_live: Codex not detected"
+            );
+            return;
+        }
+        let p = match CodexProvider::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "skipping codex_prompt_cache_key_reads_across_turns_live: ctor failed: {e}"
+                );
+                return;
+            }
+        };
+        let model = match p.current_model() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "skipping codex_prompt_cache_key_reads_across_turns_live: no current model: {e}"
+                );
+                return;
+            }
+        };
+        let cache_key = Some("omni-live-codex-cache".to_string());
+        let big_context = format!(
+            "You are reviewing the following reference material. \
+             Answer only from it. Reference block repeated for length:\n{}",
+            "The quick brown fox jumps over the lazy dog near the riverbank. ".repeat(600)
+        );
+
+        let turn1 = CanonicalRequest {
+            model: model.clone(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text(big_context.clone()),
+            }],
+            prompt_cache_key: cache_key.clone(),
+            max_tokens: Some(16),
+            ..Default::default()
+        };
+        let r1 = p
+            .send(turn1)
+            .await
+            .expect("turn 1 send must succeed with creds");
+        let assistant_reply = if r1.content.is_empty() {
+            "Understood.".to_string()
+        } else {
+            r1.content.clone()
+        };
+        let turn2 = CanonicalRequest {
+            model,
+            messages: vec![
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text(big_context),
+                },
+                CanonicalMessage {
+                    role: "assistant".into(),
+                    content: CanonicalContent::Text(assistant_reply),
+                },
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("Reply with one word: ok".into()),
+                },
+            ],
+            prompt_cache_key: cache_key,
+            max_tokens: Some(16),
+            ..Default::default()
+        };
+        let r2 = p
+            .send(turn2)
+            .await
+            .expect("turn 2 send must succeed with creds");
+        assert!(
+            r2.usage.cache_read > 0,
+            "turn 2 must READ Codex prompt cache (prompt_cache_key routing + stable prefix); \
+             got read={} input={}",
+            r2.usage.cache_read,
+            r2.usage.input_tokens
         );
     }
 }

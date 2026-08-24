@@ -365,7 +365,11 @@ fn chat_reasoning_and_extras(
     let mut filtered = Map::new();
     for (key, value) in obj {
         let k = key.as_str();
-        if gateway_only_extra_keys().contains(&k) || k == "reasoning_effort" || k == "reasoning" {
+        if gateway_only_extra_keys().contains(&k)
+            || k == "reasoning_effort"
+            || k == "reasoning"
+            || k == "prompt_cache_key"
+        {
             continue;
         }
         filtered.insert(key.clone(), value.clone());
@@ -381,6 +385,25 @@ fn chat_reasoning_and_extras(
     };
 
     Ok((reasoning, provider_extras))
+}
+
+/// Lift `prompt_cache_key` from a JSON value (flattened extras or a body key).
+///
+/// Empty / whitespace / JSON null is absent. A non-string is a 400: this is a
+/// routing identity, not a silent drop.
+pub(crate) fn parse_prompt_cache_key(value: Option<&Value>) -> Result<Option<String>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err("prompt_cache_key must be a string".into()),
+    }
 }
 
 /// Convert an OpenAI request into a `CanonicalRequest`. The `model` field is the
@@ -442,6 +465,7 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
     };
 
     let (reasoning, provider_extras) = chat_reasoning_and_extras(&req.extras)?;
+    let prompt_cache_key = parse_prompt_cache_key(req.extras.get("prompt_cache_key"))?;
 
     Ok(CanonicalRequest {
         model: req.model.clone(),
@@ -454,6 +478,7 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
         top_p: req.top_p,
         reasoning,
         metadata: Default::default(),
+        prompt_cache_key,
         provider_extras,
     })
 }
@@ -924,6 +949,53 @@ mod tests {
             .expect("provider extras should be preserved");
         assert_eq!(extras["response_format"]["type"], "json_object");
         assert!(extras.get("user").is_none());
+    }
+
+    #[test]
+    fn to_canonical_lifts_prompt_cache_key_out_of_extras() {
+        // WHY: prompt_cache_key is a cache-routing identity, not a provider extra.
+        // Leaving it in extras 400s every current extras allowlist (Claude has
+        // none; Grok/Codex lists omit it). It must become CanonicalRequest.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "prompt_cache_key":"sess-1","response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).expect("chat request should convert");
+        assert_eq!(canon.prompt_cache_key.as_deref(), Some("sess-1"));
+        let extras = canon
+            .provider_extras
+            .expect("unrelated extras should remain");
+        assert_eq!(extras["response_format"]["type"], "json_object");
+        assert!(
+            extras.get("prompt_cache_key").is_none(),
+            "prompt_cache_key must not become a provider extra: {extras}"
+        );
+    }
+
+    #[test]
+    fn to_canonical_rejects_non_string_prompt_cache_key() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "prompt_cache_key":{"id":"sess-1"}}"#,
+        )
+        .unwrap();
+        let err = to_canonical(&req).expect_err("non-string prompt_cache_key must 400");
+        assert!(
+            err.contains("prompt_cache_key must be a string"),
+            "error must name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn to_canonical_empty_prompt_cache_key_is_absent() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "prompt_cache_key":"  "}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).expect("whitespace key is absent, not an error");
+        assert!(canon.prompt_cache_key.is_none());
     }
 
     #[test]

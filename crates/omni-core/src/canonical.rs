@@ -15,6 +15,12 @@ pub struct CanonicalRequest {
     pub top_p: Option<f32>,
     pub reasoning: Option<CanonicalReasoning>,
     pub metadata: HashMap<String, String>,
+    /// Cache-routing identity. OpenAI Chat Completions and Responses call this
+    /// `prompt_cache_key`. Grok Chat Completions sends it as `x-grok-conv-id`;
+    /// Grok CLI / Codex Responses send the body field. Claude does not use a
+    /// routing key (block `cache_control` / auto-cache instead) and ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
     // provider_extras for things like search_parameters, service_tier (passed through adapters)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_extras: Option<serde_json::Value>,
@@ -337,6 +343,7 @@ mod tests {
                 budget_tokens: None,
             }),
             metadata: [("k".into(), "v".into())].into(),
+            prompt_cache_key: Some("cache-k".into()),
             provider_extras: None,
         }
     }
@@ -352,6 +359,7 @@ mod tests {
             back.reasoning.as_ref().unwrap().effort.as_deref(),
             Some("low")
         );
+        assert_eq!(back.prompt_cache_key.as_deref(), Some("cache-k"));
     }
 
     #[test]
@@ -494,6 +502,7 @@ mod tests {
                 budget_tokens: Some(20000),
             }),
             metadata: [("trace".into(), "abc123".into())].into(),
+            prompt_cache_key: Some("sess-1".into()),
             provider_extras: Some(
                 serde_json::json!({"service_tier":"priority","search_parameters":{}}),
             ),
@@ -697,6 +706,7 @@ mod tests {
             top_p: None,
             reasoning: None,
             metadata: Default::default(),
+            prompt_cache_key: None,
             provider_extras: None,
         };
         let rg = g.send(base.clone()).await.unwrap();

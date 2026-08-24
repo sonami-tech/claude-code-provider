@@ -24,4 +24,5 @@ tracing.workspace = true
 dirs = "6"
 
 [dev-dependencies]
+omni-common = { path = "../omni-common", features = ["test-support"] }
 wiremock = "0.6.5"

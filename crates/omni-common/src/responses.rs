@@ -27,7 +27,9 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
-use crate::http::{gateway_only_extra_keys, validate_reasoning_effort_lexical};
+use crate::http::{
+    gateway_only_extra_keys, parse_prompt_cache_key, validate_reasoning_effort_lexical,
+};
 
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
@@ -385,10 +387,13 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         }
     };
 
+    let prompt_cache_key = parse_prompt_cache_key(req.extras.get("prompt_cache_key"))?;
     let provider_extras = req.extras.as_object().and_then(|extras| {
         let filtered = extras
             .iter()
-            .filter(|(key, _)| !gateway_only_extra_keys().contains(&key.as_str()))
+            .filter(|(key, _)| {
+                !gateway_only_extra_keys().contains(&key.as_str()) && *key != "prompt_cache_key"
+            })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<serde_json::Map<_, _>>();
         if filtered.is_empty() {
@@ -408,6 +413,7 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         top_p: req.top_p,
         reasoning,
         metadata: Default::default(),
+        prompt_cache_key,
         provider_extras,
     })
 }
@@ -1693,6 +1699,34 @@ mod tests {
         assert_eq!(extras["parallel_tool_calls"], true);
         assert_eq!(extras["service_tier"], "priority");
         assert!(extras.get("user").is_none());
+    }
+
+    #[test]
+    fn to_canonical_lifts_prompt_cache_key_out_of_extras() {
+        // WHY: prompt_cache_key is the OpenAI/xAI cache-routing identity. If it
+        // stays in extras, Codex/Grok allowlists 400 it and Claude rejects all
+        // extras. Lift it onto CanonicalRequest instead.
+        let req = parse(r#"{"model":"m","input":"q","prompt_cache_key":"sess-1","store":false}"#);
+        let canon = responses_to_canonical(&req).unwrap();
+        assert_eq!(canon.prompt_cache_key.as_deref(), Some("sess-1"));
+        let extras = canon
+            .provider_extras
+            .expect("unrelated extras should remain");
+        assert_eq!(extras["store"], false);
+        assert!(
+            extras.get("prompt_cache_key").is_none(),
+            "prompt_cache_key must not become a provider extra: {extras}"
+        );
+    }
+
+    #[test]
+    fn to_canonical_rejects_non_string_prompt_cache_key() {
+        let req = parse(r#"{"model":"m","input":"q","prompt_cache_key":1}"#);
+        let err = responses_to_canonical(&req).expect_err("non-string key must 400");
+        assert!(
+            err.contains("prompt_cache_key must be a string"),
+            "error must name the field: {err}"
+        );
     }
 
     #[test]

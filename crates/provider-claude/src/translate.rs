@@ -1992,6 +1992,32 @@ mod tests {
     }
 
     #[test]
+    fn build_messages_ignores_prompt_cache_key_and_does_not_emit_it() {
+        // WHY: Claude has no cache-routing key. A Chat/Responses client that
+        // sends prompt_cache_key must not 400 (that used to happen when the
+        // field sat in extras). The Anthropic wire must not grow an unknown
+        // top-level key either.
+        let canon = CanonicalRequest {
+            model: "sonnet".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            prompt_cache_key: Some("sess-1".into()),
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let model_def = profile.resolve_model("sonnet");
+        let anth = build_messages_request_from_canonical(&canon, model_def, &empty_repl())
+            .expect("prompt_cache_key is not a provider extra");
+        let val = serde_json::to_value(&anth).expect("serialize");
+        assert!(
+            val.get("prompt_cache_key").is_none(),
+            "Claude Anthropic body must not carry prompt_cache_key: {val}"
+        );
+    }
+
+    #[test]
     fn build_canonical_response_maps_raw_usage_with_cache_and_tool_calls() {
         // Usage raw (incl cache_*) + tool_calls from anth must round to canon;
         // finish "tool_use" -> "tool_calls".

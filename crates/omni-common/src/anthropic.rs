@@ -19,6 +19,8 @@ use omni_core::{
     CanonicalToolChoice, CanonicalUsage,
 };
 
+use crate::http::parse_prompt_cache_key;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -282,6 +284,12 @@ pub fn anthropic_to_canonical(
     // provider extras: stop_sequences, parallel_tool_calls
     let provider_extras = build_provider_extras(body, provider_id);
 
+    // Non-Anthropic routing identity: OpenAI/xAI `prompt_cache_key`. Claude
+    // native passthrough never uses this mapper. cache_control stays dropped
+    // (documented lossy; Grok/Codex have prefix cache, not breakpoints).
+    let prompt_cache_key =
+        parse_prompt_cache_key(body.get("prompt_cache_key")).map_err(AnthropicMapError::new)?;
+
     // stream is handler control only — not placed in canonical
 
     Ok(CanonicalRequest {
@@ -294,6 +302,7 @@ pub fn anthropic_to_canonical(
         top_p,
         reasoning,
         metadata,
+        prompt_cache_key,
         provider_extras,
     })
 }
@@ -1759,6 +1768,48 @@ mod tests {
             err.0.contains("missing tool_result") || err.0.contains("t1"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn prompt_cache_key_lifts_and_cache_control_stays_dropped() {
+        // WHY: translated Anthropic has no native cache-routing field. Clients
+        // targeting Grok/Codex can send OpenAI's prompt_cache_key; it must not
+        // be ignored as an unknown top-level key. cache_control breakpoints
+        // still have no Grok/Codex equivalent and stay documented-lossy.
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "prompt_cache_key": "sess-1",
+            "system": [{
+                "type": "text",
+                "text": "stable prefix",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "u"}]
+        });
+        let canon = anthropic_to_canonical(&body, "grok").unwrap();
+        assert_eq!(canon.prompt_cache_key.as_deref(), Some("sess-1"));
+        assert!(
+            canon.provider_extras.is_none(),
+            "cache_control must not become a provider extra: {:?}",
+            canon.provider_extras
+        );
+        match &canon.messages[0].content {
+            CanonicalContent::Text(t) => assert_eq!(t, "stable prefix"),
+            other => panic!("system must collapse to text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_cache_key_rejects_non_string() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "prompt_cache_key": ["sess-1"],
+            "messages": [{"role": "user", "content": "u"}]
+        });
+        let err = anthropic_to_canonical(&body, "codex").unwrap_err();
+        assert!(err.0.contains("prompt_cache_key must be a string"), "{err}");
     }
 
     #[test]

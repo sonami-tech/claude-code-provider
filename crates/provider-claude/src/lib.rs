@@ -1066,14 +1066,11 @@ mod tests {
         //     so requiring cache_creation > 0 on Turn 1 simultaneously proves we
         //     cleared the floor (#2) and that the marker is live. Padding is
         //     deterministic (fixed string), so no clock/nonce leaks into the prefix.
-        //   - Model choice: Haiku 4.5 (claude-haiku-4-5-20251001), the current
-        //     catalog's canonical Haiku. NOT Sonnet: the active 2.1.207 profile's
-        //     wire override injects output_config.effort="high" for opus/sonnet/fable,
-        //     and the live Anthropic API rejects `effort` on the current Sonnet
-        //     (claude-sonnet-4-6) with a 400 ("This model does not support the effort
-        //     parameter"). Haiku's wire override sets output_effort=None, so its
-        //     request is valid. (The stale effort injection on the Opus/Sonnet
-        //     overrides is a separate issue, out of scope here.)
+        //   - Model: catalog alias `haiku` (not a dated id). NOT Sonnet: the
+        //     active profile's wire override injects output_config.effort="high"
+        //     for opus/sonnet/fable, and the live Anthropic API rejects `effort`
+        //     on current Sonnet with a 400. Haiku's wire override sets
+        //     output_effort=None, so its request is valid.
         //
         // Guarded exactly like claude_send_exercises_full_fingerprint_path: opt-in
         // via OMNI_LIVE_TESTS=1, real creds required, CLAUDE_CREDENTIALS_PATH
@@ -1120,14 +1117,16 @@ mod tests {
         );
 
         let p = ClaudeProvider::new().expect("ctor");
+        let cache_key = Some("omni-live-claude-cache".to_string());
 
         // ---- Turn 1: single user message carrying the big shared context. ----
         let turn1 = CanonicalRequest {
-            model: "claude-haiku-4-5-20251001".into(),
+            model: "haiku".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text(big_context.clone()),
             }],
+            prompt_cache_key: cache_key.clone(),
             ..Default::default()
         };
         let r1 = p
@@ -1160,7 +1159,7 @@ mod tests {
             r1.content.clone()
         };
         let turn2 = CanonicalRequest {
-            model: "claude-haiku-4-5-20251001".into(),
+            model: "haiku".into(),
             messages: vec![
                 CanonicalMessage {
                     role: "user".into(),
@@ -1175,6 +1174,7 @@ mod tests {
                     content: CanonicalContent::Text("Briefly, what did I ask you to do?".into()),
                 },
             ],
+            prompt_cache_key: cache_key,
             ..Default::default()
         };
         let r2 = p

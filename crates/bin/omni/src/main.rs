@@ -8703,6 +8703,86 @@ rule = [
     }
 
     #[tokio::test]
+    async fn test_chat_prompt_cache_key_not_rejected_as_extra_for_all_providers() {
+        // WHY: prompt_cache_key used to land in extras and 400 on every
+        // allowlist. It must reach the provider as CanonicalRequest, not extra.
+        use async_trait::async_trait;
+        struct StubOk {
+            id: &'static str,
+        }
+        #[async_trait]
+        impl LlmProvider for StubOk {
+            fn id(&self) -> &'static str {
+                self.id
+            }
+            async fn send(
+                &self,
+                req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                assert_eq!(
+                    req.prompt_cache_key.as_deref(),
+                    Some("sess-1"),
+                    "chat prompt_cache_key must reach provider as a canonical field"
+                );
+                if let Some(extras) = &req.provider_extras {
+                    assert!(
+                        extras.get("prompt_cache_key").is_none(),
+                        "prompt_cache_key must not be in provider_extras: {extras}"
+                    );
+                }
+                Ok(CanonicalResponse {
+                    model: req.model,
+                    content: "ok".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: Default::default(),
+                    id: None,
+                    refusal: None,
+                    ..Default::default()
+                })
+            }
+        }
+
+        fn stub_entry(base: ProviderEntry, id: &'static str) -> ProviderEntry {
+            ProviderEntry {
+                provider: Arc::new(StubOk { id }),
+                anthropic_native: None,
+                models: base.models,
+                catalog: base.catalog,
+                extras_allowed: base.extras_allowed,
+            }
+        }
+
+        let cases: [(&str, ProviderEntry, &str); 3] = [
+            (
+                "grok",
+                stub_entry(grok_entry("http://127.0.0.1:1"), "grok"),
+                "grok:grok-4.3",
+            ),
+            (
+                "claude",
+                stub_entry(claude_entry(), "claude"),
+                "claude:sonnet",
+            ),
+            ("codex", stub_entry(codex_entry(), "codex"), "codex:gpt-5.5"),
+        ];
+
+        for (name, entry, model) in cases {
+            let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+            map.insert(name.into(), entry);
+            let state = state_with(map);
+            let req: ChatCompletionRequest = serde_json::from_str(&format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],
+                    "prompt_cache_key":"sess-1"}}"#
+            ))
+            .unwrap();
+            call_chat_handler(state, req).await.unwrap_or_else(|e| {
+                panic!("{name}: prompt_cache_key must not 400 as extra: {e:?}")
+            });
+        }
+    }
+
+    #[tokio::test]
     async fn test_chat_codex_accepts_response_format_extra() {
         // WHY (issue #32): chat response_format must pass the Codex extras
         // allowlist so the adapter can translate it. A gateway 400 here would

@@ -835,6 +835,15 @@ impl GrokProvider {
         for (name, value) in self.auth_headers().await? {
             request = request.header(name, value);
         }
+        if let Some(key) = req
+            .prompt_cache_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let (name, value) = grok_conv_id_header(key)?;
+            request = request.header(name, value);
+        }
 
         let http_resp =
             request.json(&body).send().await.map_err(|e| {
@@ -879,6 +888,15 @@ impl GrokProvider {
         let url = format!("{}/chat/completions", self.base_url);
 
         let auth_headers = self.auth_headers().await?;
+        let conv_id_header = match req
+            .prompt_cache_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(key) => Some(grok_conv_id_header(key)?),
+            None => None,
+        };
         let client = self.client.clone();
 
         let stream = async_stream::stream! {
@@ -887,6 +905,9 @@ impl GrokProvider {
                 .header("Content-Type", "application/json")
                 .header("Accept", "text/event-stream");
             for (name, value) in auth_headers {
+                request = request.header(name, value);
+            }
+            if let Some((name, value)) = conv_id_header.clone() {
                 request = request.header(name, value);
             }
             let send_result = request.json(&body).send().await;
@@ -1353,7 +1374,29 @@ fn to_grok_responses_request(
         body["reasoning"] = json!({ "effort": effort });
     }
 
+    if let Some(key) = req
+        .prompt_cache_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        body["prompt_cache_key"] = json!(key);
+    }
+
     Ok(body)
+}
+
+/// Chat Completions cache routing uses the `x-grok-conv-id` header, not a body
+/// field. Fail loud on values that cannot be a header (newlines, etc.).
+fn grok_conv_id_header(
+    key: &str,
+) -> Result<(header::HeaderName, header::HeaderValue), ProviderError> {
+    let value = header::HeaderValue::from_str(key.trim()).map_err(|_| {
+        ProviderError::BadRequest(
+            "prompt_cache_key is not a valid x-grok-conv-id header value".into(),
+        )
+    })?;
+    Ok((header::HeaderName::from_static("x-grok-conv-id"), value))
 }
 
 /// Map canonical effort onto the selected xAI model's advertised set.
@@ -1973,6 +2016,7 @@ mod tests {
                 budget_tokens: None,
             }),
             metadata: Default::default(),
+            prompt_cache_key: None,
             provider_extras: Some(json!({"service_tier": "priority"})),
         };
 
@@ -2313,6 +2357,7 @@ mod tests {
             top_p: None,
             reasoning: None,
             metadata: Default::default(),
+            prompt_cache_key: None,
             provider_extras: None,
         };
 
@@ -2617,6 +2662,7 @@ mod tests {
                 budget_tokens: Some(100),
             }),
             metadata: Default::default(),
+            prompt_cache_key: None,
             provider_extras: Some(serde_json::json!({"service_tier": "standard"})),
         };
         let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
@@ -2818,6 +2864,93 @@ mod tests {
         // model may be resolved/echoed by upstream
         assert!(
             resp.usage.input_tokens > 0 || resp.usage.output_tokens > 0 || !resp.content.is_empty()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn grok_prompt_cache_key_reads_across_turns_live() {
+        // Live opt-in: two turns with the same prompt_cache_key and a stable
+        // prefix. Grok only reports cached_tokens on a hit (no creation
+        // counter), so turn 2 must show cache_read > 0. Model comes from the
+        // pinned catalog, not a dated id in this test.
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if !omni_common::test_support::live_tests_enabled() {
+            eprintln!(
+                "skipping grok_prompt_cache_key_reads_across_turns_live: set OMNI_LIVE_TESTS=1"
+            );
+            return;
+        }
+        let key = match live_grok_key() {
+            Some(k) => k,
+            None => {
+                eprintln!("skipping grok_prompt_cache_key_reads_across_turns_live: no Grok creds");
+                return;
+            }
+        };
+        let p = GrokProvider::new(Some(key)).expect("ctor with explicit key");
+        let model = p
+            .models_list()
+            .into_iter()
+            .next()
+            .map(|m| m.id)
+            .expect("grok catalog is not empty");
+        let cache_key = Some("omni-live-grok-cache".to_string());
+        let big_context = format!(
+            "You are reviewing the following reference material. \
+             Answer only from it. Reference block repeated for length:\n{}",
+            "The quick brown fox jumps over the lazy dog near the riverbank. ".repeat(600)
+        );
+
+        let turn1 = CanonicalRequest {
+            model: model.clone(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text(big_context.clone()),
+            }],
+            prompt_cache_key: cache_key.clone(),
+            max_tokens: Some(8),
+            ..Default::default()
+        };
+        let r1 = p
+            .send(turn1)
+            .await
+            .expect("turn 1 send must succeed with creds");
+        let assistant_reply = if r1.content.is_empty() {
+            "Understood.".to_string()
+        } else {
+            r1.content.clone()
+        };
+        let turn2 = CanonicalRequest {
+            model,
+            messages: vec![
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text(big_context),
+                },
+                CanonicalMessage {
+                    role: "assistant".into(),
+                    content: CanonicalContent::Text(assistant_reply),
+                },
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("Reply with one word: ok".into()),
+                },
+            ],
+            prompt_cache_key: cache_key,
+            max_tokens: Some(8),
+            ..Default::default()
+        };
+        let r2 = p
+            .send(turn2)
+            .await
+            .expect("turn 2 send must succeed with creds");
+        assert!(
+            r2.usage.cache_read > 0,
+            "turn 2 must READ grok prompt cache (prompt_cache_key routing + stable prefix); \
+             got read={} input={}",
+            r2.usage.cache_read,
+            r2.usage.input_tokens
         );
     }
 
@@ -4501,6 +4634,54 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn grok_custom_chat_sends_prompt_cache_key_as_conv_id_header() {
+        // WHY: custom-endpoint Grok is Chat Completions. xAI routes cache by
+        // x-grok-conv-id, not a body prompt_cache_key. The canonical field must
+        // become that header or cache routing is silently dropped.
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = DummyXaiCreds::install("cache-header");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("x-grok-conv-id", "sess-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-cache",
+                "object": "chat.completion",
+                "model": "grok-4.6",
+                "choices": [ {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop"
+                } ],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = GrokProvider::new(None)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_custom_auth(Some(DummyXaiCreds::KEY.into()), None, vec![]);
+        let req = CanonicalRequest {
+            model: "grok-4.6".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            prompt_cache_key: Some("sess-1".into()),
+            ..Default::default()
+        };
+        let resp = p.send(req).await.expect("hermetic grok send must succeed");
+        assert_eq!(resp.content, "ok");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn grok_nonstream_tool_call_roundtrip_via_wiremock() {
         // WHY: tool calls take the tool_calls decode branch (synthesize/keep id,
         // map name + arguments, finish_reason tool_calls). Pins the wire round-trip
@@ -4927,6 +5108,58 @@ mod tests {
         assert!(
             body.get("tools").is_none(),
             "tools must be absent when none were supplied"
+        );
+    }
+
+    #[test]
+    fn to_grok_responses_request_forwards_prompt_cache_key() {
+        // WHY: CLI Grok speaks Responses. prompt_cache_key is the documented
+        // cache-routing field for that wire. It must not land in extras (400)
+        // and must not be omitted from the body.
+        let req = CanonicalRequest {
+            model: "m".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            prompt_cache_key: Some("sess-1".into()),
+            ..Default::default()
+        };
+        let body = to_grok_responses_request(&req, GROK_CATALOG, false).unwrap();
+        assert_eq!(body["prompt_cache_key"], "sess-1");
+        assert!(
+            body.get("x-grok-conv-id").is_none(),
+            "conv-id is a Chat Completions header, not a Responses body field: {body}"
+        );
+    }
+
+    #[test]
+    fn grok_conv_id_header_rejects_newlines() {
+        let err = grok_conv_id_header("bad\nkey").expect_err("newline is not a header value");
+        assert!(
+            err.to_string().contains("prompt_cache_key"),
+            "error must name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn to_xai_chat_request_does_not_put_prompt_cache_key_in_body() {
+        // WHY: custom-endpoint Grok is Chat Completions. The routing identity
+        // is the x-grok-conv-id header, not a body field xAI does not document
+        // for chat.
+        let req = CanonicalRequest {
+            model: "m".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            prompt_cache_key: Some("sess-1".into()),
+            ..Default::default()
+        };
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "chat body must not carry prompt_cache_key: {body}"
         );
     }
 
