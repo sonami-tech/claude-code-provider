@@ -14,12 +14,13 @@ use serde_json::{Map, Value};
 use tracing::debug;
 
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
-    CanonicalRequest, CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalTool,
-    CanonicalToolChoice, CanonicalUsage,
+    CanonicalBlock, CanonicalCacheIntent, CanonicalCacheMark, CanonicalContent,
+    CanonicalImageSource, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
+    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolChoice,
+    CanonicalUsage,
 };
 
-use crate::http::parse_prompt_cache_key;
+use crate::cache::{parse_anthropic_cache_control, reject_anthropic_prompt_cache_key};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -182,15 +183,14 @@ pub fn anthropic_to_canonical(
 
     let mut messages: Vec<CanonicalMessage> = Vec::new();
 
-    // Top-level system → one system message
+    // Top-level system → one system message. Marked system blocks stay as
+    // Blocks so cache_control is not collapsed to a string.
     if let Some(system) = body.get("system") {
-        if let Some(text) = system_to_text(system)? {
-            if !text.is_empty() {
-                messages.push(CanonicalMessage {
-                    role: "system".into(),
-                    content: CanonicalContent::Text(text),
-                });
-            }
+        if let Some(content) = system_to_canonical(system)? {
+            messages.push(CanonicalMessage {
+                role: "system".into(),
+                content,
+            });
         }
     }
 
@@ -284,11 +284,38 @@ pub fn anthropic_to_canonical(
     // provider extras: stop_sequences, parallel_tool_calls
     let provider_extras = build_provider_extras(body, provider_id);
 
-    // Non-Anthropic routing identity: OpenAI/xAI `prompt_cache_key`. Claude
-    // native passthrough never uses this mapper. cache_control stays dropped
-    // (documented lossy; Grok/Codex have prefix cache, not breakpoints).
-    let prompt_cache_key =
-        parse_prompt_cache_key(body.get("prompt_cache_key")).map_err(AnthropicMapError::new)?;
+    reject_anthropic_prompt_cache_key(body).map_err(AnthropicMapError::new)?;
+    let automatic =
+        parse_anthropic_cache_control(body.get("cache_control")).map_err(AnthropicMapError::new)?;
+    let ttl = automatic.as_ref().and_then(|mark| mark.ttl).or_else(|| {
+        tools
+            .as_ref()
+            .and_then(|ts| ts.iter().find_map(|t| t.cache.as_ref().and_then(|c| c.ttl)))
+            .or_else(|| {
+                messages.iter().find_map(|m| match &m.content {
+                    CanonicalContent::Blocks(blocks) => blocks
+                        .iter()
+                        .find_map(|b| b.cache_mark().and_then(|c| c.ttl)),
+                    CanonicalContent::Text(_) => None,
+                })
+            })
+    });
+    let has_marks = tools
+        .as_ref()
+        .is_some_and(|ts| ts.iter().any(|t| t.cache.is_some()))
+        || messages.iter().any(|m| match &m.content {
+            CanonicalContent::Blocks(blocks) => blocks.iter().any(|b| b.cache_mark().is_some()),
+            CanonicalContent::Text(_) => false,
+        });
+    let cache = if automatic.is_some() || ttl.is_some() || has_marks {
+        Some(CanonicalCacheIntent {
+            ttl,
+            automatic,
+            ..CanonicalCacheIntent::default()
+        })
+    } else {
+        None
+    };
 
     // stream is handler control only — not placed in canonical
 
@@ -302,7 +329,7 @@ pub fn anthropic_to_canonical(
         top_p,
         reasoning,
         metadata,
-        prompt_cache_key,
+        cache,
         provider_extras,
     })
 }
@@ -313,47 +340,66 @@ struct RawMsg {
 }
 
 enum RawBlock {
-    Text(String),
+    Text {
+        text: String,
+        cache: Option<CanonicalCacheMark>,
+    },
     Image {
         source: CanonicalImageSource,
+        cache: Option<CanonicalCacheMark>,
     },
     ToolUse {
         id: String,
         name: String,
         arguments: String,
+        cache: Option<CanonicalCacheMark>,
     },
     ToolResult {
         tool_use_id: String,
         content: String,
         is_error: bool,
+        cache: Option<CanonicalCacheMark>,
     },
     Thinking,
     RedactedThinking,
 }
 
-fn system_to_text(system: &Value) -> Result<Option<String>, AnthropicMapError> {
+fn parse_block_cache_control(
+    block: &Value,
+    loc: &str,
+) -> Result<Option<CanonicalCacheMark>, AnthropicMapError> {
+    parse_anthropic_cache_control(block.get("cache_control"))
+        .map_err(|e| AnthropicMapError::new(format!("{loc}: {e}")))
+}
+
+fn system_to_canonical(system: &Value) -> Result<Option<CanonicalContent>, AnthropicMapError> {
     match system {
-        Value::String(s) => Ok(Some(s.clone())),
+        Value::String(s) => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(CanonicalContent::Text(s.clone())))
+            }
+        }
         Value::Array(blocks) => {
             let mut parts = Vec::new();
+            let mut marked = Vec::new();
+            let mut has_mark = false;
             for (i, b) in blocks.iter().enumerate() {
                 let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match ty {
-                    "text" => {
-                        parts.push(
-                            b.get("text")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                        );
-                    }
-                    "" if b.get("text").is_some() => {
-                        parts.push(
-                            b.get("text")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                        );
+                    "text" | "" if b.get("text").is_some() => {
+                        let text = b
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let cache = parse_block_cache_control(b, &format!("system[{i}]"))?;
+                        if cache.is_some() {
+                            has_mark = true;
+                        }
+                        parts.push(text.clone());
+                        marked.push(CanonicalBlock::Text { text, cache });
                     }
                     other => {
                         return Err(AnthropicMapError::new(format!(
@@ -362,7 +408,13 @@ fn system_to_text(system: &Value) -> Result<Option<String>, AnthropicMapError> {
                     }
                 }
             }
-            Ok(Some(parts.join("\n")))
+            if marked.is_empty() || parts.iter().all(|p| p.is_empty()) && !has_mark {
+                Ok(None)
+            } else if has_mark {
+                Ok(Some(CanonicalContent::Blocks(marked)))
+            } else {
+                Ok(Some(CanonicalContent::Text(parts.join("\n"))))
+            }
         }
         Value::Null => Ok(None),
         _ => Err(AnthropicMapError::new(
@@ -377,7 +429,10 @@ fn parse_message_blocks(
     msg_idx: usize,
 ) -> Result<Vec<RawBlock>, AnthropicMapError> {
     match content {
-        Value::String(s) => Ok(vec![RawBlock::Text(s.clone())]),
+        Value::String(s) => Ok(vec![RawBlock::Text {
+            text: s.clone(),
+            cache: None,
+        }]),
         Value::Array(arr) => {
             let mut blocks = Vec::with_capacity(arr.len());
             for (bi, b) in arr.iter().enumerate() {
@@ -393,7 +448,11 @@ fn parse_message_blocks(
                             .and_then(|t| t.as_str())
                             .unwrap_or("")
                             .to_string();
-                        blocks.push(RawBlock::Text(text));
+                        let cache = parse_block_cache_control(
+                            b,
+                            &format!("messages[{msg_idx}].content[{bi}]"),
+                        )?;
+                        blocks.push(RawBlock::Text { text, cache });
                     }
                     "image" => {
                         if role == "assistant" {
@@ -462,7 +521,11 @@ fn parse_message_blocks(
                                 )));
                             }
                         };
-                        blocks.push(RawBlock::Image { source: img });
+                        let cache = parse_block_cache_control(
+                            b,
+                            &format!("messages[{msg_idx}].content[{bi}]"),
+                        )?;
+                        blocks.push(RawBlock::Image { source: img, cache });
                     }
                     "tool_use" => {
                         if role != "assistant" {
@@ -504,10 +567,15 @@ fn parse_message_blocks(
                                 "messages[{msg_idx}].content[{bi}]: tool_use.input serialize: {e}"
                             ))
                         })?;
+                        let cache = parse_block_cache_control(
+                            b,
+                            &format!("messages[{msg_idx}].content[{bi}]"),
+                        )?;
                         blocks.push(RawBlock::ToolUse {
                             id,
                             name,
                             arguments,
+                            cache,
                         });
                     }
                     "tool_result" => {
@@ -528,10 +596,15 @@ fn parse_message_blocks(
                             .to_string();
                         let content_str = tool_result_content(b.get("content"), msg_idx, bi)?;
                         let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let cache = parse_block_cache_control(
+                            b,
+                            &format!("messages[{msg_idx}].content[{bi}]"),
+                        )?;
                         blocks.push(RawBlock::ToolResult {
                             tool_use_id,
                             content: content_str,
                             is_error,
+                            cache,
                         });
                     }
                     "thinking" => blocks.push(RawBlock::Thinking),
@@ -614,22 +687,28 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
             let mut text_parts = Vec::new();
             for b in &msg.blocks {
                 match b {
-                    RawBlock::Text(t) => {
-                        if !t.is_empty() {
-                            text_parts.push(t.clone());
+                    RawBlock::Text { text, cache } => {
+                        if !text.is_empty() || cache.is_some() {
+                            text_parts.push((text.clone(), cache.clone()));
                         }
                     }
                     RawBlock::ToolUse {
                         id,
                         name,
                         arguments,
+                        cache,
                     } => {
                         if !ids_in_turn.insert(id.clone()) {
                             return Err(AnthropicMapError::new(format!(
                                 "duplicate tool_use.id \"{id}\" in assistant turn"
                             )));
                         }
-                        tool_uses.push((id.clone(), name.clone(), arguments.clone()));
+                        tool_uses.push((
+                            id.clone(),
+                            name.clone(),
+                            arguments.clone(),
+                            cache.clone(),
+                        ));
                     }
                     RawBlock::Image { .. } => {
                         return Err(AnthropicMapError::new("assistant images are not supported"));
@@ -645,22 +724,19 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
 
             // Build assistant message
             if tool_uses.is_empty() {
-                let text = text_parts.join("");
                 out.push(CanonicalMessage {
                     role: "assistant".into(),
-                    content: CanonicalContent::Text(text),
+                    content: text_parts_to_content(text_parts),
                 });
             } else {
                 let mut blocks = Vec::new();
-                let text = text_parts.join("");
-                if !text.is_empty() {
-                    blocks.push(CanonicalBlock::Text(text));
-                }
-                for (id, name, arguments) in &tool_uses {
+                blocks.extend(text_parts_to_blocks(text_parts));
+                for (id, name, arguments, cache) in &tool_uses {
                     blocks.push(CanonicalBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         arguments: arguments.clone(),
+                        cache: cache.clone(),
                     });
                 }
                 out.push(CanonicalMessage {
@@ -682,7 +758,7 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
                     ));
                 }
                 let mut outstanding: HashSet<String> =
-                    tool_uses.iter().map(|(id, _, _)| id.clone()).collect();
+                    tool_uses.iter().map(|(id, _, _, _)| id.clone()).collect();
                 let mut seen_results: HashSet<String> = HashSet::new();
                 let mut result_msgs = Vec::new();
                 let mut trailing: Vec<CanonicalBlock> = Vec::new();
@@ -693,6 +769,7 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
                             tool_use_id,
                             content,
                             is_error,
+                            cache,
                         } => {
                             if !outstanding.contains(tool_use_id) {
                                 return Err(AnthropicMapError::new(format!(
@@ -712,18 +789,23 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
                                         tool_use_id: tool_use_id.clone(),
                                         content: content.clone(),
                                         is_error: *is_error,
+                                        cache: cache.clone(),
                                     },
                                 ]),
                             });
                         }
-                        RawBlock::Text(t) => {
-                            if !t.is_empty() {
-                                trailing.push(CanonicalBlock::Text(t.clone()));
+                        RawBlock::Text { text, cache } => {
+                            if !text.is_empty() || cache.is_some() {
+                                trailing.push(CanonicalBlock::Text {
+                                    text: text.clone(),
+                                    cache: cache.clone(),
+                                });
                             }
                         }
-                        RawBlock::Image { source } => {
+                        RawBlock::Image { source, cache } => {
                             trailing.push(CanonicalBlock::Image {
                                 source: source.clone(),
+                                cache: cache.clone(),
                             });
                         }
                         RawBlock::ToolUse { .. } => {
@@ -744,17 +826,9 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
                 }
                 out.extend(result_msgs);
                 if !trailing.is_empty() {
-                    let content = if trailing.len() == 1 {
-                        match &trailing[0] {
-                            CanonicalBlock::Text(t) => CanonicalContent::Text(t.clone()),
-                            _ => CanonicalContent::Blocks(trailing),
-                        }
-                    } else {
-                        CanonicalContent::Blocks(trailing)
-                    };
                     out.push(CanonicalMessage {
                         role: "user".into(),
-                        content,
+                        content: blocks_to_content(trailing),
                     });
                 }
             }
@@ -769,14 +843,18 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
                             "unpaired tool_result for id \"{tool_use_id}\" (no preceding assistant tool_use)"
                         )));
                     }
-                    RawBlock::Text(t) => {
-                        if !t.is_empty() {
-                            trailing.push(CanonicalBlock::Text(t.clone()));
+                    RawBlock::Text { text, cache } => {
+                        if !text.is_empty() || cache.is_some() {
+                            trailing.push(CanonicalBlock::Text {
+                                text: text.clone(),
+                                cache: cache.clone(),
+                            });
                         }
                     }
-                    RawBlock::Image { source } => {
+                    RawBlock::Image { source, cache } => {
                         trailing.push(CanonicalBlock::Image {
                             source: source.clone(),
+                            cache: cache.clone(),
                         });
                     }
                     RawBlock::ToolUse { .. } => {
@@ -793,31 +871,46 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
                     role: "user".into(),
                     content: CanonicalContent::Text(String::new()),
                 });
-            } else if trailing.len() == 1 {
-                match &trailing[0] {
-                    CanonicalBlock::Text(t) => {
-                        out.push(CanonicalMessage {
-                            role: "user".into(),
-                            content: CanonicalContent::Text(t.clone()),
-                        });
-                    }
-                    _ => {
-                        out.push(CanonicalMessage {
-                            role: "user".into(),
-                            content: CanonicalContent::Blocks(trailing),
-                        });
-                    }
-                }
             } else {
                 out.push(CanonicalMessage {
                     role: "user".into(),
-                    content: CanonicalContent::Blocks(trailing),
+                    content: blocks_to_content(trailing),
                 });
             }
         }
         i += 1;
     }
     Ok(out)
+}
+
+fn text_parts_to_blocks(parts: Vec<(String, Option<CanonicalCacheMark>)>) -> Vec<CanonicalBlock> {
+    parts
+        .into_iter()
+        .map(|(text, cache)| CanonicalBlock::Text { text, cache })
+        .collect()
+}
+
+fn text_parts_to_content(parts: Vec<(String, Option<CanonicalCacheMark>)>) -> CanonicalContent {
+    if parts.iter().any(|(_, cache)| cache.is_some()) {
+        CanonicalContent::Blocks(text_parts_to_blocks(parts))
+    } else {
+        CanonicalContent::Text(
+            parts
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+                .join(""),
+        )
+    }
+}
+
+fn blocks_to_content(blocks: Vec<CanonicalBlock>) -> CanonicalContent {
+    if blocks.len() == 1
+        && let CanonicalBlock::Text { text, cache: None } = &blocks[0]
+    {
+        return CanonicalContent::Text(text.clone());
+    }
+    CanonicalContent::Blocks(blocks)
 }
 
 fn map_tools(tools: Option<&Value>) -> Result<Option<Vec<CanonicalTool>>, AnthropicMapError> {
@@ -866,10 +959,12 @@ fn map_tools(tools: Option<&Value>) -> Result<Option<Vec<CanonicalTool>>, Anthro
             .get("description")
             .and_then(|d| d.as_str())
             .map(|s| s.to_string());
+        let cache = parse_block_cache_control(t, &format!("tools[{i}]"))?;
         out.push(CanonicalTool {
             name: name.to_string(),
             description,
             parameters,
+            cache,
         });
     }
     Ok(Some(out))
@@ -1706,6 +1801,7 @@ mod tests {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     assert_eq!(tool_use_id, "t1");
                     assert_eq!(content, "ok1");
@@ -1721,6 +1817,7 @@ mod tests {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     assert_eq!(tool_use_id, "t2");
                     assert_eq!(content, "fail");
@@ -1771,15 +1868,25 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_key_lifts_and_cache_control_stays_dropped() {
-        // WHY: translated Anthropic has no native cache-routing field. Clients
-        // targeting Grok/Codex can send OpenAI's prompt_cache_key; it must not
-        // be ignored as an unknown top-level key. cache_control breakpoints
-        // still have no Grok/Codex equivalent and stay documented-lossy.
+    fn prompt_cache_key_on_anthropic_is_400() {
+        // WHY: prompt_cache_key is not an Anthropic field. Do not add an Omni
+        // dialect on this interface.
         let body = json!({
             "model": "m",
             "max_tokens": 10,
             "prompt_cache_key": "sess-1",
+            "messages": [{"role": "user", "content": "u"}]
+        });
+        let err = anthropic_to_canonical(&body, "grok").unwrap_err();
+        assert!(err.0.contains("prompt_cache_key"), "{err}");
+    }
+
+    #[test]
+    fn cache_control_is_translated_not_dropped() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
             "system": [{
                 "type": "text",
                 "text": "stable prefix",
@@ -1788,28 +1895,56 @@ mod tests {
             "messages": [{"role": "user", "content": "u"}]
         });
         let canon = anthropic_to_canonical(&body, "grok").unwrap();
-        assert_eq!(canon.prompt_cache_key.as_deref(), Some("sess-1"));
+        assert!(canon.cache_routing_identity().is_none());
+        assert_eq!(
+            canon
+                .cache
+                .as_ref()
+                .and_then(|c| c.automatic.as_ref())
+                .map(|m| m.ttl),
+            Some(Some(omni_core::CanonicalCacheTtl::OneHour))
+        );
+        match &canon.messages[0].content {
+            CanonicalContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(blocks[0].cache_mark().is_some());
+            }
+            other => panic!("marked system must not collapse to a string: {other:?}"),
+        }
         assert!(
             canon.provider_extras.is_none(),
             "cache_control must not become a provider extra: {:?}",
             canon.provider_extras
         );
-        match &canon.messages[0].content {
-            CanonicalContent::Text(t) => assert_eq!(t, "stable prefix"),
-            other => panic!("system must collapse to text, got {other:?}"),
-        }
     }
 
     #[test]
-    fn prompt_cache_key_rejects_non_string() {
+    fn anthropic_invalid_ttl_on_inbound_is_400() {
         let body = json!({
             "model": "m",
             "max_tokens": 10,
-            "prompt_cache_key": ["sess-1"],
-            "messages": [{"role": "user", "content": "u"}]
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "u", "cache_control": {"type": "ephemeral", "ttl": "30m"}}
+            ]}]
         });
         let err = anthropic_to_canonical(&body, "codex").unwrap_err();
-        assert!(err.0.contains("prompt_cache_key must be a string"), "{err}");
+        assert!(err.0.contains("cache_control.ttl"), "{err}");
+    }
+
+    #[test]
+    fn anthropic_metadata_user_id_is_not_cache_identity() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "metadata": {"user_id": "alice"},
+            "messages": [{"role": "user", "content": "u"}]
+        });
+        let canon = anthropic_to_canonical(&body, "grok").unwrap();
+        assert!(canon.cache.is_none());
+        assert_eq!(
+            canon.metadata.get("user_id").map(String::as_str),
+            Some("alice")
+        );
     }
 
     #[test]
@@ -1860,17 +1995,19 @@ mod tests {
         let c = anthropic_to_canonical(&body, "grok").unwrap();
         match &c.messages[0].content {
             CanonicalContent::Blocks(blocks) => {
-                assert!(matches!(blocks[0], CanonicalBlock::Text(_)));
+                assert!(matches!(blocks[0], CanonicalBlock::Text { .. }));
                 assert!(matches!(
                     &blocks[1],
                     CanonicalBlock::Image {
-                        source: CanonicalImageSource::Base64 { media_type, data }
+                        source: CanonicalImageSource::Base64 { media_type, data },
+                        ..
                     } if media_type == "image/png" && data == "abc"
                 ));
                 assert!(matches!(
                     &blocks[2],
                     CanonicalBlock::Image {
-                        source: CanonicalImageSource::Url { url }
+                        source: CanonicalImageSource::Url { url },
+                        ..
                     } if url == "https://example.com/i.png"
                 ));
             }

@@ -82,11 +82,13 @@ use serde::Deserialize;
 use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
+#[cfg(test)]
+use omni_common::to_canonical;
 use omni_common::{
     ActiveRequestGuard, ApiKeyId, AppError, ChatCompletionRequest, ConversationLog, Stats,
     TokenUsage, accumulate_anthropic_stream_usage, anthropic_to_canonical, canonical_to_anthropic,
     from_canonical, is_anthropic_content_delta, parse_anthropic_object_no_dup_keys,
-    peek_model_string, sse_from_canonical_stream_anthropic, to_canonical,
+    peek_model_string, sse_from_canonical_stream_anthropic, to_canonical_with_headers,
     token_usage_from_anthropic_response,
 };
 use omni_core::{
@@ -1290,7 +1292,19 @@ async fn chat_completions_handler(
     }
 
     // Build canonical *with the stripped model* so the delegated provider sees the real model name.
-    let mut canon = to_canonical(&body).map_err(|e| record_bad_request(&state, &stats_key, e))?;
+    let grok_conv_id = match headers.get("x-grok-conv-id") {
+        None => None,
+        Some(value) => Some(
+            value
+                .to_str()
+                .map_err(|_| {
+                    record_bad_request(&state, &stats_key, "x-grok-conv-id must be a string".into())
+                })?
+                .to_string(),
+        ),
+    };
+    let mut canon = to_canonical_with_headers(&body, grok_conv_id.as_deref())
+        .map_err(|e| record_bad_request(&state, &stats_key, e))?;
     canon.model = stripped_model.clone();
     check_provider_extras(&prov_key, entry, canon.provider_extras.as_ref())
         .map_err(|e| record_bad_request(&state, &stats_key, e))?;
@@ -8720,7 +8734,7 @@ rule = [
                 req: omni_core::CanonicalRequest,
             ) -> Result<CanonicalResponse, ProviderError> {
                 assert_eq!(
-                    req.prompt_cache_key.as_deref(),
+                    req.cache_routing_identity(),
                     Some("sess-1"),
                     "chat prompt_cache_key must reach provider as a canonical field"
                 );

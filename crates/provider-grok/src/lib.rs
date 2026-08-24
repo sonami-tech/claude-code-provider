@@ -835,16 +835,6 @@ impl GrokProvider {
         for (name, value) in self.auth_headers().await? {
             request = request.header(name, value);
         }
-        if let Some(key) = req
-            .prompt_cache_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let (name, value) = grok_conv_id_header(key)?;
-            request = request.header(name, value);
-        }
-
         let http_resp =
             request.json(&body).send().await.map_err(|e| {
                 ProviderError::upstream(format!("network error calling xAI: {}", e))
@@ -888,15 +878,6 @@ impl GrokProvider {
         let url = format!("{}/chat/completions", self.base_url);
 
         let auth_headers = self.auth_headers().await?;
-        let conv_id_header = match req
-            .prompt_cache_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(key) => Some(grok_conv_id_header(key)?),
-            None => None,
-        };
         let client = self.client.clone();
 
         let stream = async_stream::stream! {
@@ -905,9 +886,6 @@ impl GrokProvider {
                 .header("Content-Type", "application/json")
                 .header("Accept", "text/event-stream");
             for (name, value) in auth_headers {
-                request = request.header(name, value);
-            }
-            if let Some((name, value)) = conv_id_header.clone() {
                 request = request.header(name, value);
             }
             let send_result = request.json(&body).send().await;
@@ -1066,7 +1044,7 @@ fn to_xai_chat_request(
                 let mut tool_result_msgs: Vec<Value> = Vec::new();
                 for b in blocks {
                     match b {
-                        CanonicalBlock::Text(t) => {
+                        CanonicalBlock::Text { text: t, .. } => {
                             let text_part = repl.apply_prompt(t);
                             text.push_str(&text_part);
                             if !text_part.is_empty() {
@@ -1076,7 +1054,7 @@ fn to_xai_chat_request(
                                 }));
                             }
                         }
-                        CanonicalBlock::Image { source } => {
+                        CanonicalBlock::Image { source, .. } => {
                             content_parts.push(json!({
                                 "type": "image_url",
                                 "image_url": { "url": source.as_image_url() },
@@ -1086,6 +1064,7 @@ fn to_xai_chat_request(
                             id,
                             name,
                             arguments,
+                            ..
                         } => {
                             tool_calls.push(json!({
                                 "id": id,
@@ -1097,6 +1076,7 @@ fn to_xai_chat_request(
                             tool_use_id,
                             content,
                             is_error,
+                            ..
                         } => {
                             let wire = omni_common::encode_tool_result_content(content, *is_error);
                             tool_result_msgs.push(json!({
@@ -1209,10 +1189,22 @@ fn to_xai_chat_request(
         }
     }
 
+    apply_grok_prompt_cache_key(&mut body, req);
+
     // Light hook demonstration for omni-common replacements on the *structured* prompt surface.
     // (Real rules for tool names etc. are typically applied by the frontend before producing CanonicalRequest,
     // or the provider ctor would be given a live Replacements instance instead of always empty().)
     Ok(body)
+}
+
+fn apply_grok_prompt_cache_key(body: &mut Value, req: &CanonicalRequest) {
+    if let Some(key) = req
+        .cache_routing_identity()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        body["prompt_cache_key"] = json!(key);
+    }
 }
 
 fn is_image_part(value: &Value) -> bool {
@@ -1374,29 +1366,9 @@ fn to_grok_responses_request(
         body["reasoning"] = json!({ "effort": effort });
     }
 
-    if let Some(key) = req
-        .prompt_cache_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        body["prompt_cache_key"] = json!(key);
-    }
+    apply_grok_prompt_cache_key(&mut body, req);
 
     Ok(body)
-}
-
-/// Chat Completions cache routing uses the `x-grok-conv-id` header, not a body
-/// field. Fail loud on values that cannot be a header (newlines, etc.).
-fn grok_conv_id_header(
-    key: &str,
-) -> Result<(header::HeaderName, header::HeaderValue), ProviderError> {
-    let value = header::HeaderValue::from_str(key.trim()).map_err(|_| {
-        ProviderError::BadRequest(
-            "prompt_cache_key is not a valid x-grok-conv-id header value".into(),
-        )
-    })?;
-    Ok((header::HeaderName::from_static("x-grok-conv-id"), value))
 }
 
 /// Map canonical effort onto the selected xAI model's advertised set.
@@ -1452,13 +1424,13 @@ fn append_grok_responses_items(message: &CanonicalMessage, input: &mut Vec<Value
             let mut has_image = false;
             for block in blocks {
                 match block {
-                    CanonicalBlock::Text(t) => {
+                    CanonicalBlock::Text { text: t, .. } => {
                         text.push_str(t);
                         if !t.is_empty() {
                             content_parts.push(json!({ "type": "input_text", "text": t }));
                         }
                     }
-                    CanonicalBlock::Image { source } => {
+                    CanonicalBlock::Image { source, .. } => {
                         has_image = true;
                         content_parts.push(json!({
                             "type": "input_image",
@@ -1469,6 +1441,7 @@ fn append_grok_responses_items(message: &CanonicalMessage, input: &mut Vec<Value
                         id,
                         name,
                         arguments,
+                        ..
                     } => {
                         flush_grok_responses_message(
                             input,
@@ -1488,6 +1461,7 @@ fn append_grok_responses_items(message: &CanonicalMessage, input: &mut Vec<Value
                         tool_use_id,
                         content,
                         is_error,
+                        ..
                     } => {
                         flush_grok_responses_message(
                             input,
@@ -2016,8 +1990,8 @@ mod tests {
                 budget_tokens: None,
             }),
             metadata: Default::default(),
-            prompt_cache_key: None,
             provider_extras: Some(json!({"service_tier": "priority"})),
+            cache: None,
         };
 
         let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
@@ -2348,6 +2322,7 @@ mod tests {
                 name: "get_weather".into(),
                 description: Some("Get weather".into()),
                 parameters: json!({"type":"object","properties":{}}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
                 name: "get_weather".into(),
@@ -2357,7 +2332,7 @@ mod tests {
             top_p: None,
             reasoning: None,
             metadata: Default::default(),
-            prompt_cache_key: None,
+            cache: None,
             provider_extras: None,
         };
 
@@ -2382,11 +2357,15 @@ mod tests {
                 CanonicalMessage {
                     role: "assistant".into(),
                     content: CanonicalContent::Blocks(vec![
-                        CanonicalBlock::Text("thinking".into()),
+                        CanonicalBlock::Text {
+                            text: "thinking".into(),
+                            cache: None,
+                        },
                         CanonicalBlock::ToolUse {
                             id: "c1".into(),
                             name: "f".into(),
                             arguments: "{}".into(),
+                            cache: None,
                         },
                     ]),
                 },
@@ -2396,6 +2375,7 @@ mod tests {
                         tool_use_id: "c1".into(),
                         content: "R".into(),
                         is_error: false,
+                        cache: None,
                     }]),
                 },
             ],
@@ -2441,16 +2421,21 @@ mod tests {
             messages: vec![CanonicalMessage {
                 role: "assistant".into(),
                 content: CanonicalContent::Blocks(vec![
-                    CanonicalBlock::Text("calling".into()),
+                    CanonicalBlock::Text {
+                        text: "calling".into(),
+                        cache: None,
+                    },
                     CanonicalBlock::ToolUse {
                         id: "c1".into(),
                         name: "f".into(),
                         arguments: "{}".into(),
+                        cache: None,
                     },
                     CanonicalBlock::ToolResult {
                         tool_use_id: "c1".into(),
                         content: "R".into(),
                         is_error: false,
+                        cache: None,
                     },
                 ]),
             }],
@@ -2480,7 +2465,10 @@ mod tests {
             model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "assistant".into(),
-                content: CanonicalContent::Blocks(vec![CanonicalBlock::Text("hi".into())]),
+                content: CanonicalContent::Blocks(vec![CanonicalBlock::Text {
+                    text: "hi".into(),
+                    cache: None,
+                }]),
             }],
             ..Default::default()
         };
@@ -2614,17 +2602,22 @@ mod tests {
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Blocks(vec![
-                    CanonicalBlock::Text("look".into()),
+                    CanonicalBlock::Text {
+                        text: "look".into(),
+                        cache: None,
+                    },
                     CanonicalBlock::Image {
                         source: omni_core::CanonicalImageSource::Url {
                             url: "https://example.com/a.png".into(),
                         },
+                        cache: None,
                     },
                     CanonicalBlock::Image {
                         source: omni_core::CanonicalImageSource::Base64 {
                             media_type: "image/png".into(),
                             data: "abcd".into(),
                         },
+                        cache: None,
                     },
                 ]),
             }],
@@ -2652,6 +2645,7 @@ mod tests {
                 name: "web".into(),
                 description: Some("web".into()),
                 parameters: serde_json::json!({"type":"object"}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
             max_tokens: Some(256),
@@ -2662,7 +2656,7 @@ mod tests {
                 budget_tokens: Some(100),
             }),
             metadata: Default::default(),
-            prompt_cache_key: None,
+            cache: None,
             provider_extras: Some(serde_json::json!({"service_tier": "standard"})),
         };
         let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
@@ -2908,7 +2902,10 @@ mod tests {
                 role: "user".into(),
                 content: CanonicalContent::Text(big_context.clone()),
             }],
-            prompt_cache_key: cache_key.clone(),
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: cache_key.clone(),
+                ..Default::default()
+            }),
             max_tokens: Some(8),
             ..Default::default()
         };
@@ -2937,7 +2934,10 @@ mod tests {
                     content: CanonicalContent::Text("Reply with one word: ok".into()),
                 },
             ],
-            prompt_cache_key: cache_key,
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: cache_key,
+                ..Default::default()
+            }),
             max_tokens: Some(8),
             ..Default::default()
         };
@@ -3194,6 +3194,7 @@ mod tests {
                 name: "get_weather".into(),
                 description: Some("weather fn".into()),
                 parameters: json!({"type":"object"}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
             provider_extras: Some(json!({
@@ -3223,6 +3224,7 @@ mod tests {
                 name: "calc".into(),
                 description: None,
                 parameters: json!({}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Required),
             ..Default::default()
@@ -3250,6 +3252,7 @@ mod tests {
                 name: "get_wx".into(),
                 description: Some("the weather tool here".into()),
                 parameters: json!({"type":"object"}),
+                cache: None,
             }]),
             ..Default::default()
         };
@@ -4050,6 +4053,7 @@ mod tests {
                 name: "adder".into(),
                 description: Some("add two nums".into()),
                 parameters: json!({"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
                 name: "adder".into(),
@@ -4634,20 +4638,18 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn grok_custom_chat_sends_prompt_cache_key_as_conv_id_header() {
-        // WHY: custom-endpoint Grok is Chat Completions. xAI routes cache by
-        // x-grok-conv-id, not a body prompt_cache_key. The canonical field must
-        // become that header or cache routing is silently dropped.
-        use wiremock::matchers::{header, method, path};
+    async fn grok_custom_chat_sends_prompt_cache_key_in_body_not_header() {
+        // WHY: outbound Grok Chat must use the official body prompt_cache_key
+        // and must never emit x-grok-conv-id.
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _creds = DummyXaiCreds::install("cache-header");
+        let _creds = DummyXaiCreds::install("cache-body");
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(header("x-grok-conv-id", "sess-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "chatcmpl-cache",
                 "object": "chat.completion",
@@ -4673,11 +4675,21 @@ mod tests {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
             }],
-            prompt_cache_key: Some("sess-1".into()),
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: Some("sess-1".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let resp = p.send(req).await.expect("hermetic grok send must succeed");
         assert_eq!(resp.content, "ok");
+        let received = server.received_requests().await.expect("recorded");
+        assert!(
+            received[0].headers.get("x-grok-conv-id").is_none(),
+            "Grok Chat must not emit x-grok-conv-id"
+        );
+        let body: Value = serde_json::from_slice(&received[0].body).expect("json body");
+        assert_eq!(body["prompt_cache_key"], "sess-1");
     }
 
     #[tokio::test]
@@ -5055,6 +5067,7 @@ mod tests {
                 name: "get_weather".into(),
                 description: Some("look up weather".into()),
                 parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
                 name: "get_weather".into(),
@@ -5122,7 +5135,10 @@ mod tests {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
             }],
-            prompt_cache_key: Some("sess-1".into()),
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: Some("sess-1".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let body = to_grok_responses_request(&req, GROK_CATALOG, false).unwrap();
@@ -5134,33 +5150,40 @@ mod tests {
     }
 
     #[test]
-    fn grok_conv_id_header_rejects_newlines() {
-        let err = grok_conv_id_header("bad\nkey").expect_err("newline is not a header value");
-        assert!(
-            err.to_string().contains("prompt_cache_key"),
-            "error must name the field: {err}"
-        );
-    }
-
-    #[test]
-    fn to_xai_chat_request_does_not_put_prompt_cache_key_in_body() {
-        // WHY: custom-endpoint Grok is Chat Completions. The routing identity
-        // is the x-grok-conv-id header, not a body field xAI does not document
-        // for chat.
+    fn to_xai_chat_request_puts_prompt_cache_key_in_body() {
+        // WHY: shipped cache translation sends Grok Chat the official body
+        // prompt_cache_key and never a conv-id header field on the body.
         let req = CanonicalRequest {
             model: "m".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
             }],
-            prompt_cache_key: Some("sess-1".into()),
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: Some("sess-1".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG).unwrap();
+        assert_eq!(body["prompt_cache_key"], "sess-1");
         assert!(
-            body.get("prompt_cache_key").is_none(),
-            "chat body must not carry prompt_cache_key: {body}"
+            body.get("x-grok-conv-id").is_none(),
+            "chat body must not carry x-grok-conv-id: {body}"
         );
+    }
+
+    #[test]
+    fn chat_inbound_header_and_body_translate_to_grok_body_key_only() {
+        let req: omni_common::ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "prompt_cache_key":"body-1"}"#,
+        )
+        .unwrap();
+        let canon = omni_common::to_canonical_with_headers(&req, Some("hdr-1")).unwrap();
+        let body = to_xai_chat_request(&canon, &empty_repl(), GROK_CATALOG).unwrap();
+        assert_eq!(body["prompt_cache_key"], "body-1");
+        assert!(body.get("x-grok-conv-id").is_none());
     }
 
     #[test]
@@ -5178,6 +5201,7 @@ mod tests {
                         id: "call_1".into(),
                         name: "get_weather".into(),
                         arguments: "{\"city\":\"SF\"}".into(),
+                        cache: None,
                     }]),
                 },
                 CanonicalMessage {
@@ -5186,6 +5210,7 @@ mod tests {
                         tool_use_id: "call_1".into(),
                         content: "sunny".into(),
                         is_error: false,
+                        cache: None,
                     }]),
                 },
             ],

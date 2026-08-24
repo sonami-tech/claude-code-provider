@@ -26,10 +26,11 @@ use axum::response::sse::{Event, Sse};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
-use crate::http::{
-    gateway_only_extra_keys, parse_prompt_cache_key, validate_reasoning_effort_lexical,
+use crate::cache::{
+    parse_openai_cache_intent, parse_prompt_cache_breakpoint, strip_openai_cache_keys,
 };
+use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
+use crate::http::{gateway_only_extra_keys, validate_reasoning_effort_lexical};
 
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
@@ -51,7 +52,7 @@ pub struct ResponsesRequest {
     pub model: String,
     pub input: ResponsesInput,
     #[serde(default)]
-    pub instructions: Option<String>,
+    pub instructions: Option<ResponsesInstructions>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
@@ -112,6 +113,16 @@ pub enum ResponsesInputContent {
     Parts(Vec<ResponsesContentPart>),
 }
 
+/// Top-level Responses `instructions`: a string, or typed parts. Breakpoints
+/// on this field are forbidden (put marked instructions in a developer
+/// `input_text` part).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ResponsesInstructions {
+    Text(String),
+    Parts(Vec<ResponsesContentPart>),
+}
+
 /// One typed content part. Supports text plus `input_image` with `image_url`.
 /// Other media part types are rejected by name.
 #[derive(Debug, Deserialize, Serialize)]
@@ -122,6 +133,8 @@ pub struct ResponsesContentPart {
     pub text: Option<String>,
     #[serde(default)]
     pub image_url: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_breakpoint: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -261,10 +274,11 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
     let mut messages: Vec<CanonicalMessage> = Vec::new();
 
     // `instructions` is the Responses system prompt: a leading system message.
+    // Breakpoints on this field are forbidden.
     if let Some(instructions) = req.instructions.as_ref() {
         messages.push(CanonicalMessage {
             role: "system".into(),
-            content: CanonicalContent::Text(instructions.clone()),
+            content: responses_instructions_to_canonical(instructions)?,
         });
     }
 
@@ -294,6 +308,7 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
                                 id: call_id,
                                 name,
                                 arguments: item.arguments.clone().unwrap_or_default(),
+                                cache: None,
                             }]),
                         });
                     }
@@ -308,6 +323,7 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
                                 tool_use_id: call_id,
                                 content: item.output.clone().unwrap_or_default(),
                                 is_error: false,
+                                cache: None,
                             }]),
                         });
                     }
@@ -347,6 +363,7 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
                         .parameters
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({})),
+                    cache: None,
                 });
             }
             Some(out)
@@ -387,15 +404,14 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         }
     };
 
-    let prompt_cache_key = parse_prompt_cache_key(req.extras.get("prompt_cache_key"))?;
+    let cache = parse_openai_cache_intent(&req.extras, None)?;
     let provider_extras = req.extras.as_object().and_then(|extras| {
         let filtered = extras
             .iter()
-            .filter(|(key, _)| {
-                !gateway_only_extra_keys().contains(&key.as_str()) && *key != "prompt_cache_key"
-            })
+            .filter(|(key, _)| !gateway_only_extra_keys().contains(&key.as_str()))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<serde_json::Map<_, _>>();
+        let filtered = strip_openai_cache_keys(&filtered);
         if filtered.is_empty() {
             None
         } else {
@@ -413,9 +429,38 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         top_p: req.top_p,
         reasoning,
         metadata: Default::default(),
-        prompt_cache_key,
+        cache,
         provider_extras,
     })
+}
+
+fn responses_instructions_to_canonical(
+    instructions: &ResponsesInstructions,
+) -> Result<CanonicalContent, String> {
+    match instructions {
+        ResponsesInstructions::Text(text) => Ok(CanonicalContent::Text(text.clone())),
+        ResponsesInstructions::Parts(parts) => {
+            for part in parts {
+                if parse_prompt_cache_breakpoint(part.prompt_cache_breakpoint.as_ref())?.is_some() {
+                    return Err(
+                        "prompt_cache_breakpoint is not allowed on top-level instructions".into(),
+                    );
+                }
+            }
+            let mut fragments = Vec::new();
+            for part in parts {
+                match part.kind.as_str() {
+                    "input_text" | "output_text" => {
+                        fragments.push(part.text.clone().unwrap_or_default());
+                    }
+                    other => {
+                        return Err(format!("unsupported instructions part type: {other}"));
+                    }
+                }
+            }
+            Ok(CanonicalContent::Text(fragments.join("\n")))
+        }
+    }
 }
 
 fn responses_content_to_canonical(
@@ -427,12 +472,17 @@ fn responses_content_to_canonical(
             let mut text_fragments = Vec::new();
             let mut blocks = Vec::with_capacity(parts.len());
             let mut has_image = false;
+            let mut has_mark = false;
             for part in parts {
+                let cache = parse_prompt_cache_breakpoint(part.prompt_cache_breakpoint.as_ref())?;
+                if cache.is_some() {
+                    has_mark = true;
+                }
                 match part.kind.as_str() {
                     "input_text" | "output_text" => {
                         let text = part.text.clone().unwrap_or_default();
                         text_fragments.push(text.clone());
-                        blocks.push(CanonicalBlock::Text(text));
+                        blocks.push(CanonicalBlock::Text { text, cache });
                     }
                     "input_image" => {
                         let image_url = part.image_url.as_deref().ok_or_else(|| {
@@ -440,13 +490,14 @@ fn responses_content_to_canonical(
                         })?;
                         blocks.push(CanonicalBlock::Image {
                             source: CanonicalImageSource::from_image_url(image_url)?,
+                            cache,
                         });
                         has_image = true;
                     }
                     other => return Err(format!("unsupported content part type: {other}")),
                 }
             }
-            if has_image {
+            if has_image || has_mark {
                 Ok(CanonicalContent::Blocks(blocks))
             } else {
                 Ok(CanonicalContent::Text(text_fragments.join("\n")))
@@ -1561,19 +1612,19 @@ mod tests {
         let canon = responses_to_canonical(&req).unwrap();
         match &canon.messages[0].content {
             CanonicalContent::Blocks(blocks) => {
-                assert!(matches!(&blocks[0], CanonicalBlock::Text(text) if text == "first"));
+                assert!(matches!(&blocks[0], CanonicalBlock::Text { text, .. } if text == "first"));
                 assert!(matches!(
                     &blocks[1],
                     CanonicalBlock::Image {
-                        source: CanonicalImageSource::Url { url }
-                    } if url == "https://example.com/a.png"
+                        source: CanonicalImageSource::Url { url }, .. } if url == "https://example.com/a.png"
                 ));
-                assert!(matches!(&blocks[2], CanonicalBlock::Text(text) if text == "second"));
+                assert!(
+                    matches!(&blocks[2], CanonicalBlock::Text { text, .. } if text == "second")
+                );
                 assert!(matches!(
                     &blocks[3],
                     CanonicalBlock::Image {
-                        source: CanonicalImageSource::Base64 { media_type, data }
-                    } if media_type == "image/jpeg" && data == "abcd"
+                        source: CanonicalImageSource::Base64 { media_type, data }, .. } if media_type == "image/jpeg" && data == "abcd"
                 ));
             }
             CanonicalContent::Text(_) => panic!("image parts must produce blocks"),
@@ -1708,7 +1759,7 @@ mod tests {
         // extras. Lift it onto CanonicalRequest instead.
         let req = parse(r#"{"model":"m","input":"q","prompt_cache_key":"sess-1","store":false}"#);
         let canon = responses_to_canonical(&req).unwrap();
-        assert_eq!(canon.prompt_cache_key.as_deref(), Some("sess-1"));
+        assert_eq!(canon.cache_routing_identity(), Some("sess-1"));
         let extras = canon
             .provider_extras
             .expect("unrelated extras should remain");
@@ -1717,6 +1768,38 @@ mod tests {
             extras.get("prompt_cache_key").is_none(),
             "prompt_cache_key must not become a provider extra: {extras}"
         );
+    }
+
+    #[test]
+    fn responses_instructions_breakpoint_is_400() {
+        let req = parse(
+            r#"{"model":"m","input":"q","instructions":[
+                {"type":"input_text","text":"sys","prompt_cache_breakpoint":{"mode":"explicit"}}
+            ]}"#,
+        );
+        let err = responses_to_canonical(&req).expect_err("instructions breakpoint must 400");
+        assert!(
+            err.contains("instructions"),
+            "error must name instructions: {err}"
+        );
+    }
+
+    #[test]
+    fn responses_input_breakpoint_stays_on_blocks() {
+        let req = parse(
+            r#"{"model":"m","input":[{"role":"user","content":[
+                {"type":"input_text","text":"prefix","prompt_cache_breakpoint":{"mode":"explicit"}},
+                {"type":"input_text","text":"suffix"}
+            ]}]}"#,
+        );
+        let canon = responses_to_canonical(&req).unwrap();
+        match &canon.messages[0].content {
+            CanonicalContent::Blocks(blocks) => {
+                assert!(blocks[0].cache_mark().is_some());
+                assert!(blocks[1].cache_mark().is_none());
+            }
+            other => panic!("marked input_text must not collapse: {other:?}"),
+        }
     }
 
     #[test]
@@ -1819,6 +1902,7 @@ mod tests {
                     id,
                     name,
                     arguments,
+                    ..
                 } => {
                     assert_eq!(id, "c1");
                     assert_eq!(name, "get_weather");

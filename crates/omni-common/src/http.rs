@@ -18,6 +18,7 @@ use omni_core::{
     CanonicalToolCall, CanonicalToolChoice,
 };
 
+use crate::cache::{parse_openai_cache_intent, parse_prompt_cache_breakpoint};
 use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
 
 /// OpenAI-compatible chat completion request (text messages, tools, and core
@@ -95,6 +96,9 @@ pub struct ChatContentPart {
     pub text: Option<String>,
     #[serde(default)]
     pub image_url: Option<ChatImageUrl>,
+    /// Official Chat Completions breakpoint on a supported part.
+    #[serde(default)]
+    pub prompt_cache_breakpoint: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -368,7 +372,7 @@ fn chat_reasoning_and_extras(
         if gateway_only_extra_keys().contains(&k)
             || k == "reasoning_effort"
             || k == "reasoning"
-            || k == "prompt_cache_key"
+            || crate::cache::OPENAI_CACHE_EXTRA_KEYS.contains(&k)
         {
             continue;
         }
@@ -387,25 +391,6 @@ fn chat_reasoning_and_extras(
     Ok((reasoning, provider_extras))
 }
 
-/// Lift `prompt_cache_key` from a JSON value (flattened extras or a body key).
-///
-/// Empty / whitespace / JSON null is absent. A non-string is a 400: this is a
-/// routing identity, not a silent drop.
-pub(crate) fn parse_prompt_cache_key(value: Option<&Value>) -> Result<Option<String>, String> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed.to_string()))
-            }
-        }
-        Some(_) => Err("prompt_cache_key must be a string".into()),
-    }
-}
-
 /// Convert an OpenAI request into a `CanonicalRequest`. The `model` field is the
 /// caller-supplied value; the `omni` router overwrites it with the
 /// prefix-stripped model before delegating when needed.
@@ -415,6 +400,17 @@ pub(crate) fn parse_prompt_cache_key(value: Option<&Value>) -> Result<Option<Str
 /// rejected by name as a 400 rather than silently dropped - the same contract
 /// the Responses protocol enforces.
 pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, String> {
+    to_canonical_with_headers(req, None)
+}
+
+/// Chat Completions inbound parse, including optional `x-grok-conv-id`.
+///
+/// Header only becomes routing identity. Body `prompt_cache_key` wins when both
+/// are present. The header is never forwarded alongside the body key.
+pub fn to_canonical_with_headers(
+    req: &ChatCompletionRequest,
+    grok_conv_id: Option<&str>,
+) -> Result<CanonicalRequest, String> {
     let messages: Vec<CanonicalMessage> = req
         .messages
         .iter()
@@ -437,6 +433,7 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
                         .parameters
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({})),
+                    cache: None,
                 });
             }
             Some(out)
@@ -465,7 +462,7 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
     };
 
     let (reasoning, provider_extras) = chat_reasoning_and_extras(&req.extras)?;
-    let prompt_cache_key = parse_prompt_cache_key(req.extras.get("prompt_cache_key"))?;
+    let cache = parse_openai_cache_intent(&req.extras, grok_conv_id)?;
 
     Ok(CanonicalRequest {
         model: req.model.clone(),
@@ -478,7 +475,7 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
         top_p: req.top_p,
         reasoning,
         metadata: Default::default(),
-        prompt_cache_key,
+        cache,
         provider_extras,
     })
 }
@@ -505,12 +502,14 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
             .tool_call_id
             .clone()
             .ok_or_else(|| "tool message missing tool_call_id".to_string())?;
+        let cache = chat_content_cache_mark(&m.content)?;
         return Ok(CanonicalMessage {
             role: "tool".into(),
             content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
                 tool_use_id: id,
                 content: chat_content_text(&m.content)?,
                 is_error: false,
+                cache,
             }]),
         });
     }
@@ -518,8 +517,12 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
     // An assistant message may interleave text with tool calls.
     if let Some(tool_calls) = m.tool_calls.as_ref().filter(|tc| !tc.is_empty()) {
         let mut blocks: Vec<CanonicalBlock> = Vec::new();
-        if let Some(text) = chat_content_optional_text(&m.content)? {
-            blocks.push(CanonicalBlock::Text(text));
+        match chat_content_to_canonical(&m.content)? {
+            CanonicalContent::Text(text) if !text.is_empty() => {
+                blocks.push(CanonicalBlock::text(text));
+            }
+            CanonicalContent::Text(_) => {}
+            CanonicalContent::Blocks(content_blocks) => blocks.extend(content_blocks),
         }
         for tc in tool_calls {
             if tc.kind != "function" {
@@ -529,6 +532,7 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
                 id: tc.id.clone(),
                 name: tc.function.name.clone(),
                 arguments: tc.function.arguments.clone(),
+                cache: None,
             });
         }
         return Ok(CanonicalMessage {
@@ -563,11 +567,19 @@ fn chat_content_text(content: &Option<ChatMessageContent>) -> Result<String, Str
     }
 }
 
-fn chat_content_optional_text(
+fn chat_content_cache_mark(
     content: &Option<ChatMessageContent>,
-) -> Result<Option<String>, String> {
-    let text = chat_content_text(content)?;
-    Ok((!text.is_empty()).then_some(text))
+) -> Result<Option<omni_core::CanonicalCacheMark>, String> {
+    let Some(ChatMessageContent::Parts(parts)) = content else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for part in parts {
+        if let Some(mark) = parse_prompt_cache_breakpoint(part.prompt_cache_breakpoint.as_ref())? {
+            found = Some(mark);
+        }
+    }
+    Ok(found)
 }
 
 fn chat_content_to_canonical(
@@ -578,11 +590,17 @@ fn chat_content_to_canonical(
         Some(ChatMessageContent::Parts(parts)) => {
             let mut blocks = Vec::with_capacity(parts.len());
             let mut has_image = false;
+            let mut has_mark = false;
             for part in parts {
+                let cache = parse_prompt_cache_breakpoint(part.prompt_cache_breakpoint.as_ref())?;
+                if cache.is_some() {
+                    has_mark = true;
+                }
                 match part.kind.as_str() {
-                    "text" => {
-                        blocks.push(CanonicalBlock::Text(part.text.clone().unwrap_or_default()))
-                    }
+                    "text" => blocks.push(CanonicalBlock::Text {
+                        text: part.text.clone().unwrap_or_default(),
+                        cache,
+                    }),
                     "image_url" => {
                         let url = part
                             .image_url
@@ -592,20 +610,21 @@ fn chat_content_to_canonical(
                             .as_str();
                         blocks.push(CanonicalBlock::Image {
                             source: CanonicalImageSource::from_image_url(url)?,
+                            cache,
                         });
                         has_image = true;
                     }
                     other => return Err(format!("unsupported content part type: {other}")),
                 }
             }
-            if has_image {
+            if has_image || has_mark {
                 Ok(CanonicalContent::Blocks(blocks))
             } else {
                 Ok(CanonicalContent::Text(
                     blocks
                         .into_iter()
                         .filter_map(|block| match block {
-                            CanonicalBlock::Text(text) => Some(text),
+                            CanonicalBlock::Text { text, .. } => Some(text),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -962,7 +981,7 @@ mod tests {
         )
         .unwrap();
         let canon = to_canonical(&req).expect("chat request should convert");
-        assert_eq!(canon.prompt_cache_key.as_deref(), Some("sess-1"));
+        assert_eq!(canon.cache_routing_identity(), Some("sess-1"));
         let extras = canon
             .provider_extras
             .expect("unrelated extras should remain");
@@ -995,7 +1014,72 @@ mod tests {
         )
         .unwrap();
         let canon = to_canonical(&req).expect("whitespace key is absent, not an error");
-        assert!(canon.prompt_cache_key.is_none());
+        assert!(canon.cache.is_none());
+    }
+
+    #[test]
+    fn chat_header_only_becomes_routing_identity() {
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .unwrap();
+        let canon = to_canonical_with_headers(&req, Some("hdr-1")).unwrap();
+        assert_eq!(canon.cache_routing_identity(), Some("hdr-1"));
+        assert!(canon.provider_extras.is_none());
+    }
+
+    #[test]
+    fn chat_body_key_wins_over_header() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "prompt_cache_key":"body-1"}"#,
+        )
+        .unwrap();
+        let canon = to_canonical_with_headers(&req, Some("hdr-1")).unwrap();
+        assert_eq!(canon.cache_routing_identity(), Some("body-1"));
+    }
+
+    #[test]
+    fn chat_user_and_safety_identifier_are_not_cache_identity() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "user":"alice","safety_identifier":"sid-1"}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).unwrap();
+        assert!(canon.cache.is_none());
+        assert_ne!(canon.cache_routing_identity(), Some("alice"));
+        assert_ne!(canon.cache_routing_identity(), Some("sid-1"));
+    }
+
+    #[test]
+    fn chat_prompt_cache_breakpoint_keeps_marked_text_as_blocks() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":[
+                {"type":"text","text":"prefix","prompt_cache_breakpoint":{"mode":"explicit"}},
+                {"type":"text","text":"suffix"}
+            ]}]}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).unwrap();
+        match &canon.messages[0].content {
+            CanonicalContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(blocks[0].cache_mark().is_some());
+                assert!(blocks[1].cache_mark().is_none());
+            }
+            other => panic!("marked text must not collapse to a string: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_invalid_prompt_cache_options_ttl_is_400() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "prompt_cache_options":{"ttl":"1h"}}"#,
+        )
+        .unwrap();
+        let err = to_canonical(&req).expect_err("OpenAI ttl 1h is not legal");
+        assert!(err.contains("prompt_cache_options.ttl"), "{err}");
     }
 
     #[test]
@@ -1307,19 +1391,17 @@ mod tests {
         match &canon.messages[0].content {
             CanonicalContent::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 4);
-                assert!(matches!(&blocks[0], CanonicalBlock::Text(text) if text == "look"));
+                assert!(matches!(&blocks[0], CanonicalBlock::Text { text, .. } if text == "look"));
                 assert!(matches!(
                     &blocks[1],
                     CanonicalBlock::Image {
-                        source: omni_core::CanonicalImageSource::Url { url }
-                    } if url == "https://example.com/cat.png"
+                        source: omni_core::CanonicalImageSource::Url { url }, .. } if url == "https://example.com/cat.png"
                 ));
-                assert!(matches!(&blocks[2], CanonicalBlock::Text(text) if text == "again"));
+                assert!(matches!(&blocks[2], CanonicalBlock::Text { text, .. } if text == "again"));
                 assert!(matches!(
                     &blocks[3],
                     CanonicalBlock::Image {
-                        source: omni_core::CanonicalImageSource::Base64 { media_type, data }
-                    } if media_type == "image/png" && data == "aGVsbG8="
+                        source: omni_core::CanonicalImageSource::Base64 { media_type, data }, .. } if media_type == "image/png" && data == "aGVsbG8="
                 ));
             }
             CanonicalContent::Text(_) => panic!("image content must become blocks"),
@@ -1416,6 +1498,7 @@ mod tests {
                     id,
                     name,
                     arguments,
+                    ..
                 } => {
                     assert_eq!(id, "call_1");
                     assert_eq!(name, "get_weather");
@@ -1443,6 +1526,7 @@ mod tests {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     assert_eq!(tool_use_id, "call_1");
                     assert_eq!(content, "72F");

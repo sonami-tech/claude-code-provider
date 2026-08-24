@@ -112,7 +112,7 @@
 - Server concerns: auth, stats, bind/public flags, route registration, and model
   routing stay in `omni`.
 
-## Prompt cache translation (working)
+## Prompt cache translation
 
 - Decision: internal cache intent plus block/tool marks. Clients keep official
   inbound fields. Providers receive official outbound fields. See
@@ -133,9 +133,7 @@
   do not inject gateway auto-cache.
 - Decision: invalid values on the inbound dialect itself are 400. Clamp-down
   is only for legal inbound values the chosen backend cannot copy.
-- Non-goals until that file is implemented: treating
-  `CanonicalRequest.prompt_cache_key` as the final shape (interim lift only).
-- Source of truth: `docs/cache-translation.md` (working spec), provider cache
+- Source of truth: `docs/cache-translation.md` (shipped spec), provider cache
   docs (field names and enums).
 
 ## Current Surfaces

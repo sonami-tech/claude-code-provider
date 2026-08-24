@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::cache::{CanonicalCacheIntent, CanonicalCacheMark};
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CanonicalRequest {
     pub model: String,
@@ -15,15 +17,35 @@ pub struct CanonicalRequest {
     pub top_p: Option<f32>,
     pub reasoning: Option<CanonicalReasoning>,
     pub metadata: HashMap<String, String>,
-    /// Cache-routing identity. OpenAI Chat Completions and Responses call this
-    /// `prompt_cache_key`. Grok Chat Completions sends it as `x-grok-conv-id`;
-    /// Grok CLI / Codex Responses send the body field. Claude does not use a
-    /// routing key (block `cache_control` / auto-cache instead) and ignores it.
+    /// Official inbound cache fields as internal intent. Not leftover JSON
+    /// and not a client-facing Omni dialect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<String>,
+    pub cache: Option<CanonicalCacheIntent>,
     // provider_extras for things like search_parameters, service_tier (passed through adapters)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_extras: Option<serde_json::Value>,
+}
+
+impl CanonicalRequest {
+    pub fn cache_routing_identity(&self) -> Option<&str> {
+        self.cache
+            .as_ref()
+            .and_then(|cache| cache.routing_identity.as_deref())
+    }
+
+    /// True when any tool or content block carries a cache mark.
+    pub fn has_cache_marks(&self) -> bool {
+        if self
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool.cache.is_some()))
+        {
+            return true;
+        }
+        self.messages
+            .iter()
+            .any(|message| message.content.has_cache_marks())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,15 +75,25 @@ pub enum CanonicalContent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CanonicalBlock {
     /// Plain text within a multi-block message.
-    Text(String),
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache: Option<CanonicalCacheMark>,
+    },
     /// Image input ordered with surrounding text.
-    Image { source: CanonicalImageSource },
+    Image {
+        source: CanonicalImageSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache: Option<CanonicalCacheMark>,
+    },
     /// An assistant request to call a tool (the model's tool-call). `arguments`
     /// is the raw JSON arguments string, as both wire formats carry it.
     ToolUse {
         id: String,
         name: String,
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache: Option<CanonicalCacheMark>,
     },
     /// A tool's result fed back by the caller, keyed to the `ToolUse` it answers.
     ToolResult {
@@ -69,7 +101,27 @@ pub enum CanonicalBlock {
         content: String,
         #[serde(default)]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache: Option<CanonicalCacheMark>,
     },
+}
+
+impl CanonicalBlock {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text {
+            text: text.into(),
+            cache: None,
+        }
+    }
+
+    pub fn cache_mark(&self) -> Option<&CanonicalCacheMark> {
+        match self {
+            Self::Text { cache, .. }
+            | Self::Image { cache, .. }
+            | Self::ToolUse { cache, .. }
+            | Self::ToolResult { cache, .. } => cache.as_ref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,11 +176,18 @@ impl CanonicalContent {
             CanonicalContent::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
-                    CanonicalBlock::Text(t) => Some(t.as_str()),
+                    CanonicalBlock::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join(""),
+        }
+    }
+
+    pub fn has_cache_marks(&self) -> bool {
+        match self {
+            CanonicalContent::Text(_) => false,
+            CanonicalContent::Blocks(blocks) => blocks.iter().any(|b| b.cache_mark().is_some()),
         }
     }
 }
@@ -138,6 +197,8 @@ pub struct CanonicalTool {
     pub name: String,
     pub description: Option<String>,
     pub parameters: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CanonicalCacheMark>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,7 +404,10 @@ mod tests {
                 budget_tokens: None,
             }),
             metadata: [("k".into(), "v".into())].into(),
-            prompt_cache_key: Some("cache-k".into()),
+            cache: Some(CanonicalCacheIntent {
+                routing_identity: Some("cache-k".into()),
+                ..Default::default()
+            }),
             provider_extras: None,
         }
     }
@@ -359,7 +423,7 @@ mod tests {
             back.reasoning.as_ref().unwrap().effort.as_deref(),
             Some("low")
         );
-        assert_eq!(back.prompt_cache_key.as_deref(), Some("cache-k"));
+        assert_eq!(back.cache_routing_identity(), Some("cache-k"));
     }
 
     #[test]
@@ -452,6 +516,7 @@ mod tests {
             name: "f".into(),
             description: None,
             parameters: serde_json::json!({}),
+            cache: None,
         };
     }
 
@@ -490,6 +555,7 @@ mod tests {
                 name: "get_info".into(),
                 description: Some("desc".into()),
                 parameters: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
                 name: "get_info".into(),
@@ -502,7 +568,10 @@ mod tests {
                 budget_tokens: Some(20000),
             }),
             metadata: [("trace".into(), "abc123".into())].into(),
-            prompt_cache_key: Some("sess-1".into()),
+            cache: Some(CanonicalCacheIntent {
+                routing_identity: Some("sess-1".into()),
+                ..Default::default()
+            }),
             provider_extras: Some(
                 serde_json::json!({"service_tier":"priority","search_parameters":{}}),
             ),
@@ -706,7 +775,7 @@ mod tests {
             top_p: None,
             reasoning: None,
             metadata: Default::default(),
-            prompt_cache_key: None,
+            cache: None,
             provider_extras: None,
         };
         let rg = g.send(base.clone()).await.unwrap();
@@ -731,6 +800,7 @@ mod tests {
                 name: "t".into(),
                 description: None,
                 parameters: serde_json::json!({}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
             ..Default::default()
@@ -759,6 +829,7 @@ mod tests {
                 name: sim_apply_prompt("foo-tool"),
                 description: None,
                 parameters: serde_json::json!({}),
+                cache: None,
             }]),
             ..Default::default()
         };
@@ -865,12 +936,19 @@ mod tests {
         // WHY: multimodal clients depend on image ordering, while legacy
         // billing/replacement paths must still see only human-readable text.
         let content = CanonicalContent::Blocks(vec![
-            CanonicalBlock::Text("before".into()),
+            CanonicalBlock::Text {
+                text: "before".into(),
+                cache: None,
+            },
             CanonicalBlock::Image {
                 source: CanonicalImageSource::from_image_url("data:image/png;base64,aGVsbG8=")
                     .unwrap(),
+                cache: None,
             },
-            CanonicalBlock::Text("after".into()),
+            CanonicalBlock::Text {
+                text: "after".into(),
+                cache: None,
+            },
         ]);
         assert_eq!(content.as_text(), "beforeafter");
         let back: CanonicalContent =
@@ -957,6 +1035,7 @@ mod tests {
             name: "search".into(),
             description: Some("web".into()),
             parameters: serde_json::json!({"type":"object"}),
+            cache: None,
         }]);
         let tc = Some(CanonicalToolChoice::Specific {
             name: "search".into(),
@@ -1022,6 +1101,7 @@ mod tests {
                 name: "t".into(),
                 description: None,
                 parameters: serde_json::json!({}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
             ..Default::default()
@@ -1075,6 +1155,7 @@ mod tests {
                 name: "calc".into(),
                 description: None,
                 parameters: serde_json::json!({}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Required),
             reasoning: Some(CanonicalReasoning {
@@ -1110,6 +1191,7 @@ mod tests {
                 name: "bar-tool".into(),
                 description: None,
                 parameters: serde_json::json!({}),
+                cache: None,
             }]),
             ..Default::default()
         };

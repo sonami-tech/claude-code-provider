@@ -5,6 +5,7 @@
 pub mod anthropic;
 pub mod anthropic_native_stats;
 pub mod auth;
+pub mod cache;
 pub mod canonical_mapping;
 pub mod conversation_log;
 pub mod env;
@@ -37,7 +38,7 @@ pub use error::{AppError, classify_upstream};
 pub use http::{
     ChatCompletionRequest, ChatCompletionResponse, ChatContentPart, ChatImageUrl, ChatMessage,
     ChatMessageContent, MAX_REASONING_EFFORT_LEN, from_canonical, sse_from_canonical_stream,
-    to_canonical, unix_now_secs, validate_reasoning_effort_lexical,
+    to_canonical, to_canonical_with_headers, unix_now_secs, validate_reasoning_effort_lexical,
 };
 pub use oauth_refresh::{
     MAX_CREDENTIAL_RECOVERY_TURNS, NEAR_EXPIRY_SKEW_MS, NEAR_EXPIRY_SKEW_SECS,

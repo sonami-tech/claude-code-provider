@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::fingerprint::{FingerprintProfile, RequestContext};
 use crate::translate::{
-    Message, MessagesRequest, OutputConfig, SystemField, Thinking, Tool, ToolChoice,
+    CacheControl, Message, MessagesRequest, OutputConfig, SystemField, Thinking, Tool, ToolChoice,
     finalize_claude_wire_request,
 };
 use crate::upstream::RawFrame;
@@ -57,6 +57,10 @@ pub struct ClientMessagesRequest {
     /// defaults apply only when this is `None` (issue #22).
     #[serde(default)]
     pub output_config: Option<OutputConfig>,
+    /// Official Anthropic automatic cache marker. Same-provider passthrough
+    /// forwards it unchanged; Door 2 does not inject a gateway marker.
+    #[serde(default)]
+    pub cache_control: Option<CacheControl>,
 }
 
 impl ClientMessagesRequest {
@@ -78,10 +82,9 @@ impl ClientMessagesRequest {
             // Client > pin default > absent (issue #22). Pin fill happens later
             // in finalize_claude_wire_request → apply_profile_wire_defaults.
             output_config: self.output_config.clone(),
-            // Native passthrough never injects a gateway-owned top-level marker
-            // (deferred: see PR1 scope). The client's own block-level markers
-            // ride inside messages/system/tools and are preserved untouched.
-            cache_control: None,
+            // Client top-level automatic cache_control is official Anthropic.
+            // Forward it. Do not inject a gateway-owned marker on this door.
+            cache_control: self.cache_control.clone(),
         }
     }
 }
@@ -129,6 +132,7 @@ const FORWARDED_FIELDS: &[&str] = &[
     "stream",
     "thinking",
     "output_config",
+    "cache_control",
 ];
 
 /// Top-level body keys not forwarded by the closed allowlist. Returned sorted
@@ -156,6 +160,7 @@ pub fn prepare_client_messages_request(
     replacements: &Replacements,
     inject_identity: bool,
 ) -> Result<PreparedAnthropicRequest, ProviderError> {
+    reject_native_anthropic_cache_dialect(&raw_body)?;
     let client: ClientMessagesRequest = serde_json::from_value(raw_body.clone())
         .map_err(|e| ProviderError::BadRequest(format!("invalid Anthropic request: {e}")))?;
     let stream = client_requested_stream(&raw_body);
@@ -190,6 +195,7 @@ pub fn prepare_count_tokens_request(
     profile: &'static FingerprintProfile,
     replacements: &Replacements,
 ) -> Result<PreparedAnthropicRequest, ProviderError> {
+    reject_native_anthropic_cache_dialect(&raw_body)?;
     let client: ClientMessagesRequest = serde_json::from_value(raw_body.clone())
         .map_err(|e| ProviderError::BadRequest(format!("invalid Anthropic request: {e}")))?;
     let dropped = dropped_fields(&raw_body);
@@ -227,6 +233,11 @@ pub fn prepare_count_tokens_request(
     })
 }
 
+fn reject_native_anthropic_cache_dialect(raw_body: &Value) -> Result<(), ProviderError> {
+    omni_common::cache::reject_anthropic_prompt_cache_key(raw_body)
+        .map_err(ProviderError::BadRequest)
+}
+
 fn reconcile_client_request(
     client: &ClientMessagesRequest,
     profile: &'static FingerprintProfile,
@@ -247,11 +258,9 @@ fn reconcile_client_request(
         profile,
         replacements,
         inject_identity,
-        // Door 2 (native passthrough) does not inject a gateway-owned auto-cache
-        // marker in PR1: deciding this correctly needs the position-vs-content-hash
-        // question resolved (our identity prepend shifts client block indices), and
-        // whether to forward a client's own top-level cache_control is a separate
-        // allowlist change. Deferred -> always false here.
+        // Door 2 does not inject a gateway-owned auto-cache marker. Client
+        // top-level cache_control is already on `req` from the allowlist.
+        // Do not apply the translation last-4 slot cap on this path.
         false,
     );
     // `stream` is owned by this door, not the tail: a native body that omitted
@@ -994,19 +1003,9 @@ mod tests {
 
     #[test]
     fn door2_forwards_client_cache_control_and_injects_no_gateway_marker() {
-        // WHY (#3, native-passthrough caching contract): the OpenAI-inbound door
-        // auto-injects a top-level `cache_control`, but the Anthropic-inbound door
-        // must NOT. Instead it forwards the CLIENT's own block-level markers
-        // untouched. Two independent invariants, both load-bearing:
-        //   (a) no gateway-owned TOP-LEVEL marker is added here (that is Door 1's
-        //       job; adding it here would be an unrequested wire deviation on the
-        //       fingerprint-contracted native path), and
-        //   (b) a client-set cache_control on a SYSTEM block survives to the wire,
-        //       so a passthrough client that caches keeps caching. Our identity
-        //       prepend pushes the client block behind billing+preamble (index
-        //       shift), but the marker itself must be preserved, not dropped.
-        // A regression that either injected a top-level marker on Door 2 or stripped
-        // the client's block marker during reconciliation would fail here.
+        // WHY: Door 2 does not inject a gateway-owned top-level marker. It does
+        // forward the client's own block-level cache_control. Identity prepend
+        // shifts the client block behind billing+preamble, but the marker stays.
         let body = serde_json::json!({
             "model": "claude-haiku-4-5",
             "max_tokens": 100,
@@ -1049,6 +1048,123 @@ mod tests {
             marked[0].cache_control.as_ref().map(|c| c.kind.as_str()),
             Some("ephemeral"),
             "client's ephemeral marker must survive reconciliation unchanged"
+        );
+    }
+
+    #[test]
+    fn door2_forwards_top_level_automatic_cache_control_unchanged() {
+        // Native entry: prepare_client_messages_request. Same-provider
+        // passthrough must send official automatic cache_control as given.
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role": "user", "content": "Say OK"}]
+        });
+        let prepared =
+            prepare_client_messages_request(body, default_profile(), &empty_repl(), true)
+                .expect("prepare ok");
+        let wire = prepared.body();
+        assert_eq!(
+            wire.get("cache_control")
+                .and_then(|c| c.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("ephemeral")
+        );
+        assert_eq!(
+            wire.get("cache_control")
+                .and_then(|c| c.get("ttl"))
+                .and_then(|t| t.as_str()),
+            Some("1h")
+        );
+        assert!(
+            !prepared.dropped_fields.iter().any(|k| k == "cache_control"),
+            "cache_control must be forwarded, not dropped: {:?}",
+            prepared.dropped_fields
+        );
+    }
+
+    #[test]
+    fn door2_rejects_anthropic_body_prompt_cache_key() {
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "prompt_cache_key": "sess-1",
+            "messages": [{"role": "user", "content": "Say OK"}]
+        });
+        let err = prepare_client_messages_request(body, default_profile(), &empty_repl(), true)
+            .expect_err("prompt_cache_key is not an Anthropic field");
+        match err {
+            ProviderError::BadRequest(msg) => {
+                assert!(msg.contains("prompt_cache_key"), "{msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn door2_rejects_invalid_cache_control_type_and_ttl() {
+        let bad_type = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "cache_control": {"type": "persistent"},
+            "messages": [{"role": "user", "content": "Say OK"}]
+        });
+        let err = prepare_client_messages_request(bad_type, default_profile(), &empty_repl(), true)
+            .expect_err("invalid type must 400");
+        match err {
+            ProviderError::BadRequest(msg) => {
+                assert!(msg.contains("cache_control"), "{msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        let bad_ttl = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "cache_control": {"type": "ephemeral", "ttl": "30m"},
+            "messages": [{"role": "user", "content": "Say OK"}]
+        });
+        let err = prepare_client_messages_request(bad_ttl, default_profile(), &empty_repl(), true)
+            .expect_err("invalid ttl must 400");
+        match err {
+            ProviderError::BadRequest(msg) => {
+                assert!(msg.contains("cache_control"), "{msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn door2_does_not_apply_last_four_slot_cap() {
+        // Translation caps at 4 including automatic. Native passthrough must
+        // not rewrite the client body.
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "cache_control": {"type": "ephemeral"},
+            "system": [
+                {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "c", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "d", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "e", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{"role": "user", "content": "Say OK"}]
+        });
+        let prepared =
+            prepare_client_messages_request(body, default_profile(), &empty_repl(), true)
+                .expect("prepare ok");
+        let wire = prepared.body();
+        assert!(wire.get("cache_control").is_some());
+        let system = wire["system"].as_array().expect("system blocks");
+        let marked = system
+            .iter()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        assert_eq!(
+            marked, 5,
+            "native passthrough must keep all five client marks"
         );
     }
 

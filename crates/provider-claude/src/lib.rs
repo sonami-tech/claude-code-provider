@@ -352,12 +352,12 @@ impl ClaudeProvider {
         self.profile
     }
 
-    /// Whether to inject Anthropic top-level automatic caching for this request.
-    /// This is only ever called from `send`/`send_stream`, which serve the
-    /// OpenAI-compatible inbound door exclusively (the native Anthropic passthrough
-    /// never reaches here). That door has no Claude Code fingerprint contract to
-    /// preserve, so caching is injected automatically and unconditionally — the
-    /// only escape is the `OMNI_CLAUDE_NO_AUTO_CACHE` opt-out.
+    /// Whether this provider may inject Anthropic top-level automatic caching.
+    /// Called from `send`/`send_stream` (OpenAI-compatible inbound). Native
+    /// Anthropic passthrough never reaches here. First-party routes default on
+    /// unless `OMNI_CLAUDE_NO_AUTO_CACHE` is set; `prepare_anthropic_request`
+    /// still gates injection with `should_inject_gateway_auto_cache` (client
+    /// marks and OpenAI `mode=explicit` with no breakpoints skip it).
     fn supports_auto_cache(&self) -> bool {
         !auto_cache_disabled()
     }
@@ -760,6 +760,7 @@ mod tests {
                 name: "do_x".into(),
                 description: Some("do the x".into()),
                 parameters: serde_json::json!({"type":"object"}),
+                cache: None,
             }]),
             tool_choice: Some(omni_core::CanonicalToolChoice::Auto),
             ..Default::default()
@@ -1126,7 +1127,10 @@ mod tests {
                 role: "user".into(),
                 content: CanonicalContent::Text(big_context.clone()),
             }],
-            prompt_cache_key: cache_key.clone(),
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: cache_key.clone(),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let r1 = p
@@ -1174,7 +1178,10 @@ mod tests {
                     content: CanonicalContent::Text("Briefly, what did I ask you to do?".into()),
                 },
             ],
-            prompt_cache_key: cache_key,
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: cache_key,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let r2 = p
@@ -1486,6 +1493,7 @@ mod tests {
                         source: omni_core::CanonicalImageSource::Url {
                             url: "https://example.com/x.png".into(),
                         },
+                        cache: None,
                     }]),
                 },
                 CanonicalMessage {

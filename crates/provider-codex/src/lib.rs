@@ -31,9 +31,10 @@ use omni_common::{
     UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT, env_nonempty, headers_from_env,
 };
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
+    CanonicalBlock, CanonicalCacheMark, CanonicalCacheMode, CanonicalCacheRetention,
+    CanonicalCacheTtl, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
-    CanonicalToolChoice, CatalogModel, LlmProvider, ProviderError,
+    CanonicalToolChoice, CatalogModel, LlmProvider, ProviderError, clamp_duration, clamp_retention,
 };
 use reqwest::header::HeaderMap;
 use reqwest::{Client, Url, header};
@@ -1682,7 +1683,15 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
     let mut input = Vec::new();
     for message in &req.messages {
         if message.role == "system" || message.role == "developer" {
-            instructions.push(message.content.as_text());
+            if message.content.has_cache_marks() {
+                // Marked instructions cannot live on the string `instructions`
+                // field. Emit a developer input item so breakpoints survive.
+                let mut marked = message.clone();
+                marked.role = "developer".into();
+                append_message_items(&marked, &mut input);
+            } else {
+                instructions.push(message.content.as_text());
+            }
             continue;
         }
         append_message_items(message, &mut input);
@@ -1736,14 +1745,7 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
             CanonicalToolChoice::Specific { name } => json!({"type": "function", "name": name}),
         };
     }
-    if let Some(key) = req
-        .prompt_cache_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        body["prompt_cache_key"] = json!(key);
-    }
+    apply_codex_cache(&mut body, req);
     if let Some(extras) = &req.provider_extras
         && let Some(obj) = extras.as_object()
     {
@@ -1926,6 +1928,80 @@ fn codex_reasoning_effort(
     }
 }
 
+fn apply_codex_cache(body: &mut Value, req: &CanonicalRequest) {
+    if let Some(key) = req
+        .cache_routing_identity()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        body["prompt_cache_key"] = json!(key);
+    }
+    let uses_ttl = codex_model_uses_ttl(&req.model);
+    let cache = req.cache.as_ref();
+    if uses_ttl {
+        let mut options = serde_json::Map::new();
+        if let Some(mode) = cache.and_then(|c| c.mode) {
+            options.insert(
+                "mode".into(),
+                json!(match mode {
+                    CanonicalCacheMode::Implicit => "implicit",
+                    CanonicalCacheMode::Explicit => "explicit",
+                }),
+            );
+        }
+        if let Some(secs) = cache.and_then(|c| c.requested_duration_secs()) {
+            if let Some(ttl) = clamp_duration(secs, CanonicalCacheTtl::CODEX_GPT56) {
+                options.insert("ttl".into(), json!(ttl.as_str()));
+            }
+        }
+        if !options.is_empty() {
+            body["prompt_cache_options"] = Value::Object(options);
+        }
+    } else if let Some(cache) = cache {
+        if let Some(ret) = cache.legacy_retention {
+            body["prompt_cache_retention"] = json!(ret.as_str());
+        } else if let Some(secs) = cache.requested_duration_secs()
+            && let Some(ret) = clamp_retention(
+                secs,
+                [
+                    CanonicalCacheRetention::InMemory,
+                    CanonicalCacheRetention::TwentyFourHours,
+                ],
+            )
+        {
+            body["prompt_cache_retention"] = json!(ret.as_str());
+        }
+    }
+}
+
+fn codex_model_uses_ttl(model: &str) -> bool {
+    let resolved = CODEX_CATALOG
+        .iter()
+        .find(|entry| entry.matches(model))
+        .map(|entry| entry.id)
+        .unwrap_or(model);
+    is_gpt56_or_later(resolved)
+}
+
+fn is_gpt56_or_later(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    let Some(rest) = id.strip_prefix("gpt-") else {
+        return false;
+    };
+    let ver = rest.split('-').next().unwrap_or(rest);
+    let mut parts = ver.split('.');
+    let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    major > 5 || (major == 5 && minor >= 6)
+}
+
+fn openai_breakpoint_part(mut part: Value, cache: Option<&CanonicalCacheMark>) -> Value {
+    if cache.is_some() {
+        part["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
+    }
+    part
+}
+
 fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
     match &message.content {
         CanonicalContent::Text(text) => {
@@ -1939,28 +2015,42 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
             let mut text = String::new();
             let mut content_parts: Vec<Value> = Vec::new();
             let mut has_image = false;
+            let mut has_breakpoint = false;
             for block in blocks {
                 match block {
-                    CanonicalBlock::Text(t) => {
+                    CanonicalBlock::Text { text: t, cache } => {
                         text.push_str(t);
-                        if !t.is_empty() {
-                            content_parts.push(json!({
-                                "type": "input_text",
-                                "text": t,
-                            }));
+                        if !t.is_empty() || cache.is_some() {
+                            if cache.is_some() {
+                                has_breakpoint = true;
+                            }
+                            content_parts.push(openai_breakpoint_part(
+                                json!({
+                                    "type": "input_text",
+                                    "text": t,
+                                }),
+                                cache.as_ref(),
+                            ));
                         }
                     }
-                    CanonicalBlock::Image { source } => {
+                    CanonicalBlock::Image { source, cache } => {
                         has_image = true;
-                        content_parts.push(json!({
-                            "type": "input_image",
-                            "image_url": source.as_image_url(),
-                        }));
+                        if cache.is_some() {
+                            has_breakpoint = true;
+                        }
+                        content_parts.push(openai_breakpoint_part(
+                            json!({
+                                "type": "input_image",
+                                "image_url": source.as_image_url(),
+                            }),
+                            cache.as_ref(),
+                        ));
                     }
                     CanonicalBlock::ToolUse {
                         id,
                         name,
                         arguments,
+                        ..
                     } => {
                         flush_codex_message(
                             input,
@@ -1968,6 +2058,7 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                             &mut text,
                             &mut content_parts,
                             &mut has_image,
+                            &mut has_breakpoint,
                         );
                         input.push(json!({
                             "type": "function_call",
@@ -1980,6 +2071,7 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                         tool_use_id,
                         content,
                         is_error,
+                        ..
                     } => {
                         flush_codex_message(
                             input,
@@ -1987,6 +2079,7 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                             &mut text,
                             &mut content_parts,
                             &mut has_image,
+                            &mut has_breakpoint,
                         );
                         let wire = omni_common::encode_tool_result_content(content, *is_error);
                         input.push(json!({
@@ -2003,6 +2096,7 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                 &mut text,
                 &mut content_parts,
                 &mut has_image,
+                &mut has_breakpoint,
             );
         }
     }
@@ -2014,17 +2108,19 @@ fn flush_codex_message(
     text: &mut String,
     content_parts: &mut Vec<Value>,
     has_image: &mut bool,
+    has_breakpoint: &mut bool,
 ) {
     if *has_image && content_parts.is_empty() {
         text.clear();
         *has_image = false;
+        *has_breakpoint = false;
         return;
     }
-    if !*has_image && text.is_empty() {
+    if !*has_image && !*has_breakpoint && text.is_empty() {
         content_parts.clear();
         return;
     }
-    let content = if *has_image {
+    let content = if *has_image || *has_breakpoint {
         Value::Array(std::mem::take(content_parts))
     } else {
         content_parts.clear();
@@ -2037,6 +2133,7 @@ fn flush_codex_message(
     }));
     text.clear();
     *has_image = false;
+    *has_breakpoint = false;
 }
 
 pub fn codex_extra_allowed(key: &str) -> bool {
@@ -2803,6 +2900,7 @@ query_params = { api-version = "2026-01-01" }
                         id: "call_1".into(),
                         name: "lookup".into(),
                         arguments: "{\"q\":\"x\"}".into(),
+                        cache: None,
                     }]),
                 },
             ],
@@ -2810,6 +2908,7 @@ query_params = { api-version = "2026-01-01" }
                 name: "lookup".into(),
                 description: Some("Lookup".into()),
                 parameters: json!({"type":"object"}),
+                cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
                 name: "lookup".into(),
@@ -2822,7 +2921,10 @@ query_params = { api-version = "2026-01-01" }
                 budget_tokens: None,
             }),
             metadata: Default::default(),
-            prompt_cache_key: Some("sess-1".into()),
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: Some("sess-1".into()),
+                ..Default::default()
+            }),
             provider_extras: Some(json!({
                 "store": false,
                 "previous_response_id": "resp_1",
@@ -2846,6 +2948,125 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["name"], "out");
         assert_eq!(body["text"]["format"]["schema"], json!({"type": "object"}));
+    }
+
+    #[test]
+    fn anthropic_1h_clamps_to_codex_gpt56_30m() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role": "user", "content": "u"}]
+        });
+        let mut canon = omni_common::anthropic_to_canonical(&body, "codex").unwrap();
+        canon.model = "gpt-5.6-sol".into();
+        let rest = codex_responses_body(&canon, false).unwrap();
+        let ws = codex_response_create_body(&canon).unwrap();
+        assert_eq!(rest["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(ws["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(
+            rest.get("prompt_cache_options"),
+            ws.get("prompt_cache_options")
+        );
+    }
+
+    #[test]
+    fn anthropic_5m_omits_codex_gpt56_ttl() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            "messages": [{"role": "user", "content": "u"}]
+        });
+        let mut canon = omni_common::anthropic_to_canonical(&body, "codex").unwrap();
+        canon.model = "gpt-5.6-sol".into();
+        let rest = codex_responses_body(&canon, false).unwrap();
+        assert!(
+            rest.get("prompt_cache_options")
+                .and_then(|v| v.get("ttl"))
+                .is_none(),
+            "5m has no Codex GPT-5.6+ value ≤ 5m: {rest}"
+        );
+        let ws = codex_response_create_body(&canon).unwrap();
+        assert_eq!(
+            rest.get("prompt_cache_options"),
+            ws.get("prompt_cache_options")
+        );
+    }
+
+    #[test]
+    fn cache_control_breakpoint_becomes_codex_prompt_cache_breakpoint() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "prefix", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "suffix"}
+            ]}]
+        });
+        let mut canon = omni_common::anthropic_to_canonical(&body, "codex").unwrap();
+        canon.model = "gpt-5.6-sol".into();
+        let rest = codex_responses_body(&canon, false).unwrap();
+        let parts = rest["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["prompt_cache_breakpoint"]["mode"], "explicit");
+        assert!(parts[1].get("prompt_cache_breakpoint").is_none());
+        let ws = codex_response_create_body(&canon).unwrap();
+        assert_eq!(rest["input"], ws["input"]);
+    }
+
+    #[test]
+    fn responses_developer_breakpoint_survives_on_codex_wire() {
+        let req: omni_common::ResponsesRequest = serde_json::from_str(
+            r#"{"model":"gpt-5.6-sol","input":[
+                {"role":"developer","content":[
+                    {"type":"input_text","text":"sys","prompt_cache_breakpoint":{"mode":"explicit"}}
+                ]},
+                {"role":"user","content":"hi"}
+            ]}"#,
+        )
+        .unwrap();
+        let canon = omni_common::responses_to_canonical(&req).unwrap();
+        let rest = codex_responses_body(&canon, false).unwrap();
+        assert!(
+            rest.get("instructions").is_none(),
+            "marked developer content must not collapse into instructions: {rest}"
+        );
+        let input = rest["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        let parts = input[0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "sys");
+        assert_eq!(parts[0]["prompt_cache_breakpoint"]["mode"], "explicit");
+        let ws = codex_response_create_body(&canon).unwrap();
+        assert_eq!(rest["input"], ws["input"]);
+        assert_eq!(rest.get("instructions"), ws.get("instructions"));
+    }
+
+    #[test]
+    fn anthropic_marked_system_survives_on_codex_wire() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "system": [{
+                "type": "text",
+                "text": "stable prefix",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "u"}]
+        });
+        let mut canon = omni_common::anthropic_to_canonical(&body, "codex").unwrap();
+        canon.model = "gpt-5.6-sol".into();
+        let rest = codex_responses_body(&canon, false).unwrap();
+        assert!(
+            rest.get("instructions").is_none(),
+            "marked Anthropic system must not collapse into instructions: {rest}"
+        );
+        let input = rest["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        let parts = input[0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "stable prefix");
+        assert_eq!(parts[0]["prompt_cache_breakpoint"]["mode"], "explicit");
+        let ws = codex_response_create_body(&canon).unwrap();
+        assert_eq!(rest["input"], ws["input"]);
     }
 
     #[test]
@@ -3284,17 +3505,22 @@ requires_openai_auth = false
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Blocks(vec![
-                    CanonicalBlock::Text("look".into()),
+                    CanonicalBlock::Text {
+                        text: "look".into(),
+                        cache: None,
+                    },
                     CanonicalBlock::Image {
                         source: omni_core::CanonicalImageSource::Url {
                             url: "https://example.com/a.png".into(),
                         },
+                        cache: None,
                     },
                     CanonicalBlock::Image {
                         source: omni_core::CanonicalImageSource::Base64 {
                             media_type: "image/png".into(),
                             data: "abcd".into(),
                         },
+                        cache: None,
                     },
                 ]),
             }],
@@ -5453,7 +5679,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 role: "user".into(),
                 content: CanonicalContent::Text(big_context.clone()),
             }],
-            prompt_cache_key: cache_key.clone(),
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: cache_key.clone(),
+                ..Default::default()
+            }),
             max_tokens: Some(16),
             ..Default::default()
         };
@@ -5482,7 +5711,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     content: CanonicalContent::Text("Reply with one word: ok".into()),
                 },
             ],
-            prompt_cache_key: cache_key,
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: cache_key,
+                ..Default::default()
+            }),
             max_tokens: Some(16),
             ..Default::default()
         };

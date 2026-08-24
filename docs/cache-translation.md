@@ -1,8 +1,8 @@
-# Cache translation (working decisions)
+# Cache translation
 
-Status: agreed, not implemented. Replaces the working-tree
-`CanonicalRequest.prompt_cache_key: Option<String>` with an internal cache
-intent. Do not treat this file as live wire behavior until the code ships.
+Status: shipped. Official inbound cache fields become internal cache intent
+(`CanonicalRequest.cache` plus block/tool marks). Outbound backends receive
+that backend's official cache fields only. Canonical types stay internal.
 
 Official provider docs remain the source of truth for field names and
 supported values. This file records Omni gateway decisions only.
@@ -166,17 +166,10 @@ Grok has no TTL field. Drop it. Prefix cache duration is Grok’s.
 
 ## Current tree vs this spec
 
-Interim code (to be replaced by this spec):
-
-- `CanonicalRequest.prompt_cache_key: Option<String>` only. No intent object,
-  no block/tool marks.
-- Chat inbound does not read `x-grok-conv-id`.
-- Grok custom Chat outbound still emits `x-grok-conv-id` instead of body
-  `prompt_cache_key`.
-- Translated Anthropic still drops `cache_control` and still lifts
-  `prompt_cache_key` (this spec rejects that Anthropic body key).
-
-Do not treat the interim string field as the final shape.
+Shipped. The interim `CanonicalRequest.prompt_cache_key: Option<String>` lift
+is gone. Inbound parsers store `CanonicalCacheIntent` plus block/tool marks.
+Grok Chat outbound sends body `prompt_cache_key` and never `x-grok-conv-id`.
+Anthropic inbound `prompt_cache_key` is 400; `cache_control` is translated.
 
 ## Tests and live policy
 

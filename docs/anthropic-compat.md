@@ -9,6 +9,10 @@ OpenAI chat (`resolve_provider_and_model`).
 | **grok** / **codex** | Translated through canonical. Best-effort Anthropic shape. |
 | other / missing | Anthropic-shaped 400 |
 
+Native Claude forwards official `cache_control` (including top-level automatic)
+unchanged and returns 400 for body `prompt_cache_key`. The last-4 slot cap is
+translation-only; native passthrough does not rewrite client cache marks.
+
 ### Claude Door-2 `output_config` (issue #22)
 
 On native Claude `/v1/messages`, client `output_config` is **honored**
@@ -53,8 +57,8 @@ thinking is never emitted on Grok/Codex Anthropic SSE/JSON.
 |---|---|
 | User text interleaved with `tool_result` in one user message | All tool results first, then trailing text/images (OAI adjacency) |
 | `top_k` | Dropped |
-| `cache_control` | Dropped today. Go-forward: translate per [`cache-translation.md`](cache-translation.md). |
-| `prompt_cache_key` | Lifted today (interim). Go-forward: reject on Anthropic inbound (not an Anthropic field). |
+| `cache_control` | Translated per [`cache-translation.md`](cache-translation.md). Marks stay on content and tools. |
+| `prompt_cache_key` | 400. Not an Anthropic field; do not add an Omni dialect on this interface. |
 | `stop_sequences` | Grok → extras `stop`; Codex dropped. Response always `stop_sequence: null` |
 | Mid-conversation `role: "system"` | 400 |
 | Trailing assistant prefill | 400 |

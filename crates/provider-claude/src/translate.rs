@@ -15,14 +15,16 @@
 
 use std::collections::BTreeMap;
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use omni_common::Replacements;
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
-    CanonicalReasoningBlock, CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata,
-    CanonicalTool, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, ProviderError,
+    CanonicalBlock, CanonicalCacheMark, CanonicalCacheMode, CanonicalCacheTtl, CanonicalContent,
+    CanonicalImageSource, CanonicalMessage, CanonicalReasoning, CanonicalReasoningBlock,
+    CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata, CanonicalTool,
+    CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, ProviderError, clamp_duration,
 };
 
 use crate::anthropic_passthrough::apply_prompt_replacements;
@@ -76,8 +78,9 @@ pub struct MessagesRequest {
     /// places one cache breakpoint on the last cacheable block and moves it
     /// forward as the conversation grows (the documented analog of OpenAI's
     /// server-side caching). Serialized LAST so it never lands inside the
-    /// cached prefix. Only ever `Some` on first-party routes with auto-cache
-    /// enabled; `None` reproduces the captured Claude Code baseline byte-for-byte.
+    /// cached prefix. Set when the builder copies client `cache.automatic`,
+    /// when Door 2 forwards the client's official top-level `cache_control`,
+    /// or when first-party OpenAI inbound injects gateway auto-cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
 }
@@ -128,6 +131,8 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolResult {
         tool_use_id: String,
@@ -135,6 +140,8 @@ pub enum ContentBlock {
         content: Option<ToolResultContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     Thinking {
         thinking: String,
@@ -143,6 +150,8 @@ pub enum ContentBlock {
     },
     Image {
         source: ImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
@@ -218,12 +227,44 @@ pub struct OutputConfig {
     pub extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CacheControl {
     #[serde(rename = "type")]
     pub kind: String, // "ephemeral"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>, // "5m" or "1h"
+}
+
+impl<'de> Deserialize<'de> for CacheControl {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            ttl: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.kind != "ephemeral" {
+            return Err(de::Error::custom(format!(
+                "cache_control.type must be \"ephemeral\", got {:?}",
+                raw.kind
+            )));
+        }
+        match raw.ttl.as_deref() {
+            None => {}
+            Some("5m") | Some("1h") => {}
+            Some(other) => {
+                return Err(de::Error::custom(format!(
+                    "cache_control.ttl must be \"5m\" or \"1h\", got {other:?}"
+                )));
+            }
+        }
+        Ok(Self {
+            kind: raw.kind,
+            ttl: raw.ttl,
+        })
+    }
 }
 
 // ── Response (non-streaming) ──────────────────────────────────────
@@ -296,6 +337,7 @@ pub fn build_messages_request_from_canonical(
     // Both `system` and `developer` are handled because the Chat Completions
     // surface does not normalize `developer` to `system` (see
     // omni-common/src/http.rs chat_message_to_canonical).
+    let request_ttl = claude_request_ttl(req);
     let mut system_blocks: Vec<SystemBlock> = Vec::new();
     let mut seen_non_system = false;
     let mut messages: Vec<Message> = Vec::new();
@@ -304,28 +346,28 @@ pub fn build_messages_request_from_canonical(
             // Non-text blocks (e.g. an image) in a system/developer message are
             // unrepresentable as system content; fail loud rather than silently
             // drop them (diverges from the reference's silent text-only extract).
-            let text = repl.apply_prompt(&system_text(m)?);
-            if text.is_empty() {
-                // Empty system/developer content contributes nothing; skip it so
-                // we never emit a phantom system block or marked user turn.
+            let hoisted = hoist_system_blocks(m, repl, request_ttl)?;
+            if hoisted.is_empty() {
                 continue;
             }
             if seen_non_system {
-                // Mid-thread: fold in place into a user turn, preserving order.
+                // Mid-thread: one user message holding every hoisted block, each
+                // keeping its cache_control. Splitting per block would add extra
+                // user turns and break adjacent-role / cache-slot layout.
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: MessageContent::Blocks(vec![ContentBlock::Text {
-                        text: format!("[system message]\n{text}"),
-                        cache_control: None,
-                    }]),
+                    content: MessageContent::Blocks(
+                        hoisted
+                            .into_iter()
+                            .map(|block| ContentBlock::Text {
+                                text: format!("[system message]\n{}", block.text),
+                                cache_control: block.cache_control,
+                            })
+                            .collect(),
+                    ),
                 });
             } else {
-                // Leading: accumulate into the top-level `system` field.
-                system_blocks.push(SystemBlock {
-                    kind: "text".to_string(),
-                    text,
-                    cache_control: None,
-                });
+                system_blocks.extend(hoisted);
             }
             continue;
         }
@@ -336,7 +378,7 @@ pub fn build_messages_request_from_canonical(
             CanonicalContent::Blocks(blocks) => {
                 let out: Vec<ContentBlock> = blocks
                     .iter()
-                    .map(|b| canonical_block_to_anthropic(b, repl))
+                    .map(|b| canonical_block_to_anthropic(b, repl, request_ttl))
                     .collect::<Result<_, String>>()?;
                 MessageContent::Blocks(out)
             }
@@ -374,7 +416,7 @@ pub fn build_messages_request_from_canonical(
     }
 
     let tools = match req.tools.as_ref() {
-        Some(t) if !t.is_empty() => Some(translate_tools(t, repl)?),
+        Some(t) if !t.is_empty() => Some(translate_tools(t, repl, request_ttl)?),
         _ => None,
     };
 
@@ -458,10 +500,15 @@ pub fn build_messages_request_from_canonical(
         metadata,
         thinking,
         output_config,
-        // Auto-cache marker is injected later by finalize_claude_wire_request
-        // (step 5), gated on the first-party + enabled check. None here keeps
-        // the direct-builder output identical to the fingerprint baseline.
-        cache_control: None,
+        // Copy client automatic cache_control when present. Gateway auto-cache
+        // injection still happens later in prepare_anthropic_request /
+        // finalize_claude_wire_request when should_inject_gateway_auto_cache
+        // and supports_auto_cache both allow it.
+        cache_control: req
+            .cache
+            .as_ref()
+            .and_then(|c| c.automatic.as_ref())
+            .and_then(|mark| claude_cache_control(Some(mark), request_ttl)),
     })
 }
 
@@ -470,6 +517,189 @@ pub fn build_messages_request_from_canonical(
 /// block (image, tool_use, tool_result) is rejected with a 400-class error
 /// rather than silently dropped, because such content cannot be represented as
 /// Anthropic system content. Multiple text blocks are joined with newlines.
+fn hoist_system_blocks(
+    m: &CanonicalMessage,
+    repl: &Replacements,
+    request_ttl: Option<CanonicalCacheTtl>,
+) -> Result<Vec<SystemBlock>, String> {
+    match &m.content {
+        CanonicalContent::Text(t) => {
+            if t.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![SystemBlock {
+                    kind: "text".into(),
+                    text: repl.apply_prompt(t),
+                    cache_control: None,
+                }])
+            }
+        }
+        CanonicalContent::Blocks(blocks) => {
+            let has_mark = blocks.iter().any(|b| b.cache_mark().is_some());
+            if !has_mark {
+                let text = system_text(m)?;
+                if text.is_empty() {
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![SystemBlock {
+                    kind: "text".into(),
+                    text: repl.apply_prompt(&text),
+                    cache_control: None,
+                }]);
+            }
+            let mut out = Vec::new();
+            for b in blocks {
+                match b {
+                    CanonicalBlock::Text { text, cache } => {
+                        out.push(SystemBlock {
+                            kind: "text".into(),
+                            text: repl.apply_prompt(text),
+                            cache_control: claude_cache_control(cache.as_ref(), request_ttl),
+                        });
+                    }
+                    _ => {
+                        return Err(
+                            "system/developer messages must contain only text content".into()
+                        );
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn claude_request_ttl(req: &CanonicalRequest) -> Option<CanonicalCacheTtl> {
+    let cache = req.cache.as_ref()?;
+    if let Some(ttl) = cache.ttl {
+        return if CanonicalCacheTtl::CLAUDE.contains(&ttl) {
+            Some(ttl)
+        } else {
+            ttl.clamp_down(&CanonicalCacheTtl::CLAUDE)
+        };
+    }
+    cache
+        .legacy_retention
+        .and_then(|ret| clamp_duration(ret.duration_secs(), CanonicalCacheTtl::CLAUDE))
+}
+
+fn claude_cache_control(
+    mark: Option<&CanonicalCacheMark>,
+    request_ttl: Option<CanonicalCacheTtl>,
+) -> Option<CacheControl> {
+    let mark = mark?;
+    let ttl = mark
+        .ttl
+        .map(|ttl| {
+            if CanonicalCacheTtl::CLAUDE.contains(&ttl) {
+                Some(ttl)
+            } else {
+                ttl.clamp_down(&CanonicalCacheTtl::CLAUDE)
+            }
+        })
+        .unwrap_or(request_ttl);
+    Some(CacheControl {
+        kind: "ephemeral".into(),
+        ttl: ttl.map(|t| t.as_str().to_string()),
+    })
+}
+
+fn should_inject_gateway_auto_cache(canon: &CanonicalRequest) -> bool {
+    if canon.has_cache_marks() {
+        return false;
+    }
+    match &canon.cache {
+        Some(cache) if cache.automatic.is_some() => false,
+        Some(cache) if cache.mode == Some(CanonicalCacheMode::Explicit) => false,
+        _ => true,
+    }
+}
+
+fn cap_claude_cache_slots(req: &mut MessagesRequest) {
+    const MAX_SLOTS: usize = 4;
+    let mut remaining_drop = claude_cache_slot_count(req).saturating_sub(MAX_SLOTS);
+    if remaining_drop == 0 {
+        return;
+    }
+    if let Some(tools) = req.tools.as_mut() {
+        for tool in tools {
+            if remaining_drop == 0 {
+                return;
+            }
+            if tool.cache_control.is_some() {
+                tool.cache_control = None;
+                remaining_drop -= 1;
+            }
+        }
+    }
+    if let Some(SystemField::Blocks(blocks)) = req.system.as_mut() {
+        for block in blocks {
+            if remaining_drop == 0 {
+                return;
+            }
+            if block.cache_control.is_some() {
+                block.cache_control = None;
+                remaining_drop -= 1;
+            }
+        }
+    }
+    for message in &mut req.messages {
+        let MessageContent::Blocks(blocks) = &mut message.content else {
+            continue;
+        };
+        for block in blocks {
+            if remaining_drop == 0 {
+                return;
+            }
+            let cache_control = match block {
+                ContentBlock::Text { cache_control, .. }
+                | ContentBlock::Image { cache_control, .. }
+                | ContentBlock::ToolUse { cache_control, .. }
+                | ContentBlock::ToolResult { cache_control, .. } => cache_control,
+                ContentBlock::Thinking { .. } => continue,
+            };
+            if cache_control.is_some() {
+                *cache_control = None;
+                remaining_drop -= 1;
+            }
+        }
+    }
+    if remaining_drop > 0 && req.cache_control.is_some() {
+        req.cache_control = None;
+    }
+}
+
+fn claude_cache_slot_count(req: &MessagesRequest) -> usize {
+    let mut n = 0;
+    if let Some(tools) = req.tools.as_ref() {
+        n += tools.iter().filter(|t| t.cache_control.is_some()).count();
+    }
+    if let Some(SystemField::Blocks(blocks)) = req.system.as_ref() {
+        n += blocks.iter().filter(|b| b.cache_control.is_some()).count();
+    }
+    for message in &req.messages {
+        let MessageContent::Blocks(blocks) = &message.content else {
+            continue;
+        };
+        for block in blocks {
+            let marked = match block {
+                ContentBlock::Text { cache_control, .. }
+                | ContentBlock::Image { cache_control, .. }
+                | ContentBlock::ToolUse { cache_control, .. }
+                | ContentBlock::ToolResult { cache_control, .. } => cache_control.is_some(),
+                ContentBlock::Thinking { .. } => false,
+            };
+            if marked {
+                n += 1;
+            }
+        }
+    }
+    if req.cache_control.is_some() {
+        n += 1;
+    }
+    n
+}
+
 fn system_text(m: &CanonicalMessage) -> Result<String, String> {
     match &m.content {
         CanonicalContent::Text(t) => Ok(t.clone()),
@@ -477,7 +707,7 @@ fn system_text(m: &CanonicalMessage) -> Result<String, String> {
             let mut parts: Vec<&str> = Vec::with_capacity(blocks.len());
             for b in blocks {
                 match b {
-                    CanonicalBlock::Text(t) => parts.push(t),
+                    CanonicalBlock::Text { text: t, .. } => parts.push(t),
                     _ => {
                         return Err(
                             "system/developer messages must contain only text content".into()
@@ -496,32 +726,38 @@ fn system_text(m: &CanonicalMessage) -> Result<String, String> {
 fn canonical_block_to_anthropic(
     block: &CanonicalBlock,
     repl: &Replacements,
+    request_ttl: Option<CanonicalCacheTtl>,
 ) -> Result<ContentBlock, String> {
     Ok(match block {
-        CanonicalBlock::Text(t) => ContentBlock::Text {
+        CanonicalBlock::Text { text: t, cache } => ContentBlock::Text {
             text: repl.apply_prompt(t),
-            cache_control: None,
+            cache_control: claude_cache_control(cache.as_ref(), request_ttl),
         },
         CanonicalBlock::ToolUse {
             id,
             name,
             arguments,
+            cache,
         } => ContentBlock::ToolUse {
             id: id.clone(),
             name: name.clone(),
             input: parse_tool_arguments(arguments)?,
+            cache_control: claude_cache_control(cache.as_ref(), request_ttl),
         },
         CanonicalBlock::ToolResult {
             tool_use_id,
             content,
             is_error,
+            cache,
         } => ContentBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: Some(ToolResultContent::Text(repl.apply_prompt(content))),
             is_error: if *is_error { Some(true) } else { None },
+            cache_control: claude_cache_control(cache.as_ref(), request_ttl),
         },
-        CanonicalBlock::Image { source } => ContentBlock::Image {
+        CanonicalBlock::Image { source, cache } => ContentBlock::Image {
             source: canonical_image_to_anthropic(source)?,
+            cache_control: claude_cache_control(cache.as_ref(), request_ttl),
         },
     })
 }
@@ -597,7 +833,11 @@ fn tool_choice_requires_tool(choice: &Option<CanonicalToolChoice>) -> bool {
     )
 }
 
-fn translate_tools(tools: &[CanonicalTool], repl: &Replacements) -> Result<Vec<Tool>, String> {
+fn translate_tools(
+    tools: &[CanonicalTool],
+    repl: &Replacements,
+    request_ttl: Option<CanonicalCacheTtl>,
+) -> Result<Vec<Tool>, String> {
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
         let name = repl.apply_prompt(&t.name);
@@ -607,7 +847,7 @@ fn translate_tools(tools: &[CanonicalTool], repl: &Replacements) -> Result<Vec<T
             name,
             description,
             input_schema,
-            cache_control: None,
+            cache_control: claude_cache_control(t.cache.as_ref(), request_ttl),
         });
     }
     Ok(out)
@@ -862,6 +1102,7 @@ pub fn prepare_anthropic_request(
         anth.top_p = canon.top_p;
     }
 
+    let inject_auto = supports_auto_cache && should_inject_gateway_auto_cache(canon);
     finalize_claude_wire_request(
         &mut anth,
         &canon.model,
@@ -869,8 +1110,16 @@ pub fn prepare_anthropic_request(
         profile,
         &Replacements::empty(),
         inject_identity,
-        supports_auto_cache,
+        inject_auto,
     );
+    if inject_auto && anth.cache_control.is_some() {
+        if let Some(ttl) = claude_request_ttl(canon) {
+            if let Some(cc) = anth.cache_control.as_mut() {
+                cc.ttl = Some(ttl.as_str().to_string());
+            }
+        }
+    }
+    cap_claude_cache_slots(&mut anth);
     // Explicit client "none"/empty means omit effort, not "use pin default".
     if let Some(effort) = canon.reasoning.as_ref().and_then(|r| r.effort.as_deref())
         && (effort.is_empty() || effort == "none")
@@ -1088,6 +1337,7 @@ mod tests {
                         id: "toolu_1".into(),
                         name: "get_weather".into(),
                         arguments: r#"{"city":"SF"}"#.into(),
+                        cache: None,
                     }]),
                 },
                 CanonicalMessage {
@@ -1096,6 +1346,7 @@ mod tests {
                         tool_use_id: "toolu_1".into(),
                         content: "72F".into(),
                         is_error: false,
+                        cache: None,
                     }]),
                 },
             ],
@@ -1109,7 +1360,9 @@ mod tests {
         assert_eq!(anth.messages[0].role, "assistant");
         match &anth.messages[0].content {
             MessageContent::Blocks(blocks) => match &blocks[0] {
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     assert_eq!(id, "toolu_1");
                     assert_eq!(name, "get_weather");
                     assert_eq!(input["city"], "SF");
@@ -1443,17 +1696,22 @@ mod tests {
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Blocks(vec![
-                    CanonicalBlock::Text("see".into()),
+                    CanonicalBlock::Text {
+                        text: "see".into(),
+                        cache: None,
+                    },
                     CanonicalBlock::Image {
                         source: CanonicalImageSource::Url {
                             url: "https://example.com/a.png".into(),
                         },
+                        cache: None,
                     },
                     CanonicalBlock::Image {
                         source: CanonicalImageSource::Base64 {
                             media_type: "image/png".into(),
                             data: "abcd".into(),
                         },
+                        cache: None,
                     },
                 ]),
             }],
@@ -1465,10 +1723,12 @@ mod tests {
         match &anth.messages[0].content {
             MessageContent::Blocks(blocks) => {
                 assert!(matches!(&blocks[1], ContentBlock::Image {
-                    source: ImageSource::Url { url }
+                    source: ImageSource::Url { url },
+                    ..
                 } if url == "https://example.com/a.png"));
                 assert!(matches!(&blocks[2], ContentBlock::Image {
-                    source: ImageSource::Base64 { media_type, data }
+                    source: ImageSource::Base64 { media_type, data },
+                    ..
                 } if media_type == "image/png" && data == "abcd"));
             }
             other => panic!("expected blocks, got {other:?}"),
@@ -1488,6 +1748,7 @@ mod tests {
                     source: CanonicalImageSource::Url {
                         url: "http://example.com/a.png".into(),
                     },
+                    cache: None,
                 }]),
             }],
             ..Default::default()
@@ -2003,7 +2264,10 @@ mod tests {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
             }],
-            prompt_cache_key: Some("sess-1".into()),
+            cache: Some(omni_core::CanonicalCacheIntent {
+                routing_identity: Some("sess-1".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let profile = crate::fingerprint::default_profile();
@@ -2015,6 +2279,70 @@ mod tests {
             val.get("prompt_cache_key").is_none(),
             "Claude Anthropic body must not carry prompt_cache_key: {val}"
         );
+    }
+
+    #[test]
+    fn openai_30m_ttl_clamps_to_claude_5m_never_1h() {
+        let req: omni_common::ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],
+                "prompt_cache_options":{"ttl":"30m"}}"#,
+        )
+        .unwrap();
+        let canon = omni_common::to_canonical(&req).unwrap();
+        let profile = crate::fingerprint::default_profile();
+        let anth = prepare_anthropic_request(&canon, profile, &empty_repl(), true, true).unwrap();
+        let ttl = anth.cache_control.as_ref().and_then(|c| c.ttl.as_deref());
+        assert_eq!(ttl, Some("5m"));
+        assert_ne!(ttl, Some("1h"));
+    }
+
+    #[test]
+    fn explicit_mode_without_breakpoints_does_not_inject_claude_auto_cache() {
+        let req: omni_common::ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],
+                "prompt_cache_options":{"mode":"explicit"}}"#,
+        )
+        .unwrap();
+        let canon = omni_common::to_canonical(&req).unwrap();
+        let profile = crate::fingerprint::default_profile();
+        let anth = prepare_anthropic_request(&canon, profile, &empty_repl(), true, true).unwrap();
+        assert!(
+            anth.cache_control.is_none(),
+            "explicit with no breakpoints must not inject auto-cache: {:?}",
+            anth.cache_control
+        );
+    }
+
+    #[test]
+    fn claude_keeps_last_four_cache_slots() {
+        let req: omni_common::ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"sonnet","messages":[{"role":"user","content":[
+                {"type":"text","text":"a","prompt_cache_breakpoint":{"mode":"explicit"}},
+                {"type":"text","text":"b","prompt_cache_breakpoint":{"mode":"explicit"}},
+                {"type":"text","text":"c","prompt_cache_breakpoint":{"mode":"explicit"}},
+                {"type":"text","text":"d","prompt_cache_breakpoint":{"mode":"explicit"}},
+                {"type":"text","text":"e","prompt_cache_breakpoint":{"mode":"explicit"}}
+            ]}]}"#,
+        )
+        .unwrap();
+        let canon = omni_common::to_canonical(&req).unwrap();
+        let profile = crate::fingerprint::default_profile();
+        let anth = prepare_anthropic_request(&canon, profile, &empty_repl(), true, true).unwrap();
+        let MessageContent::Blocks(blocks) = &anth.messages[0].content else {
+            panic!("expected blocks");
+        };
+        let marked: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text {
+                    text,
+                    cache_control: Some(_),
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marked, vec!["b", "c", "d", "e"]);
+        assert!(anth.cache_control.is_none());
     }
 
     #[test]
@@ -2175,11 +2503,13 @@ mod tests {
                             id: "t1".into(),
                             name: "f".into(),
                             arguments: "{}".into(),
+                            cache: None,
                         },
                         CanonicalBlock::ToolUse {
                             id: "t2".into(),
                             name: "g".into(),
                             arguments: "{}".into(),
+                            cache: None,
                         },
                     ]),
                 },
@@ -2189,6 +2519,7 @@ mod tests {
                         tool_use_id: "t1".into(),
                         content: "A".into(),
                         is_error: false,
+                        cache: None,
                     }]),
                 },
                 CanonicalMessage {
@@ -2197,6 +2528,7 @@ mod tests {
                         tool_use_id: "t2".into(),
                         content: "B".into(),
                         is_error: false,
+                        cache: None,
                     }]),
                 },
             ],
@@ -2358,6 +2690,65 @@ mod tests {
     }
 
     #[test]
+    fn mid_thread_marked_system_stays_one_user_message() {
+        // WHY: a mid-thread system/developer with several cache marks must fold
+        // into a single user turn. One user message per block would split the
+        // conversation and drop the joint cache layout.
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![
+                user_msg("u1"),
+                CanonicalMessage {
+                    role: "system".into(),
+                    content: CanonicalContent::Blocks(vec![
+                        CanonicalBlock::Text {
+                            text: "first".into(),
+                            cache: Some(omni_core::CanonicalCacheMark::breakpoint()),
+                        },
+                        CanonicalBlock::Text {
+                            text: "second".into(),
+                            cache: Some(omni_core::CanonicalCacheMark::breakpoint()),
+                        },
+                    ]),
+                },
+                user_msg("u2"),
+            ],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let model_def = profile.resolve_model("haiku");
+        let anth = build_messages_request_from_canonical(&req, model_def, &empty_repl()).unwrap();
+        assert_eq!(anth.messages.len(), 3);
+        assert_eq!(anth.messages[1].role, "user");
+        match &anth.messages[1].content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                match &blocks[0] {
+                    ContentBlock::Text {
+                        text,
+                        cache_control,
+                    } => {
+                        assert_eq!(text, "[system message]\nfirst");
+                        assert!(cache_control.is_some());
+                    }
+                    other => panic!("expected Text, got {other:?}"),
+                }
+                match &blocks[1] {
+                    ContentBlock::Text {
+                        text,
+                        cache_control,
+                    } => {
+                        assert_eq!(text, "[system message]\nsecond");
+                        assert!(cache_control.is_some());
+                    }
+                    other => panic!("expected Text, got {other:?}"),
+                }
+            }
+            other => panic!("expected one Blocks user turn, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn multiple_leading_system_messages_concatenate_as_blocks() {
         let anth = build_haiku(vec![
             sys_msg("system", "One."),
@@ -2409,6 +2800,7 @@ mod tests {
                         source: CanonicalImageSource::Url {
                             url: "https://example.com/x.png".into(),
                         },
+                        cache: None,
                     }]),
                 },
                 user_msg("hi"),

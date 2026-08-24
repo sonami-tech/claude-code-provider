@@ -10,7 +10,7 @@ Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 | Feature | Chat Completions | Responses | Claude | Grok | Codex |
 |---|---:|---:|---:|---:|---:|
 | Text messages | Yes | Yes | Yes | Yes | Yes |
-| `prompt_cache_key` | Yes | Yes | Ignored on Claude wire | Yes (Responses body; Chat currently `x-grok-conv-id`, go-forward body key) | Yes |
+| Official cache fields | Yes (`prompt_cache_key`, `x-grok-conv-id`, options, breakpoints) | Yes (`prompt_cache_key`, options, breakpoints) | Consume routing identity; emit `cache_control` | Yes (body `prompt_cache_key`; never `x-grok-conv-id`) | Yes (REST and ChatGPT WS share one cache payload) |
 | Function tools | Yes | Yes | Yes | Yes | Yes |
 | Tool result loops | Yes | Yes | Yes | Yes | Yes |
 | Image URL input | Yes | Yes | Yes | Yes | Yes |
@@ -32,10 +32,11 @@ Unsupported typed media parts fail loudly with a request error.
 | Hosted/computer tools | Passthrough | No (400) | No (400) |
 | `count_tokens` | Yes | No (400) | No (400) |
 | Fingerprint / cch | Yes | No | No |
-| `prompt_cache_key` | Ignored (not Anthropic) | Lifted today (interim; go-forward reject) | Lifted today (interim; go-forward reject) |
+| Official `cache_control` | Native passthrough | Translated | Translated |
+| Body `prompt_cache_key` | 400 | 400 | 400 |
 
 Details and lossy fields: `docs/anthropic-compat.md`.
-Go-forward cache translation: `docs/cache-translation.md`.
+Shipped cache translation: `docs/cache-translation.md`.
 
 ## Responses Fields
 
