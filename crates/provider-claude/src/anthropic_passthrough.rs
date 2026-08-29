@@ -767,6 +767,34 @@ mod tests {
     }
 
     #[test]
+    fn native_ingress_preserves_all_anthropic_tool_choice_modes() {
+        for choice in [
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+            serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
+            serde_json::json!({"type": "tool", "name": "read", "disable_parallel_tool_use": true}),
+            serde_json::json!({"type": "none"}),
+        ] {
+            let expected_type = choice["type"].as_str().unwrap();
+            let body = serde_json::json!({
+                "model": "claude-sonnet-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "use tools"}],
+                "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+                "tool_choice": choice
+            });
+            let wire = serde_json::to_value(parse_client(body).to_messages_request())
+                .expect("request serializes");
+            assert_eq!(wire["tool_choice"]["type"], expected_type);
+            if expected_type == "tool" {
+                assert_eq!(wire["tool_choice"]["name"], "read");
+            }
+            if expected_type != "none" {
+                assert_eq!(wire["tool_choice"]["disable_parallel_tool_use"], true);
+            }
+        }
+    }
+
+    #[test]
     fn reconcile_flat_system_prepends_identity() {
         let body = serde_json::json!({
             "model": "claude-haiku-4-5",

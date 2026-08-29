@@ -1,6 +1,6 @@
 # Compatibility Matrix
 
-Last updated: 2026-08-24.
+Last updated: 2026-08-28.
 
 Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 `OMNI_LIVE_TESTS=1`.
@@ -12,6 +12,7 @@ Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 | Text messages | Yes | Yes | Yes | Yes | Yes |
 | Official cache fields | Yes (`prompt_cache_key`, `x-grok-conv-id`, options, breakpoints) | Yes (`prompt_cache_key`, options, breakpoints) | Consume routing identity; emit `cache_control` | Yes (body `prompt_cache_key`; never `x-grok-conv-id`) | Yes (REST and ChatGPT WS share one cache payload) |
 | Function tools | Yes | Yes | Yes | Yes | Yes |
+| OpenAI `allowed_tools` function subset | Yes (filtered) | Yes (filtered) | Translated | Translated | Translated |
 | Tool result loops | Yes | Yes | Yes | Yes | Yes |
 | Image URL input | Yes | Yes | Yes | Yes | Yes |
 | Base64 image input | Yes | Yes | Yes | Yes | Yes |
@@ -26,6 +27,7 @@ Unsupported typed media parts fail loudly with a request error.
 |---|---:|---:|---:|
 | Text + multi-block | Yes | Yes | Yes |
 | Function tools + tool loops | Yes | Yes | Yes |
+| `tool_choice` (`auto` / `any` / `tool` / `none`) | Yes | Yes | Yes |
 | Images (url/base64) | Yes | Yes | Yes |
 | Streaming SSE | Yes (raw) | Yes (framed) | Yes (framed) |
 | Thinking wire emit | Yes | No | No |

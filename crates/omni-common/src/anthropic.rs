@@ -1752,6 +1752,39 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_tool_choice_modes_map_on_translated_ingress() {
+        for (kind, expected) in [
+            ("auto", CanonicalToolChoice::Auto),
+            ("any", CanonicalToolChoice::Required),
+            ("none", CanonicalToolChoice::None),
+        ] {
+            let body = json!({
+                "model": "m",
+                "max_tokens": 10,
+                "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": kind},
+                "messages": [{"role": "user", "content": "use tools"}]
+            });
+            let canon = anthropic_to_canonical(&body, "grok").expect("mode must convert");
+            assert_eq!(
+                std::mem::discriminant(canon.tool_choice.as_ref().expect("choice")),
+                std::mem::discriminant(&expected),
+                "Anthropic tool_choice {kind} mapped incorrectly"
+            );
+        }
+
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "tool_choice": {"type": "allowed_tools"},
+            "messages": [{"role": "user", "content": "use tools"}]
+        });
+        let err = anthropic_to_canonical(&body, "grok")
+            .expect_err("non-Anthropic tool choice must reject");
+        assert!(err.0.contains("allowed_tools"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn hosted_tool_rejected() {
         let body = json!({
             "model": "m",

@@ -168,6 +168,21 @@ pub enum ResponsesToolChoice {
         kind: String,
         name: String,
     },
+    /// `{type:"allowed_tools",mode,tools:[...]}`
+    Allowed {
+        #[serde(rename = "type")]
+        kind: String,
+        mode: String,
+        tools: Vec<ResponsesAllowedTool>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ResponsesAllowedTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 // ── Response (Serialize) ──────────────────────────────────────────
@@ -349,7 +364,7 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
     }
 
     // Flattened function tools -> canonical tools (non-function tools rejected).
-    let tools = match req.tools.as_ref() {
+    let mut tools = match req.tools.as_ref() {
         Some(ts) if !ts.is_empty() => {
             let mut out = Vec::with_capacity(ts.len());
             for t in ts {
@@ -371,8 +386,8 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         _ => None,
     };
 
-    // tool_choice: "auto"->Auto, "required"->Required, "none"->None (tools stay
-    // visible but the model must not call them), {function,name}->Specific.
+    // Standard modes and one forced function map directly. An allowed subset
+    // is enforced by filtering tools before provider dispatch.
     let tool_choice = match req.tool_choice.as_ref() {
         Some(ResponsesToolChoice::Mode(mode)) => match mode.as_str() {
             "auto" => Some(CanonicalToolChoice::Auto),
@@ -385,6 +400,28 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
                 return Err(format!("unsupported tool_choice type: {kind}"));
             }
             Some(CanonicalToolChoice::Specific { name: name.clone() })
+        }
+        Some(ResponsesToolChoice::Allowed {
+            kind,
+            mode,
+            tools: allowed_tools,
+        }) => {
+            if kind != "allowed_tools" {
+                return Err(format!("unsupported tool_choice type: {kind}"));
+            }
+            let mut names = Vec::with_capacity(allowed_tools.len());
+            for tool in allowed_tools {
+                if tool.kind != "function" {
+                    return Err(format!("unsupported allowed tool type: {}", tool.kind));
+                }
+                let name = tool
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| "allowed function tool requires a non-empty name".to_string())?;
+                names.push(name.to_string());
+            }
+            restrict_tools_to_allowed(&mut tools, mode, &names)?
         }
         None => None,
     };
@@ -432,6 +469,40 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         cache,
         provider_extras,
     })
+}
+
+fn restrict_tools_to_allowed(
+    tools: &mut Option<Vec<CanonicalTool>>,
+    mode: &str,
+    allowed_names: &[String],
+) -> Result<Option<CanonicalToolChoice>, String> {
+    let choice = match mode {
+        "auto" => CanonicalToolChoice::Auto,
+        "required" => CanonicalToolChoice::Required,
+        other => return Err(format!("unsupported allowed_tools mode: {other}")),
+    };
+
+    for name in allowed_names {
+        if !tools
+            .as_ref()
+            .is_some_and(|declared| declared.iter().any(|tool| tool.name == name.as_str()))
+        {
+            return Err(format!("allowed tool is not declared: {name}"));
+        }
+    }
+
+    if allowed_names.is_empty() {
+        if mode == "required" {
+            return Err("allowed_tools mode required needs at least one tool".into());
+        }
+        *tools = None;
+        return Ok(None);
+    }
+
+    if let Some(declared) = tools.as_mut() {
+        declared.retain(|tool| allowed_names.iter().any(|name| name == &tool.name));
+    }
+    Ok(Some(choice))
 }
 
 fn responses_instructions_to_canonical(
@@ -1867,6 +1938,78 @@ mod tests {
             "tool_choice none must map to CanonicalToolChoice::None, got {:?}",
             canon.tool_choice
         );
+    }
+
+    #[test]
+    fn to_canonical_filters_responses_allowed_tools_for_both_modes() {
+        for (mode, required) in [("auto", false), ("required", true)] {
+            let req = parse(&format!(
+                r#"{{"model":"m","input":"q","tools":[
+                    {{"type":"function","name":"read"}},
+                    {{"type":"function","name":"write"}},
+                    {{"type":"function","name":"inspect"}}
+                ],"tool_choice":{{"type":"allowed_tools","mode":"{mode}","tools":[
+                    {{"type":"function","name":"read"}},
+                    {{"type":"function","name":"inspect"}}
+                ]}}}}"#,
+            ));
+            let canon = responses_to_canonical(&req).expect("allowed tools must convert");
+            let names = canon
+                .tools
+                .as_ref()
+                .expect("allowed tools remain")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["read", "inspect"]);
+            assert!(
+                matches!(
+                    &canon.tool_choice,
+                    Some(CanonicalToolChoice::Required) if required
+                ) || matches!(
+                    &canon.tool_choice,
+                    Some(CanonicalToolChoice::Auto) if !required
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn responses_allowed_tools_rejects_invalid_or_unsafe_subsets() {
+        let undeclared = parse(
+            r#"{"model":"m","input":"q","tools":[{"type":"function","name":"read"}],
+                "tool_choice":{"type":"allowed_tools","mode":"auto","tools":[
+                    {"type":"function","name":"write"}
+                ]}}"#,
+        );
+        let err = responses_to_canonical(&undeclared).expect_err("undeclared tool must reject");
+        assert!(err.contains("write"), "error must name the tool: {err}");
+
+        let bad_mode = parse(
+            r#"{"model":"m","input":"q","tools":[{"type":"function","name":"read"}],
+                "tool_choice":{"type":"allowed_tools","mode":"sometimes","tools":[
+                    {"type":"function","name":"read"}
+                ]}}"#,
+        );
+        let err = responses_to_canonical(&bad_mode).expect_err("bad mode must reject");
+        assert!(err.contains("sometimes"), "error must name the mode: {err}");
+
+        let empty_required = parse(
+            r#"{"model":"m","input":"q","tools":[{"type":"function","name":"read"}],
+                "tool_choice":{"type":"allowed_tools","mode":"required","tools":[]}}"#,
+        );
+        let err =
+            responses_to_canonical(&empty_required).expect_err("empty required subset must reject");
+        assert!(err.contains("at least one tool"), "unexpected error: {err}");
+
+        let empty_auto = parse(
+            r#"{"model":"m","input":"q","tools":[{"type":"function","name":"read"}],
+                "tool_choice":{"type":"allowed_tools","mode":"auto","tools":[]}}"#,
+        );
+        let canon =
+            responses_to_canonical(&empty_auto).expect("empty auto subset disables all tools");
+        assert!(canon.tools.is_none());
+        assert!(canon.tool_choice.is_none());
     }
 
     #[test]

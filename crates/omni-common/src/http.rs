@@ -124,7 +124,8 @@ pub struct ChatToolFunction {
     pub parameters: Option<serde_json::Value>,
 }
 
-/// `tool_choice`: either a bare mode string or a forced function selection.
+/// `tool_choice`: a bare mode string, a forced function selection, or an
+/// allowed subset of the declared tools.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ChatToolChoice {
@@ -136,11 +137,31 @@ pub enum ChatToolChoice {
         kind: String,
         function: ChatToolChoiceFunction,
     },
+    /// `{type:"allowed_tools",allowed_tools:{mode,tools:[...]}}`
+    Allowed {
+        #[serde(rename = "type")]
+        kind: String,
+        allowed_tools: ChatAllowedTools,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatToolChoiceFunction {
     pub name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatAllowedTools {
+    pub mode: String,
+    pub tools: Vec<ChatAllowedTool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatAllowedTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub function: Option<ChatToolChoiceFunction>,
 }
 
 /// Minimal OpenAI-compatible chat completion response (non-streaming).
@@ -418,7 +439,7 @@ pub fn to_canonical_with_headers(
         .collect::<Result<_, _>>()?;
 
     // Nested function tools -> canonical tools (non-function tools rejected).
-    let tools = match req.tools.as_ref() {
+    let mut tools = match req.tools.as_ref() {
         Some(ts) if !ts.is_empty() => {
             let mut out = Vec::with_capacity(ts.len());
             for t in ts {
@@ -441,8 +462,8 @@ pub fn to_canonical_with_headers(
         _ => None,
     };
 
-    // tool_choice: "auto"->Auto, "required"->Required, "none"->None (tools stay
-    // visible), {function,name}->Specific.
+    // tool_choice: standard modes and one forced function map directly. An
+    // allowed subset is enforced by filtering tools before provider dispatch.
     let tool_choice = match req.tool_choice.as_ref() {
         Some(ChatToolChoice::Mode(mode)) => match mode.as_str() {
             "auto" => Some(CanonicalToolChoice::Auto),
@@ -457,6 +478,28 @@ pub fn to_canonical_with_headers(
             Some(CanonicalToolChoice::Specific {
                 name: function.name.clone(),
             })
+        }
+        Some(ChatToolChoice::Allowed {
+            kind,
+            allowed_tools,
+        }) => {
+            if kind != "allowed_tools" {
+                return Err(format!("unsupported tool_choice type: {kind}"));
+            }
+            let mut names = Vec::with_capacity(allowed_tools.tools.len());
+            for tool in &allowed_tools.tools {
+                if tool.kind != "function" {
+                    return Err(format!("unsupported allowed tool type: {}", tool.kind));
+                }
+                let name = tool
+                    .function
+                    .as_ref()
+                    .map(|function| function.name.as_str())
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| "allowed function tool requires a non-empty name".to_string())?;
+                names.push(name.to_string());
+            }
+            restrict_tools_to_allowed(&mut tools, &allowed_tools.mode, &names)?
         }
         None => None,
     };
@@ -478,6 +521,40 @@ pub fn to_canonical_with_headers(
         cache,
         provider_extras,
     })
+}
+
+fn restrict_tools_to_allowed(
+    tools: &mut Option<Vec<CanonicalTool>>,
+    mode: &str,
+    allowed_names: &[String],
+) -> Result<Option<CanonicalToolChoice>, String> {
+    let choice = match mode {
+        "auto" => CanonicalToolChoice::Auto,
+        "required" => CanonicalToolChoice::Required,
+        other => return Err(format!("unsupported allowed_tools mode: {other}")),
+    };
+
+    for name in allowed_names {
+        if !tools
+            .as_ref()
+            .is_some_and(|declared| declared.iter().any(|tool| tool.name == name.as_str()))
+        {
+            return Err(format!("allowed tool is not declared: {name}"));
+        }
+    }
+
+    if allowed_names.is_empty() {
+        if mode == "required" {
+            return Err("allowed_tools mode required needs at least one tool".into());
+        }
+        *tools = None;
+        return Ok(None);
+    }
+
+    if let Some(declared) = tools.as_mut() {
+        declared.retain(|tool| allowed_names.iter().any(|name| name == &tool.name));
+    }
+    Ok(Some(choice))
 }
 
 /// Convert one chat message into a canonical message. Plain text and
@@ -1461,6 +1538,84 @@ mod tests {
                 "tool_choice {mode} mapped wrong"
             );
         }
+    }
+
+    #[test]
+    fn to_canonical_filters_chat_allowed_tools_for_both_modes() {
+        for (mode, required) in [("auto", false), ("required", true)] {
+            let req = req_from_json(&format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],
+                    "tools":[
+                        {{"type":"function","function":{{"name":"read"}}}},
+                        {{"type":"function","function":{{"name":"write"}}}},
+                        {{"type":"function","function":{{"name":"inspect"}}}}
+                    ],
+                    "tool_choice":{{"type":"allowed_tools","allowed_tools":{{
+                        "mode":"{mode}","tools":[
+                            {{"type":"function","function":{{"name":"read"}}}},
+                            {{"type":"function","function":{{"name":"inspect"}}}}
+                        ]
+                    }}}}}}"#,
+            ));
+            let canon = to_canonical(&req).expect("allowed tools must convert");
+            let names = canon
+                .tools
+                .as_ref()
+                .expect("allowed tools remain")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["read", "inspect"]);
+            assert!(
+                matches!(
+                    &canon.tool_choice,
+                    Some(CanonicalToolChoice::Required) if required
+                ) || matches!(
+                    &canon.tool_choice,
+                    Some(CanonicalToolChoice::Auto) if !required
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn chat_allowed_tools_rejects_invalid_or_unsafe_subsets() {
+        let undeclared = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"read"}}],
+                "tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[
+                    {"type":"function","function":{"name":"write"}}
+                ]}}}"#,
+        );
+        let err = to_canonical(&undeclared).expect_err("undeclared tool must reject");
+        assert!(err.contains("write"), "error must name the tool: {err}");
+
+        let bad_mode = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"read"}}],
+                "tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"sometimes","tools":[
+                    {"type":"function","function":{"name":"read"}}
+                ]}}}"#,
+        );
+        let err = to_canonical(&bad_mode).expect_err("bad mode must reject");
+        assert!(err.contains("sometimes"), "error must name the mode: {err}");
+
+        let empty_required = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"read"}}],
+                "tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[]}}}"#,
+        );
+        let err = to_canonical(&empty_required).expect_err("empty required subset must reject");
+        assert!(err.contains("at least one tool"), "unexpected error: {err}");
+
+        let empty_auto = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"read"}}],
+                "tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[]}}}"#,
+        );
+        let canon = to_canonical(&empty_auto).expect("empty auto subset disables all tools");
+        assert!(canon.tools.is_none());
+        assert!(canon.tool_choice.is_none());
     }
 
     #[test]
