@@ -326,8 +326,22 @@ pub const BETA_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-t
 pub const BETA_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 /// Active-pin haiku beta list.
 pub const BETA_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,extended-cache-ttl-2025-04-11";
+/// Active-pin fable beta list (Fable 5.1 and explicit Fable 5; same membership as opus).
+pub const BETA_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11";
 
 const MODEL_BETA_OVERRIDES: &[ModelBetaOverride] = &[
+    ModelBetaOverride {
+        model: "claude-fable-5-1",
+        beta_reply: BETA_FABLE,
+    },
+    ModelBetaOverride {
+        model: "claude-fable-5",
+        beta_reply: BETA_FABLE,
+    },
+    ModelBetaOverride {
+        model: "fable",
+        beta_reply: BETA_FABLE,
+    },
     ModelBetaOverride {
         model: "claude-opus-5",
         beta_reply: BETA_OPUS,
@@ -350,8 +364,21 @@ const MODEL_BETA_OVERRIDES: &[ModelBetaOverride] = &[
     },
 ];
 
-// Active-pin wire: opus-5 + sonnet-5 64k/no-temp/high; haiku 32k/no-temp/no-effort.
+// Active-pin wire: fable-5.1 + fable-5 + opus-5 + sonnet-5 64k/no-temp/high;
+// haiku 32k/no-temp/no-effort.
 const MODEL_WIRE_OVERRIDES: &[ModelWireOverride] = &[
+    ModelWireOverride {
+        model: "claude-fable-5-1",
+        max_tokens: 64_000,
+        temperature: None,
+        output_effort: Some("high"),
+    },
+    ModelWireOverride {
+        model: "claude-fable-5",
+        max_tokens: 64_000,
+        temperature: None,
+        output_effort: Some("high"),
+    },
     ModelWireOverride {
         model: "claude-opus-5",
         max_tokens: 64_000,
@@ -847,6 +874,8 @@ mod tests {
         let profile = default_profile();
         let creds = fixture_creds();
         let cases = [
+            ("claude-fable-5-1", BETA_FABLE),
+            ("claude-fable-5", BETA_FABLE),
             ("claude-opus-5", BETA_OPUS),
             ("claude-sonnet-5", BETA_SONNET),
             ("claude-haiku-4-5", BETA_HAIKU),
@@ -871,6 +900,7 @@ mod tests {
         let profile = default_profile();
         let creds = fixture_creds();
         let cases = [
+            ("fable", BETA_FABLE, false),
             ("opus", BETA_OPUS, false),
             ("sonnet", BETA_SONNET, false),
             ("haiku", BETA_HAIKU, false),
@@ -1009,7 +1039,10 @@ mod tests {
             profile.user_agent(),
             "claude-cli/2.1.257 (external, sdk-cli)"
         );
-        assert!(profile.resolve_model("fable").is_none());
+        assert_eq!(
+            profile.resolve_model("fable").unwrap().canonical,
+            "claude-fable-5-1"
+        );
         assert_eq!(
             profile.resolve_model("opus").unwrap().canonical,
             "claude-opus-5"
@@ -1025,7 +1058,11 @@ mod tests {
         assert!(profile.beta_reply.contains("fallback-credit-2026-06-01"));
         assert_eq!(profile.beta_reply_for_model("claude-opus-5"), BETA_OPUS);
         assert_eq!(profile.beta_reply_for_model("claude-sonnet-5"), BETA_SONNET);
-        // Wire golden: opus/sonnet 64k no-temp high; haiku 32k no-temp no-effort.
+        // Wire golden: fable/opus/sonnet 64k no-temp high; haiku 32k no-temp no-effort.
+        let fable_w = profile.wire_defaults_for_model("claude-fable-5-1");
+        assert_eq!(fable_w.max_tokens, 64_000);
+        assert_eq!(fable_w.temperature, None);
+        assert_eq!(fable_w.output_effort, Some("high"));
         let opus_w = profile.wire_defaults_for_model("claude-opus-5");
         assert_eq!(opus_w.max_tokens, 64_000);
         assert_eq!(opus_w.temperature, None);

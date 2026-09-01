@@ -3089,11 +3089,8 @@ mod tests {
         let (k, m) = resolve_provider_and_model("claude-sonnet-4-6", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-4-6"));
 
-        let err = resolve_provider_and_model("fable", &catalogs).unwrap_err();
-        assert!(
-            err.contains("unknown model"),
-            "fable must be unroutable after the Claude 2.1.232 catalog drop: {err}"
-        );
+        let (k, m) = resolve_provider_and_model("fable", &catalogs).unwrap();
+        assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-fable-5-1"));
 
         let (k, m) = resolve_provider_and_model("sonnet", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-5"));
@@ -3170,6 +3167,7 @@ mod tests {
         for expected in [
             "sonnet=claude-sonnet-5",
             "opus=claude-opus-5",
+            "fable=claude-fable-5-1",
             "haiku=claude-haiku-4-5-20251001",
             "grok=grok-4.6",
             "gpt=",
@@ -3185,8 +3183,8 @@ mod tests {
             "startup alias log must not advertise the pruned codex alias: {text}"
         );
         assert!(
-            !text.contains("fable="),
-            "startup alias log must not advertise retired fable alias: {text}"
+            text.contains("fable=claude-fable-5-1"),
+            "startup alias log must advertise live fable alias: {text}"
         );
         // composer dropped from grok-shell 1.0.13 advertised catalog.
         assert!(

@@ -1811,6 +1811,9 @@ mod tests {
             Option<&'static str>,
         );
         let cases: &[WireCase] = &[
+            ("fable", "claude-fable-5-1", 64_000, None, Some("high")),
+            ("claude-fable-5-1", "claude-fable-5-1", 64_000, None, Some("high")),
+            ("claude-fable-5", "claude-fable-5", 64_000, None, Some("high")),
             ("opus", "claude-opus-5", 64_000, None, Some("high")),
             ("sonnet", "claude-sonnet-5", 64_000, None, Some("high")),
             // The "haiku" alias resolves to the dated canonical; 2.1.220 omits

@@ -16,8 +16,17 @@ pub struct ModelDef {
 }
 
 /// Active Claude Code model catalog (pin 2.1.257).
-/// Opus is `claude-opus-5`, sonnet is `claude-sonnet-5`, and haiku is dated.
+/// Fable alias is `claude-fable-5-1`. Opus is `claude-opus-5`, sonnet is
+/// `claude-sonnet-5`, and haiku is dated. Explicit `claude-fable-5` stays
+/// pass-through plus a wire/beta override, not a second advertised row.
 pub static MODEL_CATALOG: &[ModelDef] = &[
+    ModelDef {
+        canonical: "claude-fable-5-1",
+        cli_name: "fable",
+        aliases: &["fable"],
+        context_window: 1_000_000,
+        max_tokens: 64_000,
+    },
     ModelDef {
         canonical: "claude-opus-5",
         cli_name: "opus",
@@ -175,6 +184,10 @@ mod tests {
             profile().resolve_model("haiku").unwrap().canonical,
             "claude-haiku-4-5-20251001"
         );
+        assert_eq!(
+            profile().resolve_model("fable").unwrap().canonical,
+            "claude-fable-5-1"
+        );
     }
 
     #[test]
@@ -237,12 +250,13 @@ mod tests {
     #[test]
     fn models_list_returns_default_catalog() {
         let list = profile().models_list();
-        assert_eq!(list.len(), 3);
-        assert_eq!(list[0].id, "claude-opus-5");
-        assert_eq!(list[1].id, "claude-sonnet-5");
-        assert_eq!(list[2].id, "claude-haiku-4-5-20251001");
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[0].id, "claude-fable-5-1");
+        assert_eq!(list[1].id, "claude-opus-5");
+        assert_eq!(list[2].id, "claude-sonnet-5");
+        assert_eq!(list[3].id, "claude-haiku-4-5-20251001");
         assert_eq!(list[0].context_window, 1_000_000);
-        assert_eq!(list[2].max_tokens, 64_000);
+        assert_eq!(list[3].max_tokens, 64_000);
     }
 
     #[test]

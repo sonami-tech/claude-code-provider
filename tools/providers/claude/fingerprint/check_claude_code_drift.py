@@ -426,7 +426,7 @@ def emit_vectors(claude_bin: str, version: str, out_dir: str, timeout: int) -> i
 		return 1
 
 	os.makedirs(out_dir, exist_ok=True)
-	models = ["claude-fable-5", "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
+	models = ["claude-fable-5-1", "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
 	home = make_clean_home()
 	emitted: list[dict[str, object]] = []
 	try:

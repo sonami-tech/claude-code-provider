@@ -39,7 +39,7 @@ Design narrative: [`DESIGN.md`](DESIGN.md). Decision record:
 
 - `omni` - the only server binary. Routes by canonical upstream model id
   (`claude-sonnet-5`, `grok-4.6`, or the configured Codex model),
-  documented shorthand alias (`sonnet`, `opus`, `haiku`, `grok`,
+  documented shorthand alias (`sonnet`, `opus`, `haiku`, `fable`, `grok`,
   `gpt`), or optional provider prefix (`claude:...`,
   `grok:...`, `codex:...`) when a caller needs to force a provider.
 
@@ -141,6 +141,7 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 - `sonnet` -> `claude-sonnet-5`
 - `opus` -> `claude-opus-5`
 - `haiku` -> `claude-haiku-4-5-20251001`
+- `fable` -> `claude-fable-5-1`
 - `grok` -> `grok-4.6`
 - `gpt` -> the current Codex model from `$CODEX_HOME/config.toml` or
   `~/.codex/config.toml`, falling back to the provider default

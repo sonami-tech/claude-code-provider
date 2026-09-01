@@ -51,6 +51,8 @@ Header names and dynamic values are pinned in
 | no `--model` | `claude-opus-5` | default (+fallback-credit) | 64000 | omitted | `high` |
 | `opus` | `claude-opus-5` | opus (+fallback-credit) | 64000 | omitted | `high` |
 | `sonnet` | `claude-sonnet-5` | opus list (no fallback) | 64000 | omitted | `high` |
+| `fable` | `claude-fable-5-1` | opus (+fallback-credit) | 64000 | omitted | `high` |
+| `claude-fable-5` | `claude-fable-5` | opus (+fallback-credit) | 64000 | omitted | `high` |
 | `haiku` | `claude-haiku-4-5-20251001` | haiku | 32000 | omitted | omitted |
 
 Default beta (2.1.257, same membership as 2.1.232):

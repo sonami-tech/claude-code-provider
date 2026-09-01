@@ -147,17 +147,19 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 ## Current 2.1.257 Status
 
 On 2026-09-01, Claude Code 2.1.257 was captured and model behavior was verified
-for default, `opus`, `sonnet`, and `haiku` flows. Headers use SDK package
-`0.112.1`, runtime `v26.3.0`, Anthropic version `2023-06-01`, and
-`claude-cli/2.1.257 (external, sdk-cli)`.
+for default, `opus`, `sonnet`, `haiku`, `fable`, and `claude-fable-5` flows.
+Headers use SDK package `0.112.1`, runtime `v26.3.0`, Anthropic version
+`2023-06-01`, and `claude-cli/2.1.257 (external, sdk-cli)`.
 
 2.1.257 is the current active pin. Drift versus 2.1.232:
 
 1. CLI version string (UA + billing `cc_version`).
+2. Catalog adds `claude-fable-5-1` (alias `fable`). Explicit `claude-fable-5`
+   is still accepted on the wire.
 
-Catalog, per-model betas, wire defaults, stainless package/runtime, identity
-preamble, and the no-`x-client-request-id` header set are otherwise
-live-confirmed unchanged.
+Per-model betas, wire defaults, stainless package/runtime, identity preamble,
+and the no-`x-client-request-id` header set are otherwise live-confirmed
+unchanged.
 
 Like 2.1.186/197/207/211/220/221/228/232 it emits the billing header with no
 `cch=` field, ending at `cc_entrypoint=sdk-cli;`. The `cc_version` suffix
