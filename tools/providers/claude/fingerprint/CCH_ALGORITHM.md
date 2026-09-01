@@ -1,6 +1,6 @@
 # Claude Code cch fingerprint
 
-Active Omni pin: Claude Code `2.1.232` (no `cch` field on the wire). This
+Active Omni pin: Claude Code `2.1.257` (no `cch` field on the wire). This
 document records the historical `cch` rewrite algorithm used by earlier Claude
 Code releases and by clean-room vectors under `vectors/`. Rebaseline overwrites
 the single active pin; it does not reintroduce a multi-profile ladder.

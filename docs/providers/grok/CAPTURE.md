@@ -123,7 +123,7 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-Re-baselined against grok-shell **1.0.4** on **2026-08-14**.
+Re-baselined against grok-shell **1.0.13** on **2026-09-01**.
 
 ### Default path (cli-chat-proxy.grok.com)
 
@@ -139,16 +139,18 @@ default (for example `gpt-luna` from `[models] default` in
 
 Wire notes from live MITM of `grok --single`:
 - Host: `cli-chat-proxy.grok.com`, path `POST /v1/responses`
-- UA / version: `grok-shell/1.0.4 (linux; x86_64)`, `x-grok-client-version: 1.0.4`
+- UA / version: `grok-shell/1.0.13 (linux; x86_64)`, `x-grok-client-version: 1.0.13`
 - Fingerprint headers: `x-xai-token-auth`, `x-authenticateresponse`,
   `x-grok-client-identifier`, `x-grok-client-mode: headless`,
   `x-grok-model-override`, `accept: text/event-stream`
-- Main chat body: `model: "grok-4.6"`, `reasoning: { "effort": "high", "summary": "detailed" }`,
-  `include: ["reasoning.encrypted_content", "no_inline_citations"]`, `store: false`, `stream: true`
+- Main chat body: `model: "grok-4.6"`, `reasoning: { "effort": "high", "summary": "concise" }`,
+  `include: ["reasoning.encrypted_content", "no_inline_citations"]`, `store: false`, `stream: true`,
+  plus CLI-only `prompt_cache_key` (Omni sends cache fields only from client intent)
 - Session-title side call uses the selected chat model (not `grok-build`)
 - CLI also sends session/compaction headers (`x-compaction-at`,
-  `x-compactions-remaining`, `x-grok-doom-loop-check`); Omni still omits those
-  on single-shot requests
+  `x-compactions-remaining`, `x-grok-doom-loop-check`,
+  `x-grok-exact-repetition-check`); Omni still omits those on single-shot
+  requests
 
 `/v1/models` emits only canonical upstream ids. Omni accepts aliases inbound only.
 

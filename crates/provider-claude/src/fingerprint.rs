@@ -15,7 +15,7 @@
 //! wire types + identity prepend). It never leaks into omni-common or
 //! omni-core.
 //!
-//! Active baseline: Claude Code 2.1.232 (captured 2026-08-14). Single pin only
+//! Active baseline: Claude Code 2.1.257 (captured 2026-09-01). Single pin only
 //! (issue #12). No cch field on this pin; cch algorithms remain for vectors and
 //! future pins that reintroduce checksums.
 //!
@@ -386,18 +386,17 @@ pub const WIRE_DEFAULTS: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.232-sdk-cli";
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.257-sdk-cli";
 
-// Captured 2026-08-14 against installed Claude Code 2.1.232 via the shared
+// Captured 2026-09-01 against installed Claude Code 2.1.257 via the shared
 // tools.capture framework (mitmproxy reverse proxy + real claude CLI, clean tmpfs
 // HOME), for default, explicit opus, sonnet, and haiku. This is the sole active
-// pin (issue #12). Catalog drops fable; per-model betas and wire defaults match
-// 2.1.228. The short identity preamble now names the Claude Agent SDK. Header
-// versions and set remain unchanged apart from the CLI version string. No cch field.
-// Captured cc_version=2.1.232.1d9 for prompt "Say OK".
-pub const PROFILE_CLAUDE_2_1_232_SDK_CLI: FingerprintProfile = FingerprintProfile {
+// pin (issue #12). Catalog, per-model betas, stainless, preamble, and header set
+// match 2.1.232. Drift is the CLI version string. No cch field.
+// Captured cc_version=2.1.257.27e for prompt "Say OK".
+pub const PROFILE_CLAUDE_2_1_257_SDK_CLI: FingerprintProfile = FingerprintProfile {
     name: DEFAULT_PROFILE_NAME,
-    claude_cli_version: "2.1.232",
+    claude_cli_version: "2.1.257",
     stainless_package_version: "0.112.1",
     stainless_runtime_version: "v26.3.0",
     entrypoint: "sdk-cli",
@@ -412,7 +411,7 @@ pub const PROFILE_CLAUDE_2_1_232_SDK_CLI: FingerprintProfile = FingerprintProfil
 };
 
 pub fn default_profile() -> &'static FingerprintProfile {
-    &PROFILE_CLAUDE_2_1_232_SDK_CLI
+    &PROFILE_CLAUDE_2_1_257_SDK_CLI
 }
 
 pub fn is_claude_code_billing_header(text: &str) -> bool {
@@ -534,7 +533,7 @@ fn build_headers_with_profile(
     insert(&mut h, "anthropic-dangerous-direct-browser-access", "true");
     insert(&mut h, "anthropic-version", ANTHROPIC_VERSION);
     insert(&mut h, "x-app", "cli");
-    // 2.1.232 capture does not send x-client-request-id.
+    // 2.1.257 capture does not send x-client-request-id.
 
     h
 }
@@ -1002,13 +1001,13 @@ mod tests {
         // WHY: issue #12 ships exactly one pin. These bytes are the gate: UA,
         // stainless, catalog ids, and per-model beta lists must match capture.
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.232-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.232");
+        assert_eq!(profile.name, "cc-2.1.257-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.257");
         assert_eq!(profile.stainless_package_version, "0.112.1");
         assert_eq!(profile.stainless_runtime_version, "v26.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.232 (external, sdk-cli)"
+            "claude-cli/2.1.257 (external, sdk-cli)"
         );
         assert!(profile.resolve_model("fable").is_none());
         assert_eq!(
@@ -1057,7 +1056,7 @@ mod tests {
     #[test]
     fn billing_suffix_matches_claude_code_probe() {
         // Historical suffix vectors lock the algorithm across past versions.
-        // Active pin: 2.1.232 / "Say OK" -> 1d9; header has no cch field.
+        // Active pin: 2.1.257 / "Say OK" -> 27e; header has no cch field.
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.142"), "73b");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.150"), "5bd");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.154"), "cea");
@@ -1073,9 +1072,10 @@ mod tests {
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.221"), "116");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.228"), "a3a");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.232"), "1d9");
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.257"), "27e");
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.232.1d9; cc_entrypoint=sdk-cli;"
+            "x-anthropic-billing-header: cc_version=2.1.257.27e; cc_entrypoint=sdk-cli;"
         );
         // Synthetic cch profile still emits sentinel form for rewrite tests.
         assert_eq!(

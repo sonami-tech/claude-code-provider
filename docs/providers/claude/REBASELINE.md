@@ -144,26 +144,24 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 - Recovered vectors are local to this repo and covered by Rust tests.
 - Default workspace tests pass without credentials or network.
 
-## Current 2.1.232 Status
+## Current 2.1.257 Status
 
-On 2026-08-14, Claude Code 2.1.232 was captured and model behavior was verified
+On 2026-09-01, Claude Code 2.1.257 was captured and model behavior was verified
 for default, `opus`, `sonnet`, and `haiku` flows. Headers use SDK package
 `0.112.1`, runtime `v26.3.0`, Anthropic version `2023-06-01`, and
-`claude-cli/2.1.232 (external, sdk-cli)`.
+`claude-cli/2.1.257 (external, sdk-cli)`.
 
-2.1.232 is the current active pin. Drift versus 2.1.228:
+2.1.257 is the current active pin. Drift versus 2.1.232:
 
 1. CLI version string (UA + billing `cc_version`).
-2. Short identity preamble changed to
-   `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
-3. Catalog dropped `claude-fable-5` and its `fable` alias.
 
-Catalog, per-model betas, wire defaults, stainless package/runtime, and the
-no-`x-client-request-id` header set are otherwise live-confirmed unchanged.
+Catalog, per-model betas, wire defaults, stainless package/runtime, identity
+preamble, and the no-`x-client-request-id` header set are otherwise
+live-confirmed unchanged.
 
-Like 2.1.186/197/207/211/220/221/228 it emits the billing header with no `cch=`
-field, ending at `cc_entrypoint=sdk-cli;`. The `cc_version` suffix algorithm is
-unchanged: the existing Sha256Utf16SampleV1 suffix reproduces the captured
-`cc_version=2.1.232.1d9` exactly, and the live drift checker agrees against the
-installed CLI. Because there is no checksum to recompute, this no-cch profile
-ships no clean-room cch vectors.
+Like 2.1.186/197/207/211/220/221/228/232 it emits the billing header with no
+`cch=` field, ending at `cc_entrypoint=sdk-cli;`. The `cc_version` suffix
+algorithm is unchanged: the existing Sha256Utf16SampleV1 suffix reproduces the
+captured `cc_version=2.1.257.27e` exactly, and the live drift checker agrees
+against the installed CLI. Because there is no checksum to recompute, this
+no-cch profile ships no clean-room cch vectors.

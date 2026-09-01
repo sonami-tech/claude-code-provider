@@ -3110,7 +3110,7 @@ mod tests {
         let (k, m) = resolve_provider_and_model("grok", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.6"));
 
-        // composer is no longer a Grok catalog alias (grok-shell 1.0.4).
+        // composer is no longer a Grok catalog alias (grok-shell 1.0.13).
         let err = resolve_provider_and_model("composer", &catalogs).unwrap_err();
         assert!(
             err.contains("unknown model"),
@@ -3188,7 +3188,7 @@ mod tests {
             !text.contains("fable="),
             "startup alias log must not advertise retired fable alias: {text}"
         );
-        // composer dropped from grok-shell 1.0.4 advertised catalog.
+        // composer dropped from grok-shell 1.0.13 advertised catalog.
         assert!(
             !text.contains("composer="),
             "startup alias log must not advertise retired composer alias: {text}"
@@ -5098,7 +5098,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         );
         assert!(
             !ids.iter().any(|id| id == "grok-composer-2.5-fast"),
-            "composer is no longer in the grok-shell 1.0.4 catalog: {ids:?}"
+            "composer is no longer in the grok-shell 1.0.13 catalog: {ids:?}"
         );
         assert!(
             ids.iter().any(|id| id.starts_with("claude-")),
